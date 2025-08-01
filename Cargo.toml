@@ -32,7 +32,8 @@ members = [
   "crates/vortex-events",
   "crates/proto-rust",
   "crates/dbt-env",
-  "crates/dbt-test-utils",
+  "crates/dbt-test-utils", 
+  "crates/dbt-lint",
 ]
 
 resolver = "2"
