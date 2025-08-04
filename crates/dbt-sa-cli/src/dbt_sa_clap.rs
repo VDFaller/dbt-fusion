@@ -84,6 +84,9 @@ pub enum Commands {
 
     /// Create reference documentation (json schema for artifacts)
     Man(ManArgs),
+
+    // Check the dbt project for common issues
+    Check(CheckArgs),
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -167,6 +170,16 @@ pub struct ManArgs {
     /// Show these json schema types on the command line
     #[clap(long, num_args(0..))]
     pub schema: Vec<JsonSchemaTypes>,
+}
+
+#[derive(Parser, Debug, Default, Clone, Serialize, Deserialize)]
+pub struct CheckArgs {
+    // Flattened IO args
+    #[clap(flatten)]
+    pub common_args: CommonArgs,
+
+    #[arg(long, action = ArgAction::SetTrue, default_value_t = false, value_parser = BoolishValueParser::new())]
+    pub fix: bool
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -265,7 +278,7 @@ pub struct CommonArgs {
     pub log_level_file: Option<LevelFilter>,
 
     // Send anonymous usage stats to dbt Labs.
-    #[arg(global = true, long, default_value_t=true, action = ArgAction::SetTrue, env = "DBT_SEND_ANONYMOUS_USAGE_STATS", value_parser = BoolishValueParser::new())]
+    #[arg(global = true, long, default_value_t=true, action = ArgAction::SetFalse, env = "DBT_SEND_ANONYMOUS_USAGE_STATS", value_parser = BoolishValueParser::new())]
     pub send_anonymous_usage_stats: bool,
     #[arg(global = true, long, default_value_t=false, action = ArgAction::SetTrue, value_parser = BoolishValueParser::new())]
     pub no_send_anonymous_usage_stats: bool,
@@ -302,6 +315,7 @@ impl Cli {
             Commands::Ls(args) => args.to_eval_args(arg, in_dir, out_dir),
             Commands::Clean(args) => args.to_eval_args(arg, in_dir, out_dir),
             Commands::Man(args) => args.to_eval_args(arg, in_dir, out_dir),
+            Commands::Check(args) => args.to_eval_args(arg, in_dir, out_dir),
         };
         arg.from_main = from_main;
         arg
@@ -316,6 +330,7 @@ impl Cli {
             Commands::Parse(args) => args.common_args.clone(),
             Commands::Clean(args) => args.common_args.clone(),
             Commands::Man(args) => args.common_args.clone(),
+            Commands::Check(args) => args.common_args.clone(),
         }
     }
 
@@ -337,6 +352,7 @@ impl Cli {
             Commands::Ls(..) => "ls",
             Commands::Clean(..) => "clean",
             Commands::Man(..) => "man",
+            Commands::Check(..) => "check",
         }
     }
 }
@@ -427,6 +443,15 @@ impl InitArgs {
         }
     }
 }
+
+impl CheckArgs {
+    pub fn to_eval_args(&self, arg: SystemArgs, in_dir: &Path, out_dir: &Path) -> EvalArgs {
+        let mut eval_args = self.common_args.to_eval_args(arg, in_dir, out_dir);
+        eval_args.phase = Phases::Lint;
+        eval_args
+    }
+}
+
 
 // ----------------------------------------------------------------------------------------------
 // check options

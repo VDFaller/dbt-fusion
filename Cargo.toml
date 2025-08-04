@@ -145,6 +145,7 @@ dbt-frontend-common = { path = "crates/dbt-frontend-common" }
 dbt-fusion-adapter = { path = "crates/dbt-fusion-adapter" }
 dbt-ident = { path = "crates/dbt-ident" }
 dbt-jinja-utils = { path = "crates/dbt-jinja-utils" }
+dbt-lint = { path = "crates/dbt-lint" }
 dbt-loader = { path = "crates/dbt-loader" }
 dbt-parser = { path = "crates/dbt-parser" }
 dbt-proc-macros = { path = "crates/dbt-proc-macros" }

@@ -1693,6 +1693,7 @@ dependencies = [
  "console",
  "dbt-common",
  "dbt-jinja-utils",
+ "dbt-lint",
  "dbt-loader",
  "dbt-parser",
  "dbt-schemas",

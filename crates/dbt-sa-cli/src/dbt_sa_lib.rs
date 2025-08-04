@@ -30,6 +30,8 @@ use std::{path::Path, sync::Arc, time::SystemTime};
 use dbt_loader::{args::LoadArgs, load};
 use dbt_parser::{args::ResolveArgs, resolver::resolve};
 
+use dbt_lint::{check_all};
+
 use serde_json::to_string_pretty;
 
 // ------------------------------------------------------------------------------------------------
@@ -263,5 +265,15 @@ async fn execute_all_phases(
         to_string_pretty(&dbt_manifest)?
     );
 
+    if let Commands::Check(_) = _cli.command {
+        println!("Now we lint");
+        let failures = check_all(&dbt_manifest);
+
+        println!("Nodes without description: {:?}", failures.model_failures.no_descriptions.len());
+        println!("Number of models without tags: {}", failures.model_failures.no_tags.len());
+        println!("Models with columns missing descriptions: {:?}", failures.model_failures.column_failures.len());
+
+        println!("Sources without description: {:?}", failures.source_failures.no_descriptions.len());
+    }
     show_progress_exit!(&arg, start)
 }

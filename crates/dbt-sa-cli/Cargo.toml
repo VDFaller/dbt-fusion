@@ -18,6 +18,7 @@ dbt-jinja-utils = { workspace = true }
 dbt-loader = { workspace = true }
 dbt-parser = { workspace = true }
 dbt-schemas = { workspace = true }
+dbt-lint = { workspace = true }
 
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

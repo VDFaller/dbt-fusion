@@ -1,8 +1,11 @@
 ## DBT fusion pipedream for checking the project
-I want a dbtf check --fix command that will run a series of checks on the dbt project, and fix any issues it can.
+I want a `dbtf check --fix` command that will run a series of checks on the dbt project, and fix any issues it can.
 It should be able to run the following checks:
 
+* first fix, inherit the upstream descriptions
 
+
+### replacement for 
 * dbt-project-evaluator
     * parity for rules
 	* check only, no fixes for now
