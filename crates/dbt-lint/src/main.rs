@@ -1,64 +1,91 @@
 use dbt_schemas::schemas::{
     dbt_column::DbtColumn,
     manifest::{
-        DbtManifestV12, DbtNode, ManifestModel,
+        DbtManifestV12, DbtNode, ManifestModel
     }
 };
-use dbt_lint::{check_all, get_manifest};
+use dbt_lint::{get_manifest};
 use std::{env, path::Path};
 
 
-fn inherit_column_descriptions<'a>(manifest: &'a DbtManifestV12, model: &'a ManifestModel, col: &'a mut DbtColumn) {
+fn inherit_column_descriptions<'a>(manifest: &'a mut DbtManifestV12, node_id: &'a str, col_name: &'a str) -> Result<(), String> {
     // This function will inherit column descriptions from the upstream model or source
     // todo: add sources, seeds, snapshots
     // mark unsafe if multiple upstream models have same column name
     //    or even better, know which upstream model to inherit from (SDF style)
-    // fix the mutability issue
-    if !col.description.is_none() {
-        return;
-    }
-    
-    let depends_on = model.base_attr.depends_on.clone();
-    // check if any of the upstream models have the same column name
-    for dep in &depends_on.nodes {
-        if let Some(dep_model) = manifest.nodes.get(dep) {
-            match dep_model {
-                DbtNode::Model(dep_model) => {
-                    if let Some(dep_col) = dep_model.base_attr.columns.get(&col.name) {
-                        if let Some(desc) = &dep_col.description {
-                            col.description = Some(desc.clone());
-                        }
-                    }
-                }
-                _ => continue, // skip if not a model
+    //    could possibly use the cached target/db/dbt/information_schema/output.parquet.  Not sure what would be faster. 
+    let desc = get_upstream_col_desc(manifest, node_id, col_name)?;
+
+    if let Some(desc) = get_upstream_col_desc(manifest, node_id, col_name) {
+        if let Some(DbtNode::Model(model)) = manifest.nodes.get_mut(node_id) {
+            if let Some(col) = model.base_attr.columns.get_mut(col_name) {
+                col.description = Some(desc);
+                return Ok(());
+            } else {
+                return Err(format!("Column {} not found in model {}", col_name, node_id));
             }
-
+        } else {
+            return Err(format!("Node with id {} is not a model", node_id));
         }
+    } else {
+        return Err(format!("No upstream description found for column {} in node {}", col_name, node_id));
     }
-
 }
 
+fn get_upstream_col_desc<'a>(
+    manifest: &'a DbtManifestV12,
+    node_id: &'a str,
+    col_name: &'a str,
+) -> Option<String> {
+    if let Some(DbtNode::Model(model)) = manifest.nodes.get(node_id) {
+        let desc = model
+            .base_attr
+            .depends_on
+            .nodes
+            .iter()
+            .filter_map(|upstream_id| {
+                // the upstream id can be a node or a source
+                manifest.nodes.get(upstream_id)
+                    .map(|upstream_node| match upstream_node {
+                        DbtNode::Model(upstream_model) => upstream_model.base_attr.columns.get(col_name),
+                        DbtNode::Seed(upstream_seed) => upstream_seed.base_attr.columns.get(col_name),
+                        DbtNode::Snapshot(upstream_snapshot) => upstream_snapshot.base_attr.columns.get(col_name),
+                        _ => None,
+                    })
+                    .flatten()
+                    .or_else(|| {
+                        manifest.sources.get(upstream_id)
+                            .and_then(|source| source.columns.get(col_name))
+                    })
+            })
+            .filter_map(|dep_col| dep_col.description.as_ref().cloned())
+            .next();
+        return desc;
+    }
+    else {
+        return None;
+    }
+}
 
 fn main() {
     let args: Vec<String> = env::args().collect();
     let manifest_path = Path::new(&args[1]);
-    let manifest = get_manifest(&manifest_path);
-    let failures = check_all(&manifest);
-
-    println!("Nodes without description: {:?}", failures.model_failures.no_descriptions.len());
-    println!("Number of models without tags: {}", failures.model_failures.no_tags.len());
-    println!("Models with columns missing descriptions: {:?}", failures.model_failures.column_failures.len());
-
-    println!("Sources without description: {:?}", failures.source_failures.no_descriptions.len());
+    let mut manifest= get_manifest(manifest_path);
 
 
-    let model = manifest.nodes.get("model.jaffle_shop.orders").unwrap();
-    
-    
-    if let DbtNode::Model(model) = model {
-        let mut col = model.base_attr.columns.get("customer_id").unwrap().clone();
+    let node_id: &str = "model.dsa_dbt.stg_agile__multilevelbom";
+    let col_name: &str = "fg_assembly_number";
+    let _ = inherit_column_descriptions(&mut manifest, node_id, col_name);
+    let col = manifest.nodes.get(node_id)
+        .and_then(|node| match node {
+            DbtNode::Model(model) => model.base_attr.columns.get(col_name),
+            _ => None,
+        })
+        .cloned()
+        .expect("Column not found in model");
+    println!(
+        "Inherited column description: {:?}",
+        col.description.unwrap_or(String::from("<none>"))
+        );
 
-        inherit_column_descriptions(&manifest, model, &mut col);
-        println!("Inherited column description: {:?}", col.description);
-    }
 }

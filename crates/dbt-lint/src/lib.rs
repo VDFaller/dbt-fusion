@@ -1,10 +1,9 @@
 use dbt_schemas::schemas::{
-    dbt_column::DbtColumn,
     manifest::{
         DbtManifestV12, DbtNode, ManifestSource, ManifestModel,
     }
 };
-use std::{env, fs, path::Path};
+use std::{fs, path::Path};
 
 #[derive(Default, Debug)]
 pub struct ModelFailures<'a> {
