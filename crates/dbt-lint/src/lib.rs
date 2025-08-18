@@ -30,6 +30,7 @@ pub struct Failures<'a> {
 }
 
 pub fn get_manifest(manifest_path: &Path) -> DbtManifestV12 {
+    println!("Reading manifest from: {}", manifest_path.display());
     let manifest_str = fs::read_to_string(manifest_path)
         .expect("Failed to read manifest.json");
 
@@ -60,12 +61,12 @@ pub fn check_all<'a>(manifest: &'a DbtManifestV12) -> Failures<'a> {
 
 fn check_model<'a>(model: &'a ManifestModel, failures: &mut ModelFailures<'a>){
     // check-model-has-description
-    if model.common_attr.description.is_none() {
-        failures.no_descriptions.push(model.common_attr.unique_id.as_str());
+    if model.__common_attr__.description.is_none() {
+        failures.no_descriptions.push(model.__common_attr__.unique_id.as_str());
     }
     // check-model-has-tags
     if model.config.tags.is_none() {
-        failures.no_tags.push(model.common_attr.unique_id.as_str());
+        failures.no_tags.push(model.__common_attr__.unique_id.as_str());
     }
     // check-model-columns-have-desc
     if let Some(column_failures) = check_model_columns(model) {
@@ -75,7 +76,7 @@ fn check_model<'a>(model: &'a ManifestModel, failures: &mut ModelFailures<'a>){
 
 fn check_model_columns<'a>(model: &'a ManifestModel) -> Option<ColumnFailures<'a>> {
     let column_failures = ColumnFailures {
-        model: model.common_attr.unique_id.as_str(),
+        model: model.__common_attr__.unique_id.as_str(),
         no_descriptions: check_model_columns_have_descriptions(model),
     };
 
@@ -89,14 +90,14 @@ fn check_model_columns<'a>(model: &'a ManifestModel) -> Option<ColumnFailures<'a
 fn check_model_columns_have_descriptions<'a>(
     model: &'a ManifestModel,
 ) -> Vec<&'a str> {
-    model.base_attr.columns.values()
+    model.__base_attr__.columns.values()
         .filter(|col| col.description.is_none())
         .map(|col| col.name.as_str())
         .collect() // do I need to collect? Can I just return the iterator and iterate on reporting? 
 }
 
 fn check_source<'a>(source: &'a ManifestSource, failures: &mut SourceFailures<'a>){
-    if source.common_attr.description.is_none() {
-        failures.no_descriptions.push(source.common_attr.unique_id.as_str());
+    if source.__common_attr__.description.is_none() {
+        failures.no_descriptions.push(source.__common_attr__.unique_id.as_str());
     }
 }

@@ -1,7 +1,6 @@
 use dbt_schemas::schemas::{
-    dbt_column::DbtColumn,
     manifest::{
-        DbtManifestV12, DbtNode, ManifestModel
+        DbtManifestV12, DbtNode
     }
 };
 use dbt_lint::{get_manifest};
@@ -14,11 +13,10 @@ fn inherit_column_descriptions<'a>(manifest: &'a mut DbtManifestV12, node_id: &'
     // mark unsafe if multiple upstream models have same column name
     //    or even better, know which upstream model to inherit from (SDF style)
     //    could possibly use the cached target/db/dbt/information_schema/output.parquet.  Not sure what would be faster. 
-    let desc = get_upstream_col_desc(manifest, node_id, col_name)?;
 
     if let Some(desc) = get_upstream_col_desc(manifest, node_id, col_name) {
         if let Some(DbtNode::Model(model)) = manifest.nodes.get_mut(node_id) {
-            if let Some(col) = model.base_attr.columns.get_mut(col_name) {
+            if let Some(col) = model.__base_attr__.columns.get_mut(col_name) {
                 col.description = Some(desc);
                 return Ok(());
             } else {
@@ -39,7 +37,7 @@ fn get_upstream_col_desc<'a>(
 ) -> Option<String> {
     if let Some(DbtNode::Model(model)) = manifest.nodes.get(node_id) {
         let desc = model
-            .base_attr
+            .__base_attr__
             .depends_on
             .nodes
             .iter()
@@ -47,9 +45,9 @@ fn get_upstream_col_desc<'a>(
                 // the upstream id can be a node or a source
                 manifest.nodes.get(upstream_id)
                     .map(|upstream_node| match upstream_node {
-                        DbtNode::Model(upstream_model) => upstream_model.base_attr.columns.get(col_name),
-                        DbtNode::Seed(upstream_seed) => upstream_seed.base_attr.columns.get(col_name),
-                        DbtNode::Snapshot(upstream_snapshot) => upstream_snapshot.base_attr.columns.get(col_name),
+                        DbtNode::Model(upstream_model) => upstream_model.__base_attr__.columns.get(col_name),
+                        DbtNode::Seed(upstream_seed) => upstream_seed.__base_attr__.columns.get(col_name),
+                        DbtNode::Snapshot(upstream_snapshot) => upstream_snapshot.__base_attr__.columns.get(col_name),
                         _ => None,
                     })
                     .flatten()
@@ -78,7 +76,7 @@ fn main() {
     let _ = inherit_column_descriptions(&mut manifest, node_id, col_name);
     let col = manifest.nodes.get(node_id)
         .and_then(|node| match node {
-            DbtNode::Model(model) => model.base_attr.columns.get(col_name),
+            DbtNode::Model(model) => model.__base_attr__.columns.get(col_name),
             _ => None,
         })
         .cloned()
