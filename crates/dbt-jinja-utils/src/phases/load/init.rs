@@ -1,10 +1,13 @@
 //! This module contains the functions for initializing the Jinja environment for the load phase.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, str::FromStr as _, sync::Arc};
 
 use chrono::DateTime;
 use chrono_tz::Tz;
-use dbt_common::{ErrorCode, FsResult, cancellation::CancellationToken, fs_err, io_args::IoArgs};
+use dbt_common::{
+    ErrorCode, FsResult, adapter::AdapterType, cancellation::CancellationToken, fs_err,
+    io_args::IoArgs,
+};
 use dbt_fusion_adapter::parse::adapter::create_parse_adapter;
 use dbt_schemas::{
     dbt_utils::resolve_package_quoting,
@@ -29,13 +32,13 @@ pub fn initialize_load_jinja_environment(
     profile: &str,
     target: &str,
     adapter_type: &str,
-    db_config: &DbConfig,
+    db_config: DbConfig,
     run_started_at: DateTime<Tz>,
     flags: &BTreeMap<String, minijinja::Value>,
     io_args: IoArgs,
     token: CancellationToken,
 ) -> FsResult<JinjaEnv> {
-    let target_context = TargetContext::try_from(db_config.clone())
+    let target_context = TargetContext::try_from(db_config)
         .map_err(|e| fs_err!(ErrorCode::InvalidConfig, "{}", &e))?;
     let target_context = Arc::new(build_target_context_map(profile, target, target_context));
     let globals = BTreeMap::from([
@@ -52,6 +55,13 @@ pub fn initialize_load_jinja_environment(
         ),
         ("flags".to_string(), MinijinjaValue::from_serialize(flags)),
     ]);
+
+    let adapter_type = AdapterType::from_str(adapter_type).map_err(|_| {
+        fs_err!(
+            ErrorCode::InvalidConfig,
+            "Unknown or unsupported adapter type '{adapter_type}'",
+        )
+    })?;
 
     let package_quoting = resolve_package_quoting(None, adapter_type);
 

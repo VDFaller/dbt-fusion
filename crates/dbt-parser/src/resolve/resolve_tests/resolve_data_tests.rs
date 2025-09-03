@@ -12,10 +12,13 @@ use crate::utils::generate_relation_components;
 use crate::utils::get_node_fqn;
 use crate::utils::get_original_file_path;
 use crate::utils::update_node_relation_components;
+use dbt_common::ErrorCode;
 use dbt_common::FsResult;
+use dbt_common::adapter::AdapterType;
 use dbt_common::cancellation::CancellationToken;
 use dbt_common::constants::DBT_GENERIC_TESTS_DIR_NAME;
 use dbt_common::error::AbstractLocation;
+use dbt_common::fs_err;
 use dbt_common::io_args::StaticAnalysisKind;
 use dbt_common::io_utils::try_read_yml_to_str;
 use dbt_common::stdfs;
@@ -38,6 +41,7 @@ use dbt_schemas::schemas::ref_and_source::DbtRef;
 use dbt_schemas::schemas::ref_and_source::DbtSourceWrapper;
 use dbt_schemas::schemas::{CommonAttributes, DbtTest, InternalDbtNode, NodeBaseAttributes};
 use dbt_schemas::state::DbtRuntimeConfig;
+use dbt_schemas::state::GenericTestAsset;
 use dbt_schemas::state::ModelStatus;
 use dbt_schemas::state::{DbtAsset, DbtPackage};
 use md5;
@@ -48,6 +52,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::str::FromStr as _;
 use std::sync::Arc;
 
 #[allow(clippy::too_many_arguments)]
@@ -60,11 +65,11 @@ pub async fn resolve_data_tests(
     test_properties: &mut BTreeMap<String, MinimalPropertiesEntry>,
     database: &str,
     schema: &str,
-    adapter_type: &str,
+    adapter_type: AdapterType,
     env: Arc<JinjaEnv>,
     base_ctx: &BTreeMap<String, minijinja::Value>,
     runtime_config: Arc<DbtRuntimeConfig>,
-    collected_tests: &Vec<DbtAsset>,
+    collected_generic_tests: &[GenericTestAsset],
     token: &CancellationToken,
 ) -> FsResult<(HashMap<String, Arc<DbtTest>>, HashMap<String, Arc<DbtTest>>)> {
     let mut nodes: HashMap<String, Arc<DbtTest>> = HashMap::new();
@@ -94,8 +99,18 @@ pub async fn resolve_data_tests(
         dependency_package_name_from_ctx(&env, base_ctx),
     )?;
 
+    // Create a map of dbt_asset.path.stem to GenericTestAsset for efficient lookup
+    let test_path_to_test_asset: HashMap<PathBuf, &GenericTestAsset> = collected_generic_tests
+        .iter()
+        .map(|test_asset| (test_asset.dbt_asset.path.clone(), test_asset))
+        .collect();
+
     let mut test_assets_to_render = package.test_files.clone();
-    test_assets_to_render.extend(collected_tests.to_owned());
+    test_assets_to_render.extend(
+        collected_generic_tests
+            .iter()
+            .map(|test_asset| test_asset.dbt_asset.clone()),
+    );
 
     let render_ctx = RenderCtx {
         inner: Arc::new(RenderCtxInner {
@@ -105,7 +120,7 @@ pub async fn resolve_data_tests(
             package_quoting,
             base_ctx: base_ctx.clone(),
             package_name: package_name.to_string(),
-            adapter_type: adapter_type.to_string(),
+            adapter_type,
             database: database.to_string(),
             schema: schema.to_string(),
             local_project_config,
@@ -161,7 +176,7 @@ pub async fn resolve_data_tests(
             test_config.schema = Some(DEFAULT_TEST_SCHEMA.to_string());
         }
 
-        let model_name = dbt_asset
+        let test_name = dbt_asset
             .path
             .file_stem()
             .unwrap()
@@ -172,10 +187,10 @@ pub async fn resolve_data_tests(
         let properties = if let Some(properties) = maybe_properties {
             properties
         } else {
-            &DataTestProperties::empty(model_name.to_owned())
+            &DataTestProperties::empty(test_name.to_owned())
         };
 
-        // To conform to the unique_id format in dbt-core, we need to hash the model name
+        // To conform to the unique_id format in dbt-core, we need to hash the test name
         // append the last 10 characters of the hash to the unique_id.
         // See the `create_test_node` function in
         // https://github.com/dbt-labs/dbt-core/blob/3de3b827bfffdc43845780f484d4d53011f20a37/core/dbt/parser/schema_generic_tests.py#L132
@@ -184,14 +199,25 @@ pub async fn resolve_data_tests(
         // performs a hash of soe of the contents of what was in the python data structs.
         // See https://github.com/dbt-labs/fs/pull/4725#issuecomment-3133476096 for more details.
         const HASH_LENGTH: usize = 10;
-        let hash_hex = format!("{:x}", md5::compute(&model_name));
+        let hash_hex = format!("{:x}", md5::compute(&test_name));
         let test_hash = hash_hex[hash_hex.len() - HASH_LENGTH..].to_string();
 
-        let unique_id = format!("test.{package_name}.{model_name}.{test_hash}");
+        let unique_id = format!("test.{package_name}.{test_name}.{test_hash}");
+
+        // Check if this test_name corresponds to any test in our collected tests
+        // If so, use the original_file_path from the GenericTestAsset for the fqn construction and original_file_path
+        let path_for_fqn = test_path_to_test_asset
+            .get(&dbt_asset.path)
+            .map(|test_asset| test_asset.original_file_path.clone())
+            .unwrap_or_else(|| dbt_asset.path.to_owned());
+
+        // singular data tests are only found in test_paths, but generic tests
+        // can be found in any directory in all_source_paths
         let fqn = get_node_fqn(
             package_name,
-            dbt_asset.path.to_owned(),
-            vec![model_name.to_owned()],
+            path_for_fqn,
+            vec![test_name.to_owned()],
+            &package.dbt_project.all_source_paths(),
         );
 
         // Errored models can be enabled, so enabled is set to the opposite of disabled
@@ -199,7 +225,7 @@ pub async fn resolve_data_tests(
 
         let mut dbt_test = DbtTest {
             __common_attr__: CommonAttributes {
-                name: model_name.to_owned(),
+                name: test_name.to_owned(),
                 package_name: package_name.to_owned(),
                 path: dbt_asset.path.to_owned(),
                 name_span: dbt_common::Span::default(),
@@ -208,7 +234,10 @@ pub async fn resolve_data_tests(
                     &arg.io.in_dir,
                     &dbt_asset.path,
                 ),
-                patch_path: patch_path.clone(),
+                patch_path: test_path_to_test_asset
+                    .get(&dbt_asset.path)
+                    .map(|test_asset| test_asset.original_file_path.clone())
+                    .or_else(|| patch_path.clone()),
                 unique_id: unique_id.clone(),
                 fqn,
                 description: properties.description.clone(),
@@ -243,6 +272,7 @@ pub async fn resolve_data_tests(
                 materialized: DbtMaterialization::Test,
                 enabled: test_config.enabled.unwrap_or(true),
                 extended_model: false,
+                persist_docs: None,
                 columns: BTreeMap::new(),
                 depends_on: NodeDependsOn {
                     macros: convert_macro_names_to_unique_ids(macro_calls),
@@ -271,7 +301,16 @@ pub async fn resolve_data_tests(
             },
             __test_attr__: DbtTestAttr {
                 column_name: None,
-                attached_node: None,
+                attached_node: test_path_to_test_asset
+                    .get(&dbt_asset.path)
+                    .map(|test_asset| {
+                        format!(
+                            "{}.{}.{}",
+                            test_asset.resource_type,
+                            test_asset.dbt_asset.package_name,
+                            test_asset.resource_name
+                        )
+                    }),
                 test_metadata: None,
                 file_key_name: None,
             },

@@ -24,7 +24,9 @@ use crate::schemas::{
 };
 use blake3::Hasher;
 use chrono::{DateTime, Local, Utc};
-use dbt_common::{ErrorCode, FsResult, fs_err, serde_utils::convert_yml_to_map};
+use dbt_common::{
+    ErrorCode, FsResult, adapter::AdapterType, fs_err, serde_utils::convert_yml_to_map,
+};
 use minijinja::compiler::parser::materialization_macro_name;
 use minijinja::{MacroSpans, Value as MinijinjaValue, value::Object};
 use serde::Deserialize;
@@ -103,6 +105,29 @@ impl fmt::Display for DbtAsset {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GenericTestAsset {
+    pub dbt_asset: DbtAsset,
+    pub original_file_path: PathBuf,
+    pub resource_name: String,
+    pub resource_type: String,
+    pub test_name: String,
+}
+
+impl fmt::Display for GenericTestAsset {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "GenericTestAsset {{ dbt_asset: {}, original_file_path: {}, resource_name: {}, resource_type: {}, test_name: {} }}",
+            self.dbt_asset,
+            self.original_file_path.display(),
+            self.resource_name,
+            self.resource_type,
+            self.test_name
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbtProfile {
     pub profile: String,
@@ -166,7 +191,7 @@ pub enum DbtVars {
     Value(dbt_serde_yaml::Value),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DbtState {
     pub dbt_profile: DbtProfile,
     pub run_started_at: DateTime<Tz>,
@@ -233,7 +258,7 @@ pub trait RefsAndSourcesTracker: fmt::Debug + Send + Sync {
     fn insert_ref(
         &mut self,
         node: &dyn InternalDbtNodeAttributes,
-        adapter_type: &str,
+        adapter_type: AdapterType,
         model_status: ModelStatus,
         overwrite: bool,
     ) -> FsResult<()>;
@@ -241,7 +266,7 @@ pub trait RefsAndSourcesTracker: fmt::Debug + Send + Sync {
         &mut self,
         package_name: &str,
         source: &DbtSource,
-        adapter_type: &str,
+        adapter_type: AdapterType,
         model_status: ModelStatus,
     ) -> FsResult<()>;
     fn lookup_ref(
@@ -271,7 +296,7 @@ impl RefsAndSourcesTracker for DummyRefsAndSourcesTracker {
     fn insert_ref(
         &mut self,
         _node: &dyn InternalDbtNodeAttributes,
-        _adapter_type: &str,
+        _adapter_type: AdapterType,
         _model_status: ModelStatus,
         _overwrite: bool,
     ) -> FsResult<()> {
@@ -283,7 +308,7 @@ impl RefsAndSourcesTracker for DummyRefsAndSourcesTracker {
         &mut self,
         _package_name: &str,
         _source: &DbtSource,
-        _adapter_type: &str,
+        _adapter_type: AdapterType,
         _model_status: ModelStatus,
     ) -> FsResult<()> {
         // No-op for dummy
@@ -339,7 +364,7 @@ pub struct Operations {
 #[derive(Debug, Clone)]
 pub struct ResolverState {
     pub root_project_name: String,
-    pub adapter_type: String,
+    pub adapter_type: AdapterType,
     pub nodes: Nodes,
     pub disabled_nodes: Nodes,
     pub macros: Macros,
@@ -355,6 +380,8 @@ pub struct ResolverState {
     pub resolved_selectors: ResolvedSelector,
     pub root_project_quoting: ResolvedQuoting,
     pub defer_nodes: Option<Nodes>,
+    /// Nodes that had resolution errors (e.g., unresolved refs/sources)
+    pub nodes_with_resolution_errors: HashSet<String>,
 }
 
 impl ResolverState {
@@ -363,11 +390,11 @@ impl ResolverState {
     pub fn find_materialization_macro_name(
         &self,
         materialization: impl fmt::Display,
-        adapter: &str,
+        adapter: AdapterType,
     ) -> FsResult<String> {
         let adapter_package = format!("dbt_{adapter}");
         for package in [&adapter_package, "dbt"] {
-            for adapter in [adapter, "default"] {
+            for adapter in [adapter.as_ref(), "default"] {
                 if let Some(macro_) = self.macros.macros.values().find(|m| {
                     m.name == materialization_macro_name(&materialization, adapter)
                         && m.package_name == package
@@ -491,10 +518,14 @@ pub struct NodeStatus {
 #[derive(Debug, Clone, Default)]
 pub struct CacheState {
     pub file_changes: FileChanges,
-    // only the resolved nodes which input files are unchanged
-    pub resolved_nodes: ResolvedNodes,
-    // updated nodes which input files are changed
-    pub unchanged_node_statuses: HashMap<String, NodeStatus>,
+    /// Only the unimpacted resolved nodes from file changes.
+    pub unimpacted_resolved_nodes: ResolvedNodes,
+    /// Only the unimpacted node statuses from file changes.
+    pub unimpacted_node_statuses: HashMap<String, NodeStatus>,
+    /// The unchanged nodes, by unique id, based on file changes.
+    /// This does not mean that these nodes are "unimpacted",
+    /// it just means their correpsonding file was not changed.
+    pub unchanged_nodes: Arc<HashSet<String>>,
 }
 impl CacheState {
     pub fn has_changes(&self) -> bool {

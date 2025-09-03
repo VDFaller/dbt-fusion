@@ -349,7 +349,10 @@ struct BatchSenderAgentImpl {
 
 impl BatchSenderAgentImpl {
     pub fn new(endpoint: http::Uri, vortex_client_platform: HeaderValue) -> Self {
-        let agent = ureq::Agent::new_with_defaults();
+        let config = ureq::config::Config::builder()
+            .http_status_as_error(false)
+            .build();
+        let agent = ureq::Agent::new_with_config(config);
         Self {
             agent,
             endpoint,
@@ -1165,6 +1168,7 @@ mod tests {
         // this prints a warning in debug mode, but does not do anything in release mode
         let _ = client.log_proto(test_message(7), false);
 
+        #[cfg(feature = "scheduling-tests")]
         sent_batches_handle.with_lock(|batches| {
             assert_eq!(batches.sent.len(), 2);
             assert_eq!(

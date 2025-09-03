@@ -21,7 +21,7 @@ mod tests {
     use dbt_xdbc::{
         Backend, Connection, Database, Driver, QueryCtx, Statement, bigquery, connection,
         database::{self, LogLevel},
-        databricks, driver, redshift, snowflake,
+        databricks, driver, redshift, salesforce, snowflake,
     };
 
     const ADBC_VERSION: AdbcVersion = AdbcVersion::V110;
@@ -149,6 +149,17 @@ mod tests {
                     .with_password(token);
                 Ok(builder)
             }
+            Backend::Salesforce => {
+                let mut builder = database::Builder::new(backend);
+                builder.with_named_option(salesforce::AUTH_TYPE, salesforce::auth_type::JWT)?;
+
+                builder.with_named_option(salesforce::LOGIN_URL, "https://login.salesforce.com")?;
+                builder.with_named_option(salesforce::USERNAME, "test@example.com")?;
+                builder.with_named_option(salesforce::CLIENT_ID, "1")?;
+                builder.with_named_option(salesforce::JWT_PRIVATE_KEY, "test")?;
+
+                Ok(builder)
+            }
             Backend::Generic { .. } => unimplemented!("generic backend database builder in tests"),
         }?;
         if backend == Backend::Snowflake {
@@ -244,6 +255,7 @@ mod tests {
                     );
                 }
                 Backend::Postgres
+                | Backend::Redshift
                 | Backend::Databricks
                 | Backend::DatabricksODBC
                 | Backend::RedshiftODBC => {
@@ -269,6 +281,12 @@ mod tests {
     #[test]
     fn statement_execute_bigquery() -> Result<()> {
         execute_statement(Backend::BigQuery)
+    }
+
+    #[test_with::env(ADBC_POSTGRES_URI)]
+    #[test]
+    fn statement_execute_redshift() -> Result<()> {
+        execute_statement(Backend::Redshift)
     }
 
     #[test_with::env(ADBC_POSTGRES_URI)]

@@ -11,7 +11,7 @@ type RelationCacheKey = String;
 #[derive(Debug, Clone)]
 pub struct RelationCacheEntry {
     /// Timestamp in milliseconds when this cache entry was created
-    _created_at: u128,
+    created_at: u128,
     relation: Arc<dyn BaseRelation>,
     relation_config: Option<Arc<dyn BaseRelationConfig>>,
 }
@@ -27,7 +27,7 @@ impl RelationCacheEntry {
             .map(|d| d.as_millis())
             .unwrap_or(0);
         Self {
-            _created_at: created_at,
+            created_at,
             relation,
             relation_config,
         }
@@ -49,6 +49,8 @@ struct SchemaEntry {
     relations: DashMap<RelationCacheKey, RelationCacheEntry>,
     // Tracks whether or not we have complete knowledge of this schema
     is_complete: bool,
+    // Timestamp when this schema was cached (for complete schemas)
+    cached_at: u128,
 }
 
 /// A dialect agnostic cache of [RelationCacheEntry]
@@ -142,11 +144,17 @@ impl RelationCache {
             })
             .collect();
 
+        let cached_at = std::time::UNIX_EPOCH
+            .elapsed()
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+
         self.schemas_and_relations.insert(
             schema.to_string(),
             SchemaEntry {
                 relations: cached_relations,
                 is_complete: true,
+                cached_at,
             },
         );
     }
@@ -164,6 +172,14 @@ impl RelationCache {
     pub fn contains_full_schema_for_relation(&self, relation: &Arc<dyn BaseRelation>) -> bool {
         self.schemas_and_relations
             .get(&Self::get_schema_cache_key_from_relation(relation))
+            .map(|entry| entry.is_complete)
+            .unwrap_or(false)
+    }
+
+    /// Checks if the entire schema was cached
+    pub fn contains_full_schema(&self, schema: &CatalogAndSchema) -> bool {
+        self.schemas_and_relations
+            .get(&schema.to_string())
             .map(|entry| entry.is_complete)
             .unwrap_or(false)
     }
@@ -197,6 +213,22 @@ impl RelationCache {
         self.schemas_and_relations.clear();
     }
 
+    /// Number of total relations cached
+    pub fn num_relations(&self) -> usize {
+        self.schemas_and_relations
+            .iter()
+            .map(|entry| entry.value().relations.len())
+            .sum()
+    }
+
+    /// Number of total schemas cached
+    pub fn num_schemas(&self) -> usize {
+        self.schemas_and_relations
+            .iter()
+            .filter(|entry| entry.value().is_complete)
+            .count()
+    }
+
     /// Helper: Generates cache key pairs from a [BaseRelation]
     fn get_relation_cache_keys(relation: &Arc<dyn BaseRelation>) -> (String, String) {
         (
@@ -214,10 +246,113 @@ impl RelationCache {
     fn get_schema_cache_key_from_relation(relation: &Arc<dyn BaseRelation>) -> String {
         CatalogAndSchema::from(relation).to_string()
     }
+
+    fn log_final_state(&self) {
+        use dbt_common::constants::CACHE_LOG;
+        use std::fmt::Write;
+
+        let total_schemas = self.schemas_and_relations.len();
+        if total_schemas == 0 {
+            return;
+        }
+
+        let mut buf = String::new();
+
+        writeln!(&mut buf).unwrap();
+        writeln!(&mut buf, "=== RelationCache Final State ===").unwrap();
+        writeln!(&mut buf, "Total Schemas: {total_schemas}").unwrap();
+        writeln!(&mut buf).unwrap();
+
+        // Collect and sort schema entries for consistent output
+        let mut schema_entries: Vec<_> = self.schemas_and_relations.iter().collect();
+        schema_entries.sort_by(|a, b| a.key().cmp(b.key()));
+
+        let mut complete_schemas = 0;
+        let mut partial_schemas = 0;
+        let mut total_relations = 0;
+
+        for (idx, schema_entry) in schema_entries.iter().enumerate() {
+            let schema_name = schema_entry.key();
+            let entry = schema_entry.value();
+            let relation_count = entry.relations.len();
+            total_relations += relation_count;
+
+            if entry.is_complete {
+                complete_schemas += 1;
+
+                writeln!(&mut buf, "[COMPLETE] SCHEMA").unwrap();
+                writeln!(&mut buf, "   ╭─ Name: {schema_name}").unwrap();
+                writeln!(&mut buf, "   ├─ Relations: {relation_count}").unwrap();
+
+                if entry.cached_at > 0 {
+                    writeln!(&mut buf, "   ├─ Cached: {}ms", entry.cached_at).unwrap();
+                } else {
+                    writeln!(&mut buf, "   ├─ Cached: unknown").unwrap();
+                }
+                writeln!(&mut buf, "   ╰─ Status: All relations cached as a batch").unwrap();
+            } else {
+                partial_schemas += 1;
+
+                writeln!(&mut buf, "[PARTIAL]  SCHEMA").unwrap();
+                writeln!(&mut buf, "   ╭─ Name: {schema_name}").unwrap();
+                writeln!(
+                    &mut buf,
+                    "   ├─ Relations: {relation_count} (individually cached)"
+                )
+                .unwrap();
+                writeln!(&mut buf, "   ├─ Individual Relations:").unwrap();
+
+                let mut relations: Vec<_> = entry.relations.iter().collect();
+                relations.sort_by(|a, b| a.key().cmp(b.key()));
+
+                for (rel_idx, relation) in relations.iter().enumerate() {
+                    let relation_key = relation.key();
+                    let created_at = relation.value().created_at;
+                    let is_last = rel_idx == relations.len() - 1;
+                    let connector = if is_last { "╰" } else { "├" };
+
+                    if created_at > 0 {
+                        writeln!(
+                            &mut buf,
+                            "   │  {connector} • {relation_key} → {created_at}ms"
+                        )
+                        .unwrap();
+                    } else {
+                        writeln!(
+                            &mut buf,
+                            "   │  {connector} • {relation_key} → no timestamp"
+                        )
+                        .unwrap();
+                    }
+                }
+                writeln!(&mut buf, "   ╰─ Status: Relations cached individually").unwrap();
+            }
+
+            if idx < schema_entries.len() - 1 {
+                writeln!(&mut buf).unwrap();
+            }
+        }
+
+        writeln!(&mut buf).unwrap();
+        writeln!(&mut buf, "=== Summary ===").unwrap();
+        writeln!(&mut buf, "Complete Schemas: {complete_schemas}").unwrap();
+        writeln!(&mut buf, "Partial Schemas: {partial_schemas}").unwrap();
+        writeln!(&mut buf, "Total Relations: {total_relations}").unwrap();
+
+        log::debug!(target: CACHE_LOG, name = "CacheState"; "{buf}");
+    }
+}
+
+impl Drop for RelationCache {
+    fn drop(&mut self) {
+        self.log_final_state();
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::AdapterType;
+
     use super::*;
     use dbt_schemas::schemas::{common::ResolvedQuoting, relations::DEFAULT_RESOLVED_QUOTING};
 
@@ -229,7 +364,7 @@ mod tests {
 
         // Create relations with different combinations of database, schema, identifier
         let relation1 = create_relation(
-            "postgres".to_string(),
+            AdapterType::Postgres,
             "db1".to_string(),
             "schema1".to_string(),
             Some("table1".to_string()),
@@ -239,7 +374,7 @@ mod tests {
         .unwrap();
 
         let relation2 = create_relation(
-            "postgres".to_string(),
+            AdapterType::Postgres,
             "db2".to_string(),
             "schema1".to_string(),
             Some("table1".to_string()),
@@ -249,7 +384,7 @@ mod tests {
         .unwrap();
 
         let relation3 = create_relation(
-            "postgres".to_string(),
+            AdapterType::Postgres,
             "db1".to_string(),
             "schema2".to_string(),
             Some("table1".to_string()),
@@ -259,7 +394,7 @@ mod tests {
         .unwrap();
 
         let relation4 = create_relation(
-            "postgres".to_string(),
+            AdapterType::Postgres,
             "db1".to_string(),
             "schema1".to_string(),
             Some("table2".to_string()),
@@ -269,7 +404,7 @@ mod tests {
         .unwrap();
 
         let relation1_dup = create_relation(
-            "postgres".to_string(),
+            AdapterType::Postgres,
             "db1".to_string(),
             "schema1".to_string(),
             Some("table1".to_string()),
@@ -318,7 +453,7 @@ mod tests {
 
         // With DEFAULT_RESOLVED_QUOTING
         let relation_quoted = create_relation(
-            "postgres".to_string(),
+            AdapterType::Postgres,
             "MyDB".to_string(),
             "MySchema".to_string(),
             Some("MyTable".to_string()),
@@ -329,7 +464,7 @@ mod tests {
 
         // With no quoting
         let relation_unquoted = create_relation(
-            "postgres".to_string(),
+            AdapterType::Postgres,
             "MyDB".to_string(),
             "MySchema".to_string(),
             Some("MyTable".to_string()),
@@ -359,7 +494,7 @@ mod tests {
 
         // Test that we find the unquoted relation when searching with unquoted policy
         let search_relation_unquoted = create_relation(
-            "postgres".to_string(),
+            AdapterType::Postgres,
             "MyDB".to_string(),
             "MySchema".to_string(),
             Some("MyTable".to_string()),
@@ -392,7 +527,7 @@ mod tests {
                 // Create relations in 3 different schemas
                 (0..3).map(move |schema_id| {
                     create_relation(
-                        "postgres".to_string(),
+                        AdapterType::Postgres,
                         "test_db".to_string(),
                         format!("schema_{schema_id}"),
                         Some(format!("table_{schema_id}_{i}")),
@@ -452,7 +587,7 @@ mod tests {
                             6 => {
                                 // Rename operations (less common but important)
                                 let new_relation = create_relation(
-                                    "postgres".to_string(),
+                                    AdapterType::Postgres,
                                     "test_db".to_string(),
                                     format!("schema_{}", thread_id % 3),
                                     Some(format!("renamed_table_{thread_id}_{i}")),

@@ -2,16 +2,18 @@ use super::utils::{base_tests_inner, column_tests_inner};
 use crate::args::ResolveArgs;
 use dbt_common::FsError;
 use dbt_common::FsResult;
+use dbt_common::adapter::AdapterType;
 use dbt_common::constants::DBT_GENERIC_TESTS_DIR_NAME;
 use dbt_common::io_args;
 use dbt_common::io_args::IoArgs;
 use dbt_common::show_error;
 use dbt_common::show_package_error;
-use dbt_common::show_warning_soon_to_be_error;
+use dbt_common::show_strict_error;
 use dbt_common::{ErrorCode, err};
 use dbt_common::{fs_err, stdfs};
 use dbt_frontend_common::Dialect;
 use dbt_jinja_utils::serde::check_single_expression_without_whitepsace_control;
+use dbt_jinja_utils::serde::yaml_to_fs_error;
 use dbt_schemas::schemas::common::Versions;
 use dbt_schemas::schemas::common::normalize_quote;
 use dbt_schemas::schemas::data_tests::{CustomTest, DataTests};
@@ -20,17 +22,17 @@ use dbt_schemas::schemas::dbt_column::ColumnProperties;
 use dbt_schemas::schemas::project::DataTestConfig;
 use dbt_schemas::schemas::properties::Tables;
 use dbt_schemas::schemas::properties::{ModelProperties, SeedProperties, SnapshotProperties};
-use dbt_schemas::state::DbtAsset;
+use dbt_schemas::state::{DbtAsset, GenericTestAsset};
 use dbt_serde_yaml::ShouldBe;
+use dbt_serde_yaml::Span;
 use dbt_serde_yaml::Spanned;
 use dbt_serde_yaml::Verbatim;
-use dbt_serde_yaml::{Span, to_value};
 use itertools::Itertools;
 use md5;
 use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::hash::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
@@ -39,39 +41,43 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::LazyLock;
 
+use dbt_common::string_utils::maybe_truncate_test_name;
+
 pub struct TestableNode<'a, T: TestableNodeTrait> {
     inner: &'a T,
 }
 
 impl<T: TestableNodeTrait> TestableNode<'_, T> {
+    #[allow(clippy::too_many_arguments)]
     pub fn persist(
         &self,
         project_name: &str,
         root_project_name: &str,
-        collected_tests: &mut Vec<DbtAsset>,
-        adapter_type: &str,
-        is_replay_mode: bool,
+        collected_generic_tests: &mut Vec<GenericTestAsset>,
+        adapter_type: AdapterType,
         io_args: &IoArgs,
+        original_file_path: &PathBuf,
     ) -> FsResult<()> {
         let test_configs: Vec<GenericTestConfig> = self.try_into()?;
         // Process tests for each version (or single resource)
-        let dialect = Dialect::from_str(adapter_type)
-            .map_err(|e| fs_err!(ErrorCode::Unexpected, "Failed to parse adapter type: {}", e))?;
+        let dialect = Dialect::from(adapter_type);
+        let mut seen_tests: HashSet<String> = HashSet::new();
         for test_config in test_configs {
             // Handle model-level tests
             if let Some(tests) = &test_config.model_tests {
                 for test in tests {
                     let column_test: DataTests = test.clone();
-                    let dbt_asset = persist_inner(
+                    let test_asset = persist_inner(
                         project_name,
                         root_project_name,
                         &test_config,
                         test.column_name(),
                         &column_test,
-                        false,
                         io_args,
+                        original_file_path,
+                        &mut seen_tests,
                     )?;
-                    collected_tests.push(dbt_asset);
+                    collected_generic_tests.push(test_asset);
                 }
             }
 
@@ -82,6 +88,7 @@ impl<T: TestableNodeTrait> TestableNode<'_, T> {
                         // Need dialect to quote properly
                         let (column_name, should_quote) =
                             normalize_quote(*should_quote, adapter_type, column_name);
+
                         let quoted_column_name = if should_quote {
                             format!(
                                 "{}{}{}",
@@ -92,16 +99,17 @@ impl<T: TestableNodeTrait> TestableNode<'_, T> {
                         } else {
                             column_name.to_string()
                         };
-                        let dbt_asset = persist_inner(
+                        let test_asset = persist_inner(
                             project_name,
                             root_project_name,
                             &test_config,
                             Some(&quoted_column_name),
                             test,
-                            is_replay_mode,
                             io_args,
+                            original_file_path,
+                            &mut seen_tests,
                         )?;
-                        collected_tests.push(dbt_asset);
+                        collected_generic_tests.push(test_asset);
                     }
                 }
             }
@@ -111,15 +119,18 @@ impl<T: TestableNodeTrait> TestableNode<'_, T> {
     }
 }
 
+#[allow(clippy::ptr_arg)]
+#[allow(clippy::too_many_arguments)]
 fn persist_inner(
     project_name: &str,
     root_project_name: &str,
     test_config: &GenericTestConfig,
     column_name: Option<&str>,
     test: &DataTests,
-    is_replay_mode: bool,
     io_args: &IoArgs,
-) -> FsResult<DbtAsset> {
+    original_file_path: &PathBuf,
+    seen_tests: &mut HashSet<String>,
+) -> FsResult<GenericTestAsset> {
     // If this is not the root project, we need to pass the project name as a dependency package name
     let dependecy_package_name = if project_name != root_project_name {
         Some(project_name)
@@ -134,6 +145,7 @@ fn persist_inner(
         io_args,
         dependecy_package_name,
     )?;
+
     let TestDetails {
         test_macro_name,
         custom_test_name,
@@ -151,7 +163,6 @@ fn persist_inner(
         &kwargs,
         namespace.as_ref(),
         &jinja_set_vars,
-        is_replay_mode,
     );
     let path = PathBuf::from(DBT_GENERIC_TESTS_DIR_NAME).join(format!("{full_name}.sql"));
     let test_file = io_args.out_dir.join(&path);
@@ -162,11 +173,41 @@ fn persist_inner(
         &config,
         &jinja_set_vars,
     )?;
+    if !seen_tests.insert(full_name.clone()) {
+        match column_name {
+            Some(column_name) => {
+                return err!(
+                    ErrorCode::SchemaError,
+                    "dbt found two data_tests with the same name \"{}\" on column \"{}\" in \"{}\" in the file \"{}\"",
+                    full_name,
+                    column_name,
+                    test_config.resource_name,
+                    original_file_path.display()
+                );
+            }
+            None => {
+                return err!(
+                    ErrorCode::SchemaError,
+                    "dbt found two data_tests with the same name \"{}\" in \"{}\" in the file \"{}\"",
+                    full_name,
+                    test_config.resource_name,
+                    original_file_path.display()
+                );
+            }
+        }
+    }
     stdfs::write(&test_file, generated_test_sql)?;
-    Ok(DbtAsset {
+    let dbt_asset = DbtAsset {
         path,
         base_path: io_args.out_dir.to_path_buf(),
         package_name: project_name.to_string(),
+    };
+    Ok(GenericTestAsset {
+        dbt_asset,
+        original_file_path: original_file_path.clone(),
+        resource_name: test_config.resource_name.clone(),
+        resource_type: test_config.resource_type.clone(),
+        test_name: full_name,
     })
 }
 
@@ -346,10 +387,8 @@ fn extract_kwargs_and_jinja_vars_and_dep_kwarg_and_configs(
             // If we are parsing a dependency package, we use a special macros
             // that ensures at most one error is shown per package.
             show_package_error!(io_args, package_name);
-        } else if std::env::var("_DBT_FUSION_STRICT_MODE").is_ok() {
-            show_error!(io_args, schema_error);
         } else {
-            show_warning_soon_to_be_error!(io_args, schema_error);
+            show_strict_error!(io_args, schema_error, dependency_package_name);
         }
     }
     for (key, value) in deprecated.clone() {
@@ -395,7 +434,7 @@ fn extract_kwargs_and_jinja_vars_and_dep_kwarg_and_configs(
             serde_json::from_value(merged_config_json).unwrap();
 
         // Deserialize the final merged config
-        if let Ok(merged_config) = merged_config_yaml.into_typed(|_, _, _| {}, |_| Ok(None)) {
+        if let Ok(merged_config) = serde::Deserialize::deserialize(merged_config_yaml) {
             final_config = Some(merged_config);
         }
     }
@@ -519,7 +558,6 @@ fn generate_test_name(
     kwargs: &BTreeMap<String, Value>,
     package_name: Option<&String>,
     jinja_set_vars: &BTreeMap<String, String>,
-    replay_mode: bool,
 ) -> String {
     // Flatten args (excluding 'model' and config args)
     let mut flat_args = Vec::new();
@@ -560,8 +598,7 @@ fn generate_test_name(
         .iter()
         .map(|arg| {
             CLEAN_REGEX
-                .replace_all(arg, "_")
-                .trim_matches('_')
+                .replace_all(arg.trim_matches('"'), "_")
                 .to_string()
         })
         .collect();
@@ -605,14 +642,7 @@ fn generate_test_name(
     // 30 identifying chars plus a 32-character hash of the full contents
     // See the function `synthesize_generic_test_name` in `dbt-core`:
     // https://github.com/dbt-labs/dbt-core/blob/9010537499980743503ed3b462eb1952be4d2b38/core/dbt/parser/generic_test_builders.py
-    if result.len() >= 64 && !replay_mode {
-        let test_trunc_identifier: String = test_identifier.chars().take(30).collect();
-        let hash = md5::compute(result.as_str());
-        let res: String = format!("{test_trunc_identifier}_{hash:x}");
-        res
-    } else {
-        result
-    }
+    maybe_truncate_test_name(&test_identifier, &result)
 }
 
 /// Represents column inheritance rules for a model version
@@ -725,7 +755,8 @@ fn generate_test_macro(
     // ── serialize & emit the config block ────────────────
     if let Some(cfg) = config {
         // we write the config out as a JSON in {{ config(...) }}
-        let config_str = serde_json::to_string(&cfg)
+        let cfg_val = dbt_serde_yaml::to_value(cfg).map_err(|e| yaml_to_fs_error(e, None))?;
+        let config_str = serde_json::to_string(&cfg_val)
             .map_err(|e| fs_err!(ErrorCode::SchemaError, "Failed to serialize config: {}", e))?;
 
         sql.push_str(&format!("{{{{ config({config_str}) }}}}\n"));
@@ -1205,7 +1236,7 @@ mod tests {
         let test_args_btree: BTreeMap<String, Value> = test_args.into_iter().collect();
 
         // Convert to dbt_serde_yaml::Value using the to_value function
-        let yaml_value = to_value(&test_args_btree).unwrap();
+        let yaml_value = dbt_serde_yaml::to_value(&test_args_btree).unwrap();
         let verbatim_wrapper = Verbatim::from(Some(yaml_value));
         let empty_deprecated = Verbatim::from(BTreeMap::new());
         let existing_config = None;
@@ -1300,7 +1331,6 @@ mod tests {
             &kwargs,
             None,
             &jinja_set_vars,
-            false,
         );
 
         // Verify that the test name does not contain the variable name
@@ -1324,7 +1354,6 @@ mod tests {
             &kwargs,
             None,
             &empty_set_vars,
-            false,
         );
 
         // set vars part of the name is truncated from the final test name due to length
@@ -1355,7 +1384,6 @@ mod tests {
             &BTreeMap::new(),
             None,
             &BTreeMap::new(),
-            false,
         );
 
         assert!(
@@ -1379,7 +1407,7 @@ mod tests {
             model_tests: Some(vec![DataTests::CustomTest(CustomTest::MultiKey(Box::new(
                 CustomTestMultiKey {
                     arguments: Verbatim::from(Some(
-                        to_value(json!({
+                        dbt_serde_yaml::to_value(json!({
                             "column_names": ["id"]
                         }))
                         .unwrap(),
@@ -1418,7 +1446,6 @@ mod tests {
             &kwargs,
             None,
             &BTreeMap::new(),
-            false,
         );
 
         // The generated test name will initially be over 64 characters and have the

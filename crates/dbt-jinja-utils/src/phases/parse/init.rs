@@ -2,12 +2,16 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    str::FromStr as _,
     sync::{Arc, Mutex},
 };
 
 use chrono::DateTime;
 use chrono_tz::Tz;
-use dbt_common::{ErrorCode, FsResult, cancellation::CancellationToken, fs_err, io_args::IoArgs};
+use dbt_common::{
+    ErrorCode, FsResult, adapter::AdapterType, cancellation::CancellationToken, fs_err,
+    io_args::IoArgs,
+};
 use dbt_fusion_adapter::parse::adapter::create_parse_adapter;
 use dbt_schemas::{
     schemas::{
@@ -39,7 +43,7 @@ pub fn initialize_parse_jinja_environment(
     profile: &str,
     target: &str,
     adapter_type: &str,
-    db_config: &DbConfig,
+    db_config: DbConfig,
     package_quoting: DbtQuoting,
     macro_units: BTreeMap<String, Vec<MacroUnit>>,
     vars: BTreeMap<String, BTreeMap<String, DbtVars>>,
@@ -54,7 +58,9 @@ pub fn initialize_parse_jinja_environment(
 ) -> FsResult<JinjaEnv> {
     // Set the thread local dependencies
     THREAD_LOCAL_DEPENDENCIES.get_or_init(|| Mutex::new(all_package_names));
-    let target_context = TargetContext::try_from(db_config.clone())
+    let database = db_config.get_database().cloned();
+    let schema = db_config.get_schema().cloned();
+    let target_context = TargetContext::try_from(db_config)
         .map_err(|e| fs_err!(ErrorCode::InvalidConfig, "{}", &e))?;
     let target_context = Arc::new(build_target_context_map(profile, target, target_context));
 
@@ -100,15 +106,16 @@ pub fn initialize_parse_jinja_environment(
             "var".to_string(),
             MinijinjaValue::from_object(ConfiguredVar::new(vars, cli_vars)),
         ),
-        (
-            "database".to_string(),
-            MinijinjaValue::from(db_config.get_database()),
-        ),
-        (
-            "schema".to_string(),
-            MinijinjaValue::from(db_config.get_schema()),
-        ),
+        ("database".to_string(), MinijinjaValue::from(database)),
+        ("schema".to_string(), MinijinjaValue::from(schema)),
     ]);
+
+    let adapter_type = AdapterType::from_str(adapter_type).map_err(|_| {
+        fs_err!(
+            ErrorCode::InvalidConfig,
+            "Unknown or unsupported adapter type '{adapter_type}'",
+        )
+    })?;
 
     let env = JinjaEnvBuilder::new()
         .with_undefined_behavior(minijinja::UndefinedBehavior::AllowAll)

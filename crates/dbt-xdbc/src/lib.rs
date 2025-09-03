@@ -4,6 +4,12 @@
     html_favicon_url = "https://raw.githubusercontent.com/apache/arrow/refs/heads/main/docs/source/_static/favicon.ico"
 )]
 #![doc = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))]
+#![allow(clippy::cognitive_complexity)]
+#![allow(clippy::if_same_then_else)]
+#![allow(clippy::let_and_return)]
+#![allow(clippy::needless_bool)]
+#![allow(clippy::only_used_in_recursion)]
+#![allow(clippy::should_implement_trait)]
 
 use dbt_cancel::{Cancellable, CancellationToken, CancelledError};
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -37,6 +43,7 @@ pub mod query_ctx;
 pub use query_ctx::QueryCtx;
 
 pub mod semaphore;
+pub mod sql;
 
 #[cfg(feature = "odbc")]
 pub(crate) mod odbc;
@@ -53,6 +60,7 @@ pub(crate) mod install;
 pub mod bigquery;
 pub mod databricks;
 pub mod redshift;
+pub mod salesforce;
 pub mod snowflake;
 
 // REPL for ADBC drivers
@@ -75,9 +83,11 @@ pub fn str_from_sqlstate(sqlstate: &[c_char; 5]) -> &str {
 
 // XXX: if needed, rollback to 0.17.0+dbt0.0.8 because 0.0.9 is broken on Windows
 pub const SNOWFLAKE_DRIVER_VERSION: &str = "0.18.0+dbt0.0.11";
-pub const BIGQUERY_DRIVER_VERSION: &str = "0.18.0+dbt0.0.11";
+pub const BIGQUERY_DRIVER_VERSION: &str = "0.18.0+dbt0.0.12";
 pub const POSTGRES_DRIVER_VERSION: &str = "0.18.0+dbt0.0.3";
 pub const DATABRICKS_DRIVER_VERSION: &str = "0.18.0+dbt0.0.6";
+pub const REDSHIFT_DRIVER_VERSION: &str = "0.18.0+dbt0.18.1";
+pub const SALESFORCE_DRIVER_VERSION: &str = "0.18.0+dbt0.0.1";
 
 pub use install::pre_install_driver;
 

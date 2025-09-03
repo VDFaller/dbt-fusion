@@ -1,4 +1,3 @@
-use datafusion::prelude::DataFrame;
 use dbt_frontend_common::Dialect;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -23,8 +22,8 @@ pub fn make_table_name<T: AsRef<str>>(catalog: T, schema: T, table: T) -> String
     [catalog.as_ref(), schema.as_ref(), table.as_ref()].join(".")
 }
 
-pub fn make_column_names(df: &DataFrame) -> Vec<String> {
-    df.schema()
+pub fn make_column_names(schema: &Schema) -> Vec<String> {
+    schema
         .fields()
         .iter()
         .map(|f| f.name().to_owned())
@@ -428,7 +427,7 @@ pub fn pretty_schema_table(
     subtitle: &str,
     display_format: &DisplayFormat,
     table_schema: &Schema,
-    _dialect: &Dialect,
+    _dialect: Dialect,
     limit: Option<usize>,
     show_footer: bool,
 ) -> FsResult<String> {

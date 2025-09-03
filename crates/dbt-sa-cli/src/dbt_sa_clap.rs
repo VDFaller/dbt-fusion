@@ -1,6 +1,9 @@
 use clap::{ArgAction, builder::BoolishValueParser};
 use console::Style;
+use dbt_common::constants::{DBT_PROJECT_YML, DBT_TARGET_DIR_NAME};
+use dbt_common::io_utils::determine_project_dir;
 use dbt_common::logging::LogFormat;
+use dbt_common::{ErrorCode, FsResult, fs_err, stdfs};
 use dbt_serde_yaml::Value;
 use log::LevelFilter;
 use serde::{Deserialize, Serialize};
@@ -263,7 +266,7 @@ pub struct CommonArgs {
     pub otm_file_name: Option<String>,
 
     /// Set logging format; use --log-format-file to override.
-    #[arg(global = true, long, env = "DBT_LOG_FORMAT", default_value_t = LogFormat::Text,)]
+    #[arg(global = true, long, env = "DBT_LOG_FORMAT", default_value_t = LogFormat::Default,)]
     pub log_format: LogFormat,
 
     /// Set log file format, overriding the default and --log-format setting.
@@ -300,25 +303,60 @@ pub struct CommonArgs {
 // ------------------------------------------------------------------------------------------------
 // Arg processing
 impl Cli {
-    pub fn to_eval_args(
-        &self,
-        arg: SystemArgs,
-        in_dir: &Path,
-        out_dir: &Path,
-        from_main: bool,
-    ) -> EvalArgs {
+    pub fn to_eval_args(&self, system_arg: SystemArgs) -> FsResult<EvalArgs> {
+        // Determine the input and output directories based on the command.
+        // Some commands operate without project context, while others must be run in a project directory.
+        let (in_dir, out_dir) = {
+            match &self.command {
+                Commands::Man(_) | Commands::Init(_) => {
+                    // These commands do not require a project directory
+                    (PathBuf::from("."), PathBuf::from("."))
+                }
+                _ => {
+                    let in_dir = if let Some(project_dir) = self.project_dir() {
+                        project_dir
+                    } else {
+                        // TODO: the first argument to this function is never used anywhere in the codebase,
+                        // possibly it should be removed or properly wired
+                        let node_targets = &[];
+                        determine_project_dir(node_targets, DBT_PROJECT_YML)
+                            .map_err(|e| fs_err!(ErrorCode::IoError, "{}", e))?
+                    };
+                    let in_dir = stdfs::canonicalize(in_dir)?;
+
+                    let out_dir = self
+                        .target_path()
+                        .map(|p| if p.is_relative() { in_dir.join(p) } else { p })
+                        .unwrap_or(in_dir.join(DBT_TARGET_DIR_NAME));
+                    stdfs::create_dir_all(&out_dir).map_err(|e| {
+                        fs_err!(
+                            ErrorCode::IoError,
+                            "Failed to create output directory: {}",
+                            e
+                        )
+                    })?;
+                    let out_dir = stdfs::canonicalize(out_dir)?;
+
+                    (in_dir, out_dir)
+                }
+            }
+        };
+
+        let from_main = system_arg.from_main;
+
         let mut arg = match &self.command {
-            Commands::Init(args) => args.to_eval_args(arg, in_dir, out_dir),
-            Commands::Deps(args) => args.to_eval_args(arg, in_dir, out_dir),
-            Commands::List(args) => args.to_eval_args(arg, in_dir, out_dir),
-            Commands::Parse(args) => args.to_eval_args(arg, in_dir, out_dir),
-            Commands::Ls(args) => args.to_eval_args(arg, in_dir, out_dir),
-            Commands::Clean(args) => args.to_eval_args(arg, in_dir, out_dir),
-            Commands::Man(args) => args.to_eval_args(arg, in_dir, out_dir),
-            Commands::Check(args) => args.to_eval_args(arg, in_dir, out_dir),
+            Commands::Init(args) => args.to_eval_args(system_arg, &in_dir, &out_dir),
+            Commands::Deps(args) => args.to_eval_args(system_arg, &in_dir, &out_dir),
+            Commands::List(args) => args.to_eval_args(system_arg, &in_dir, &out_dir),
+            Commands::Parse(args) => args.to_eval_args(system_arg, &in_dir, &out_dir),
+            Commands::Ls(args) => args.to_eval_args(system_arg, &in_dir, &out_dir),
+            Commands::Clean(args) => args.to_eval_args(system_arg, &in_dir, &out_dir),
+            Commands::Man(args) => args.to_eval_args(system_arg, &in_dir, &out_dir),
+            Commands::Check(args) => args.to_eval_args(system_arg, &in_dir, &out_dir),
         };
         arg.from_main = from_main;
-        arg
+
+        Ok(arg)
     }
 
     pub fn common_args(&self) -> CommonArgs {
@@ -423,6 +461,8 @@ impl InitArgs {
                 in_dir: in_dir.to_path_buf(),
                 out_dir: out_dir.to_path_buf(),
                 show,
+                command: arg.command.clone(),
+                debug: arg.io.debug,
                 invocation_id: arg.io.invocation_id,
                 send_anonymous_usage_stats: self.common_args.send_anonymous_usage_stats,
                 status_reporter: arg.io.status_reporter.clone(),
@@ -482,13 +522,7 @@ impl CommonArgs {
         } else if self.show.contains(&ShowOptions::None) {
             HashSet::new()
         } else if self.show.is_empty() {
-            HashSet::from_iter(vec![
-                ShowOptions::Progress,
-                ShowOptions::ProgressParse,
-                ShowOptions::ProgressRender,
-                ShowOptions::ProgressAnalyze,
-                ShowOptions::ProgressRun,
-            ])
+            HashSet::from_iter(vec![ShowOptions::Progress, ShowOptions::Completed])
         } else {
             self.show
                 .iter()
@@ -498,9 +532,11 @@ impl CommonArgs {
                         vec![
                             ShowOptions::Progress,
                             ShowOptions::ProgressParse,
+                            ShowOptions::ProgressHydrate,
                             ShowOptions::ProgressRender,
                             ShowOptions::ProgressAnalyze,
                             ShowOptions::ProgressRun,
+                            ShowOptions::Completed,
                         ]
                     } else {
                         vec![opt]
@@ -517,6 +553,8 @@ impl CommonArgs {
             command: arg.command.clone(),
             io: IoArgs {
                 show,
+                command: arg.command.clone(),
+                debug: self.debug,
                 invocation_id: arg.io.invocation_id,
                 in_dir: in_dir.to_path_buf(),
                 out_dir: out_dir.to_path_buf(),
@@ -594,11 +632,15 @@ impl CommonArgs {
 }
 
 pub fn from_main(cli: &Cli) -> SystemArgs {
+    let command = cli.get_command_str().to_string();
+
     SystemArgs {
-        command: cli.get_command_str().to_string(),
+        command: command.clone(),
         io: IoArgs {
             invocation_id: uuid::Uuid::new_v4(),
             show: cli.common_args().show.iter().cloned().collect(),
+            command,
+            debug: cli.common_args().debug,
             in_dir: PathBuf::new(),
             out_dir: PathBuf::new(),
             send_anonymous_usage_stats: cli.common_args().get_send_anonymous_usage_stats(),
@@ -632,11 +674,15 @@ pub fn from_main(cli: &Cli) -> SystemArgs {
 }
 
 pub fn from_lib(cli: &Cli) -> SystemArgs {
+    let command = cli.get_command_str().to_string();
+
     SystemArgs {
-        command: cli.get_command_str().to_string(),
+        command: command.clone(),
         io: IoArgs {
             invocation_id: uuid::Uuid::new_v4(),
             show: cli.common_args().show.iter().cloned().collect(),
+            command,
+            debug: cli.common_args().debug,
             in_dir: PathBuf::new(),
             out_dir: PathBuf::new(),
             send_anonymous_usage_stats: cli.common_args().get_send_anonymous_usage_stats(),

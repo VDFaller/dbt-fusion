@@ -88,7 +88,6 @@ pub fn dispatch_adapter_calls(
                     Err(e)
                 }
             })?;
-
             let schema = iter.next_arg::<&str>()?;
             let identifier = iter.next_arg::<&str>()?;
             iter.finish()?;
@@ -222,7 +221,12 @@ pub fn execute_macro_wrapper_with_package(
     package: &str,
 ) -> Result<Arc<RecordBatch>, AdapterError> {
     let result: Value = execute_macro_with_package(state, args, macro_name, package)?;
+    convert_macro_result_to_record_batch(&result)
+}
 
+pub fn convert_macro_result_to_record_batch(
+    result: &Value,
+) -> Result<Arc<RecordBatch>, AdapterError> {
     // Depending on the macro impl, result can be either ResultObject or AgateTable
     let table = if let Some(result) = result.downcast_object::<ResultObject>() {
         result.table.as_ref().expect("AgateTable exists").to_owned()

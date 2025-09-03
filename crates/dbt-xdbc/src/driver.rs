@@ -9,21 +9,27 @@ use crate::database::OdbcDatabase;
 use crate::install;
 use crate::semaphore::Semaphore;
 use adbc_core::{
-    Driver as _,
-    driver_manager::ManagedDriver as ManagedAdbcDriver,
+    Driver as _, LOAD_FLAG_DEFAULT,
     error::{Error, Result, Status},
     options::{AdbcVersion, OptionDatabase, OptionValue},
 };
+use adbc_driver_manager::ManagedDriver as ManagedAdbcDriver;
 use libloading;
 use parking_lot::RwLockUpgradableReadGuard;
 use std::sync::Arc;
 use std::{
-    collections::HashMap, env, ffi::c_int, fmt, fmt::Display, hash::Hash, path::PathBuf,
-    sync::LazyLock,
+    collections::HashMap, env, ffi::c_int, fmt, fmt::Display, hash::Hash, path::Path,
+    path::PathBuf, sync::LazyLock,
 };
 
 mod builder;
 pub use builder::*;
+
+#[cfg(debug_assertions)]
+mod env_var;
+
+#[cfg(debug_assertions)]
+use {env_var::env_var_bool, std::io::ErrorKind, std::process::Command};
 
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
 pub enum Backend {
@@ -37,6 +43,8 @@ pub enum Backend {
     Databricks,
     /// Redshift driver implementation (ADBC).
     Redshift,
+    /// Salesforce driver implementation (ADBC).
+    Salesforce,
     /// Databricks driver implementation (ODBC).
     DatabricksODBC,
     /// Redshift driver implementation (ODBC).
@@ -67,6 +75,7 @@ impl Display for Backend {
             Backend::Redshift => write!(f, "Redshift"),
             Backend::DatabricksODBC => write!(f, "Databricks"),
             Backend::RedshiftODBC => write!(f, "Redshift"),
+            Backend::Salesforce => write!(f, "Salesforce"),
             Backend::Generic { library_name, .. } => write!(f, "Generic({library_name})"),
         }
     }
@@ -79,6 +88,7 @@ impl Backend {
             Backend::BigQuery => Some("adbc_driver_bigquery"),
             Backend::Postgres => Some("adbc_driver_postgresql"),
             Backend::Databricks => Some("adbc_driver_databricks"),
+            Backend::Salesforce => Some("adbc_driver_salesforce"),
             // todo: swap over to Redshift specific driver once available
             Backend::Redshift => Some("adbc_driver_postgresql"),
             Backend::DatabricksODBC | Backend::RedshiftODBC => None, // these use ODBC
@@ -99,14 +109,14 @@ impl Backend {
 
     pub(crate) fn ffi_protocol(&self) -> FFIProtocol {
         match self {
-            Backend::Snowflake => FFIProtocol::Adbc,
-            Backend::BigQuery => FFIProtocol::Adbc,
-            Backend::Postgres => FFIProtocol::Adbc,
-            Backend::Databricks => FFIProtocol::Adbc,
-            Backend::Redshift => FFIProtocol::Adbc,
-            Backend::DatabricksODBC => FFIProtocol::Odbc,
-            Backend::RedshiftODBC => FFIProtocol::Odbc,
-            Backend::Generic { .. } => FFIProtocol::Adbc,
+            Backend::Snowflake
+            | Backend::BigQuery
+            | Backend::Postgres
+            | Backend::Databricks
+            | Backend::Redshift
+            | Backend::Salesforce
+            | Backend::Generic { .. } => FFIProtocol::Adbc,
+            Backend::DatabricksODBC | Backend::RedshiftODBC => FFIProtocol::Odbc,
         }
     }
 }
@@ -150,24 +160,93 @@ impl Hash for AdbcDriverKey {
     }
 }
 
-/// Climb up the directory tree and returns the first lib/ directory found.
-fn find_adbc_libs_directory() -> Option<PathBuf> {
-    const MAX_HEIGHT: i32 = 5;
-    let mut height = 0;
-    let mut current_dir = env::current_exe().ok()?.parent()?.to_path_buf();
-    loop {
-        let sibling_lib = current_dir.join("lib");
-        if sibling_lib.is_dir() {
-            return Some(sibling_lib);
+/// Attempt to run `make` in the location of arrow-adbc.
+///
+/// Only runs when `DISABLE_CDN_DRIVER_CACHE` is set and `DISABLE_AUTO_DRIVER_REBUILD`
+/// is unset.
+#[cfg(debug_assertions)]
+fn rebuild_drivers(dir: &PathBuf) -> Result<()> {
+    let needs_rebuild = match Command::new("make").arg("-C").arg(dir).arg("-q").status() {
+        Ok(s) => s.code() == Some(1),
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            eprintln!("`make` not found, skipping rebuild");
+            false
         }
-        if !current_dir.pop() {
-            break;
+        Err(e) => {
+            return Err(Error::with_message_and_status(
+                format!("failed to spawn `make -q`: {e}"),
+                Status::Internal,
+            ));
         }
-        height += 1;
-        if height > MAX_HEIGHT {
-            break;
+    };
+
+    if needs_rebuild {
+        let status = Command::new("make")
+            .arg("-C")
+            .arg(dir)
+            .status()
+            .expect("failed to spawn `make`");
+
+        if !status.success() {
+            return Err(Error::with_message_and_status(
+                format!("`make` failed in {}", dir.display()),
+                Status::Internal,
+            ));
         }
     }
+    Ok(())
+}
+
+/// Searches for subpath starting at `start` and continuing upward through its parents.
+///
+/// Always checks start. `max_hops = 0` checks `start` only.
+/// does not canonicalize
+pub fn find_upward_dir(start: &Path, subpath: &Path, max_hops: usize) -> Option<PathBuf> {
+    if subpath.is_absolute() {
+        return None;
+    }
+
+    for dir in start.ancestors().take(max_hops + 1) {
+        let candidate = dir.join(subpath);
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Climb up the directory tree and returns the first lib/ directory found.
+fn find_adbc_libs_directory() -> Option<PathBuf> {
+    // No. of dirs to walk is chosen for `dbt` to operate when the invoked dbt project is:
+    // * a subdir of the fusion root but not past the crate level
+    // * a sibling directory to the invoked fs repo
+    // Also supports invocations by relative paths to <fs repo root>/target/debug/dbt
+    const LIB_HEIGHT_MAX: usize = 5;
+    #[cfg(debug_assertions)]
+    const ARROW_HEIGHT_MAX: usize = 10;
+
+    let starting_dir = env::current_exe().ok()?.parent()?.to_path_buf();
+
+    #[cfg(debug_assertions)]
+    {
+        let arrow_adbc_pkg_rel_path: PathBuf = ["arrow-adbc", "go", "adbc", "pkg"].iter().collect();
+
+        if let Some(sibling_arrow_adbc) =
+            find_upward_dir(&starting_dir, &arrow_adbc_pkg_rel_path, ARROW_HEIGHT_MAX)
+        {
+            if !env_var_bool("DISABLE_AUTO_DRIVER_REBUILD").ok()? {
+                rebuild_drivers(&sibling_arrow_adbc).unwrap();
+            }
+            return Some(sibling_arrow_adbc);
+        }
+    }
+
+    let lib_dir_rel_path = &PathBuf::from("lib");
+
+    if let Some(sibling_lib) = find_upward_dir(&starting_dir, lib_dir_rel_path, LIB_HEIGHT_MAX) {
+        return Some(sibling_lib);
+    }
+
     None
 }
 
@@ -233,15 +312,18 @@ impl AdbcDriver {
             | Backend::BigQuery
             | Backend::Postgres
             | Backend::Databricks
-            | Backend::Redshift => {
+            | Backend::Redshift
+            | Backend::Salesforce => {
                 debug_assert!(backend.ffi_protocol() == FFIProtocol::Adbc);
                 debug_assert!(install::is_installable_driver(backend));
                 #[cfg(debug_assertions)]
                 {
                     // This option is only used during development of ADBC drivers to make sure
                     // the drivers are not downloaded from the CDN and are instead loaded from
-                    // the nearby lib/ directory where debug builds of the drivers can be placed.
-                    let disable_cdn_driver_cache = env::var("DISABLE_CDN_DRIVER_CACHE").is_ok();
+                    // either the repo root lib/ directory or an arrow-adbc repo whose root is
+                    // a sibling to this fs repo.
+                    let disable_cdn_driver_cache = env_var_bool("DISABLE_CDN_DRIVER_CACHE")?;
+
                     if disable_cdn_driver_cache {
                         eprintln!(
                             "WARNING: {} ADBC driver is being loaded from {} in debug mode.",
@@ -255,6 +337,22 @@ impl AdbcDriver {
                         );
                     }
                 }
+                // Override for Snowflake dbt Projects integration
+                //
+                // This flag changes driver loading behavior to adhere to:
+                // https://arrow.apache.org/adbc/main/format/driver_manifests.html
+                let use_local_snowflake = env::var("DBT_LOAD_STANDARD_SNOWFLAKE_DRIVER").is_ok();
+
+                if use_local_snowflake {
+                    return ManagedAdbcDriver::load_from_name(
+                        backend.adbc_library_name().unwrap(),
+                        backend.adbc_driver_entrypoint(),
+                        adbc_version,
+                        LOAD_FLAG_DEFAULT,
+                        None,
+                    );
+                }
+
                 Self::try_load_driver_through_cdn_cache(backend, adbc_version)
             }
             // Drivers that are not published to the dbt Labs CDN.

@@ -1,17 +1,20 @@
 use crate::AdapterType;
 use crate::errors::AdapterResult;
 use crate::errors::{AdapterError, AsyncAdapterResult};
+use crate::relation_object::create_relation_internal;
 use crate::typed_adapter::TypedBaseAdapter;
 
 use arrow::array::RecordBatch;
 use arrow_schema::Schema;
 use dbt_common::cancellation::{Cancellable, CancellationToken};
 use dbt_common::io_args::IoArgs;
+use dbt_schemas::schemas::InternalDbtNodeAttributes;
 use dbt_schemas::schemas::{
     legacy_catalog::{CatalogTable, ColumnMetadata},
     relations::base::{BaseRelation, ComponentName, RelationPattern},
 };
 use dbt_schemas::state::ResolverState;
+use dbt_schemas::stats::Stats;
 use dbt_xdbc::{Connection, MapReduce, QueryCtx};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -31,30 +34,42 @@ pub type RelationVec = Vec<Arc<dyn BaseRelation>>;
 pub struct CatalogAndSchema {
     pub rendered_catalog: String,
     pub rendered_schema: String,
+    pub resolved_catalog: String,
+    pub resolved_schema: String,
 }
 
 impl fmt::Display for CatalogAndSchema {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}.{}", self.rendered_catalog, self.rendered_schema)
+        if self.rendered_catalog.is_empty() {
+            write!(f, "{}", self.rendered_schema)
+        } else if self.rendered_schema.is_empty() {
+            write!(f, "{}", self.rendered_catalog)
+        } else {
+            write!(f, "{}.{}", self.rendered_catalog, self.rendered_schema)
+        }
     }
 }
 
 impl From<&Arc<dyn BaseRelation>> for CatalogAndSchema {
     fn from(relation: &Arc<dyn BaseRelation>) -> Self {
-        let rendered_catalog = relation.quoted(
-            &relation
-                .database_as_resolved_str()
-                .expect("Database is required for relation"),
-        );
-        let rendered_schema = relation.quoted(
-            &relation
-                .schema_as_resolved_str()
-                .expect("schema is required for relation"),
+        let rendered_catalog =
+            relation.quoted(&relation.database_as_resolved_str().unwrap_or_default());
+        let rendered_schema =
+            relation.quoted(&relation.schema_as_resolved_str().unwrap_or_default());
+
+        let resolved_catalog = relation.database_as_resolved_str().unwrap_or_default();
+        let resolved_schema = relation.schema_as_resolved_str().unwrap_or_default();
+
+        assert!(
+            !(rendered_catalog.is_empty() && rendered_schema.is_empty()),
+            "Either rendered_catalog or rendered_schema must be present"
         );
 
         Self {
             rendered_catalog,
             rendered_schema,
+            resolved_catalog,
+            resolved_schema,
         }
     }
 }
@@ -119,19 +134,17 @@ pub enum UDFKind {
 
 /// Adapter that supports metadata query
 pub trait MetadataAdapter: TypedBaseAdapter + Send + Sync {
-    // TODO: (Snowflake only) make this work for all adapters
-    fn get_stats_from_nodes(
+    fn build_schemas_from_stats_sql(
         &self,
-        _: &ResolverState,
-    ) -> AsyncAdapterResult<BTreeMap<String, CatalogTable>> {
+        _: Arc<RecordBatch>,
+    ) -> AdapterResult<BTreeMap<String, CatalogTable>> {
         unimplemented!()
     }
 
-    // TODO: (Snowflake only) make this work for all adapters
-    fn get_columns_from_nodes(
+    fn build_columns_from_get_columns(
         &self,
-        _: &ResolverState,
-    ) -> AsyncAdapterResult<BTreeMap<String, BTreeMap<String, ColumnMetadata>>> {
+        _: Arc<RecordBatch>,
+    ) -> AdapterResult<BTreeMap<String, BTreeMap<String, ColumnMetadata>>> {
         unimplemented!()
     }
 
@@ -182,6 +195,94 @@ pub trait MetadataAdapter: TypedBaseAdapter + Send + Sync {
         _io: &IoArgs,
         _db_schemas: &[CatalogAndSchema],
     ) -> AsyncAdapterResult<BTreeMap<CatalogAndSchema, AdapterResult<RelationVec>>>;
+
+    fn create_relations_from_executed_nodes(
+        &self,
+        resolved_state: &ResolverState,
+        run_stats: &Stats,
+    ) -> Vec<Arc<dyn BaseRelation>> {
+        let adapter_type = resolved_state.adapter_type;
+        let mut relations: Vec<Arc<dyn BaseRelation>> = Vec::new();
+        let executed_unique_ids = run_stats
+            .stats
+            .iter()
+            .map(|stat| stat.unique_id.clone())
+            .collect::<Vec<String>>();
+        let nodes = match run_stats.nodes.as_ref() {
+            Some(nodes) => nodes,
+            None => return relations,
+        };
+        for (unique_id, node) in nodes.models.iter() {
+            if executed_unique_ids.contains(unique_id) {
+                let relation = create_relation_internal(
+                    adapter_type,
+                    node.database(),
+                    node.schema(),
+                    Some(node.alias()),
+                    None,
+                    node.quoting(),
+                )
+                .expect("Failed to create relations from nodes");
+                relations.push(relation);
+            }
+        }
+
+        for (unique_id, node) in nodes.snapshots.iter() {
+            if executed_unique_ids.contains(unique_id) {
+                let relation = create_relation_internal(
+                    adapter_type,
+                    node.database(),
+                    node.schema(),
+                    Some(node.alias()),
+                    None,
+                    node.quoting(),
+                )
+                .expect("Failed to create relations from nodes");
+                relations.push(relation);
+            }
+        }
+
+        for (unique_id, node) in nodes.seeds.iter() {
+            if executed_unique_ids.contains(unique_id) {
+                let relation = create_relation_internal(
+                    adapter_type,
+                    node.database(),
+                    node.schema(),
+                    Some(node.alias()),
+                    None,
+                    node.quoting(),
+                )
+                .expect("Failed to create relations from nodes");
+                relations.push(relation);
+            }
+        }
+
+        for (unique_id, node) in nodes.sources.iter() {
+            if executed_unique_ids.contains(unique_id) {
+                let relation = create_relation_internal(
+                    adapter_type,
+                    node.database(),
+                    node.schema(),
+                    Some(node.alias()),
+                    None,
+                    node.quoting(),
+                )
+                .expect("Failed to create relations from nodes");
+                relations.push(relation);
+            }
+        }
+
+        relations
+    }
+
+    /// Check if the returned error is due to insufficient permissions.
+    fn is_permission_error(&self, e: &AdapterError) -> bool {
+        #[cfg(debug_assertions)]
+        {
+            println!("is_permission_error: {:?}: {}", e, e.sqlstate());
+        }
+        false
+    }
 }
 
 /// Create schemas if they don't exist
@@ -192,7 +293,6 @@ pub trait MetadataAdapter: TypedBaseAdapter + Send + Sync {
 pub fn create_schemas_if_not_exists(
     adapter: Arc<dyn MetadataAdapter>,
     catalog_schemas: &BTreeMap<String, BTreeSet<String>>,
-    adapter_type: AdapterType,
     token: CancellationToken,
 ) -> AsyncAdapterResult<'static, Vec<(String, String, AdapterResult<()>)>> {
     type Acc = Vec<(String, String, AdapterResult<()>)>;
@@ -203,6 +303,7 @@ pub fn create_schemas_if_not_exists(
             .new_connection(None)
             .map_err(Cancellable::Error)
     };
+
     let map_f = move |conn: &'_ mut dyn Connection,
                       (catalog, schema): &(String, String)|
           -> AdapterResult<AdapterResult<()>> {
@@ -217,7 +318,7 @@ pub fn create_schemas_if_not_exists(
         match adapter_clone.exec_stmt(conn, &query_ctx, false) {
             Ok(_) => Ok(Ok(())),
             Err(e) => {
-                if is_tolerable(&e, adapter_type) {
+                if adapter.is_permission_error(&e) {
                     Ok(Ok(()))
                 } else {
                     Err(e)
@@ -242,7 +343,6 @@ pub fn create_schemas_if_not_exists(
     );
     map_reduce.run(Arc::new(catalog_schemas), token)
 }
-
 pub fn flatten_catalog_schemas(
     catalog_schemas: &BTreeMap<String, BTreeSet<String>>,
 ) -> Vec<(String, String)> {
@@ -272,28 +372,5 @@ fn create_schema_sql(adapter: &Arc<dyn MetadataAdapter>, catalog: &str, schema: 
         // Redshift connetions are always to a specific database
         AdapterType::Redshift => format!("CREATE SCHEMA IF NOT EXISTS {schema}"),
         _ => unimplemented!("create_schema_sql for adapter type: {}", adapter_type),
-    }
-}
-
-fn is_tolerable(e: &AdapterError, adapter_type: AdapterType) -> bool {
-    // this is supposed to be using/extended from ANSI SQL standard but I didn't find any Snowflake documentation
-    // the magic strings here are from inspecting the results from fs run on a project with a new database,
-    // and a weak role that lack permissions to create a database
-    match adapter_type {
-        // 42501: insufficient privileges
-        // 02000: does not exist or not authorizedntax error
-        AdapterType::Snowflake => e.sqlstate() == "42501" || e.sqlstate() == "02000",
-        // Databricks doesn't provide an explicit enough SQLSTATE, noticed most of their errors' SQLSTATE is HY000
-        // so we have to match on the error message below.
-        // By the time of writing down this note, it is a problem from their backend thus not something we can fix on the SDK or driver layer
-        // check out data/repros/databricks_create_schema_no_catalog_access on how to repro this error
-        AdapterType::Databricks => e.message().contains("PERMISSION_DENIED"),
-        _ => {
-            #[cfg(debug_assertions)]
-            {
-                println!("is_error_tolerable: {:?}: {}", e, e.sqlstate());
-            }
-            false
-        }
     }
 }

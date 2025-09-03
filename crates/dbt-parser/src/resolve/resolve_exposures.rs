@@ -1,6 +1,7 @@
 use crate::args::ResolveArgs;
 use crate::dbt_project_config::{RootProjectConfigs, init_project_config};
 use crate::utils::get_node_fqn;
+use dbt_common::adapter::AdapterType;
 use dbt_common::error::AbstractLocation;
 use dbt_common::io_args::IoArgs;
 use dbt_common::{ErrorCode, FsResult, err, fs_err, show_error};
@@ -18,6 +19,7 @@ use dbt_schemas::schemas::properties::ExposureProperties;
 use dbt_schemas::schemas::ref_and_source::{DbtRef, DbtSourceWrapper};
 use dbt_schemas::schemas::relations::DEFAULT_DBT_QUOTING;
 use dbt_schemas::state::{DbtPackage, DbtRuntimeConfig};
+use dbt_serde_yaml::Spanned;
 use minijinja::value::Value as MinijinjaValue;
 use regex::Regex;
 use std::collections::BTreeMap;
@@ -37,7 +39,7 @@ pub async fn resolve_exposures(
     root_project_configs: &RootProjectConfigs,
     database: &str,
     schema: &str,
-    adapter_type: &str,
+    adapter_type: AdapterType,
     package_name: &str,
     env: &JinjaEnv,
     base_ctx: &BTreeMap<String, MinijinjaValue>,
@@ -74,10 +76,12 @@ pub async fn resolve_exposures(
             }
 
             let unique_id = format!("exposure.{}.{}", &package_name, exposure_name);
+
             let fqn = get_node_fqn(
                 package_name,
                 mpe.relative_path.clone(),
                 vec![exposure_name.to_owned()],
+                &package.dbt_project.all_source_paths(),
             );
 
             let schema_value =
@@ -168,6 +172,7 @@ pub async fn resolve_exposures(
                     static_analysis: Default::default(),
                     enabled: true,
                     extended_model: false,
+                    persist_docs: None,
                     columns: BTreeMap::new(),
                     refs,
                     sources,
@@ -202,13 +207,13 @@ pub async fn resolve_exposures(
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 pub fn resolve_yaml_depends_on(
-    depends_on: &[String],
+    depends_on: &[Spanned<String>],
     env: &JinjaEnv,
     base_ctx: &BTreeMap<String, MinijinjaValue>,
     exposure_config: &ExposureConfig,
     database: &str,
     schema: &str,
-    adapter_type: &str,
+    adapter_type: AdapterType,
     package_name: &str,
     root_project_name: &str,
     fqn: Vec<String>,
@@ -271,7 +276,7 @@ pub fn resolve_yaml_depends_on(
                 return err!(
                     ErrorCode::Unexpected,
                     "Invalid dependency input: {}",
-                    dependency
+                    dependency.as_str()
                 );
             }
         }

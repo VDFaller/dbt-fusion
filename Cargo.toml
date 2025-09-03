@@ -8,6 +8,8 @@ members = [
   "crates/dbt-auth",
   "crates/dbt-cancel",
   "crates/dbt-common",
+  "crates/dbt-cloud-api",
+  "crates/dbt-init",
   "crates/dbt-error",
   "crates/dbt-frontend-common",
   "crates/dbt-jinja/minijinja",
@@ -21,6 +23,8 @@ members = [
   "crates/dbt-telemetry",
   "crates/dbt-selector-parser",
   "crates/dbt-proc-macros",
+
+  "crates/dbt-init",
   "crates/dbt-adapter-proc-macros",
   "crates/dbt-fusion-adapter",
   "crates/dbt-ident",
@@ -46,7 +50,7 @@ homepage = "https://getdbt.com"
 keywords = ["sql", "parquet", "json", "csv", "dbt"]
 license = "<>"
 repository = "https://github.com/dbt-labs/dbt-fusion"
-version = "2.0.0-beta.64"
+version = "2.0.0-preview.7"
 
 # We currently need a fork of apache/arrow-datafusion with a few patches.
 # However, note that we declare dependencies in our crates with the same version
@@ -54,6 +58,15 @@ version = "2.0.0-beta.64"
 # See https://doc.rust-lang.org/cargo/reference/overriding-dependencies.html#the-patch-section
 [patch.crates-io]
 datafusion = { git = "https://github.com/sdf-labs/datafusion", rev = "1d8fe1ebabbd0dbfe41d57b03fbf60bd49f5b354" } # @ sdf/45
+datafusion-common = { git = "https://github.com/sdf-labs/datafusion", rev = "1d8fe1ebabbd0dbfe41d57b03fbf60bd49f5b354" } # @ sdf/45
+datafusion-catalog = { git = "https://github.com/sdf-labs/datafusion", rev = "1d8fe1ebabbd0dbfe41d57b03fbf60bd49f5b354" } # @ sdf/45
+datafusion-expr = { git = "https://github.com/sdf-labs/datafusion", rev = "1d8fe1ebabbd0dbfe41d57b03fbf60bd49f5b354" } # @ sdf/45
+datafusion-functions = { git = "https://github.com/sdf-labs/datafusion", rev = "1d8fe1ebabbd0dbfe41d57b03fbf60bd49f5b354" } # @ sdf/45
+datafusion-functions-aggregate = { git = "https://github.com/sdf-labs/datafusion", rev = "1d8fe1ebabbd0dbfe41d57b03fbf60bd49f5b354" } # @ sdf/45
+datafusion-functions-nested = { git = "https://github.com/sdf-labs/datafusion", rev = "1d8fe1ebabbd0dbfe41d57b03fbf60bd49f5b354" } # @ sdf/45
+datafusion-functions-window = { git = "https://github.com/sdf-labs/datafusion", rev = "1d8fe1ebabbd0dbfe41d57b03fbf60bd49f5b354" } # @ sdf/45
+datafusion-physical-expr = { git = "https://github.com/sdf-labs/datafusion", rev = "1d8fe1ebabbd0dbfe41d57b03fbf60bd49f5b354" } # @ sdf/45
+datafusion-physical-plan = { git = "https://github.com/sdf-labs/datafusion", rev = "1d8fe1ebabbd0dbfe41d57b03fbf60bd49f5b354" } # @ sdf/45
 # OR, when working locally
 #datafusion = { path = "../datafusion/datafusion/core" }
 
@@ -136,6 +149,7 @@ dbt-adapter-proc-macros = { path = "crates/dbt-adapter-proc-macros" }
 dbt-agate = { path = "crates/dbt-agate" }
 dbt-auth = { path = "crates/dbt-auth" }
 dbt-cancel = { path = "crates/dbt-cancel" }
+dbt-cloud-api = { path = "crates/dbt-cloud-api" }
 dbt-common = { path = "crates/dbt-common" }
 dbt-dag = { path = "crates/dbt-dag" }
 dbt-deps = { path = "crates/dbt-deps" }
@@ -144,11 +158,13 @@ dbt-error = { path = "crates/dbt-error" }
 dbt-frontend-common = { path = "crates/dbt-frontend-common" }
 dbt-fusion-adapter = { path = "crates/dbt-fusion-adapter" }
 dbt-ident = { path = "crates/dbt-ident" }
+dbt-init = { path = "crates/dbt-init" }
 dbt-jinja-utils = { path = "crates/dbt-jinja-utils" }
 dbt-lint = { path = "crates/dbt-lint" }
 dbt-loader = { path = "crates/dbt-loader" }
 dbt-parser = { path = "crates/dbt-parser" }
 dbt-proc-macros = { path = "crates/dbt-proc-macros" }
+
 dbt-schemas = { path = "crates/dbt-schemas" }
 dbt-selector-parser = { path = "crates/dbt-selector-parser" }
 dbt-telemetry = { path = "crates/dbt-telemetry" }
@@ -179,7 +195,7 @@ minijinja-contrib = { path = "crates/dbt-jinja/minijinja-contrib", features = [
 snowflake-api = { path = "crates/snowflake-rs/snowflake-api" }
 
 # serde
-dbt-serde_yaml = { git = "https://github.com/sdf-labs/dbt-serde-yaml", rev = "cec1af69146090fc08af244b1258d214cf50be5d", features = [
+dbt-serde_yaml = { git = "https://github.com/sdf-labs/dbt-serde-yaml", rev = "f11cbb614c43ebe55e6deb473002e8190cf26171", features = [
   "filename",
   "schemars",
   "flatten_dunder",
@@ -190,6 +206,8 @@ serde_json = "1.0.133"
 serde_repr = "0.1.20"
 serde_with = "3.12.0"
 
+toml = { version = "0.9.5" }
+
 # cloud providers
 aws-config = { version = "1.1.7", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.78.0"
@@ -198,6 +216,7 @@ aws-sdk-s3 = "1.78.0"
 arrow = { version = "=54.2.1", features = ["prettyprint"] }
 arrow-array = { version = "=54.2.1" }
 arrow-buffer = { version = "=54.2.1" }
+arrow-csv = { version = "=54.2.1" }
 arrow-data = { version = "=54.2.1" }
 arrow-ipc = { version = "=54.2.1" }
 arrow-json = { version = "=54.2.1" }
@@ -206,30 +225,50 @@ parquet = { version = "=54.2.1" }
 serde_arrow = { version = "0.13.4", features = ["arrow-54"] }
 
 # xdbc
-adbc-core = { git = "https://github.com/dbt-labs/arrow-adbc", package = "adbc_core", version = "0.18.0", features = [
-  "driver_manager",
-], rev = "3fdf3790bd0e0d0c2ed9f5a65266ce3d2c429811" } # @ apache-arrow-adbc-18-rust
+adbc-core = { git = "https://github.com/dbt-labs/arrow-adbc", package = "adbc_core", version = "0.20.0", rev = "34c0a6f7cd039334683bc0b05b9bc3430e0b7e86" } # @ apache-arrow-adbc-20-rust
+adbc-driver-manager = { git = "https://github.com/dbt-labs/arrow-adbc", package = "adbc_driver_manager", version = "0.20.0", rev = "34c0a6f7cd039334683bc0b05b9bc3430e0b7e86", features = [
+  "windows-sys",
+  "windows-registry",
+] } # @ apache-arrow-adbc-20-rust
 dbt-xdbc = { path = "crates/dbt-xdbc" }
 
 # antlr for frontend
 antlr-rust = { git = "https://github.com/sdf-labs/antlr4", rev = "b8179d265532a5f2c901d702adcb4975e32b949c" }
 
 # datafusion
-datafusion = { version = "45.0.0", default-features = false, features = [
-  "crypto_expressions",
-  "datetime_expressions",
-  "encoding_expressions",
-  "math_expressions",
-  "nested_expressions",
-  "parquet",
-  "regex_expressions",
-  "string_expressions",
-  "unicode_expressions",
-] }
+
+# Note: the following line has been removed to discourage dependency on the
+# `datafusion` (aka `datafusion-core`) crate: the `datafusion` crate is an
+# aggregation crate that pulls in and re-exports symbols from the other, finer
+# grained datafusion-xxx crates, while adding some APIs for the datafusion
+# execution runtime. However, it builds much slower than the individual crates.
+# Therefore, only a select few crates (specifically, those that have to interact
+# with the datafusion runtime) should depend on the `datafusion` crate, for all
+# other crates, you should prefer using the individual datafusion-xxx crates
+# directly whenever possible.
+
+# datafusion = { version = "45.0.0", default-features = false }
+datafusion-catalog = { version = "45.0.0" }
 datafusion-common = { version = "45.0.0", default-features = false, features = [
   "object_store",
   "parquet",
 ] }
+datafusion-expr = { version = "45.0.0" }
+datafusion-functions = { version = "45.0.0", default-features = false, features = [
+  "core_expressions",
+  "crypto_expressions",
+  "datetime_expressions",
+  "encoding_expressions",
+  "math_expressions",
+  "regex_expressions",
+  "string_expressions",
+  "unicode_expressions",
+] }
+datafusion-functions-aggregate = { version = "45.0.0" }
+datafusion-functions-nested = { version = "45.0.0" }
+datafusion-functions-window = { version = "45.0.0" }
+datafusion-physical-expr = { version = "45.0.0" }
+datafusion-physical-plan = { version = "45.0.0" }
 
 # uuid
 uuid = { version = "1.16.0", features = ["v4"] }
@@ -254,9 +293,13 @@ reqwest = { version = "0.12.9", default-features = false, features = [
   "macos-system-configuration",
 ] }
 # latest version depended on by the version of reqwest-retry in use
+gcloud-auth = { version = "1.1.1", default-features = false, features = [
+  "rustls-tls",
+] }
 http = { version = "1.2.0", default-features = false }
 reqwest-middleware = { version = "0.4.2" }
 reqwest-retry = { version = "0.7.0" }
+token-source = "1.0.0"
 ureq = { version = "3.0.11", default-features = false, features = [
   "gzip",
   "json",
@@ -286,6 +329,7 @@ flate2 = "1.0.28"
 gix = { version = "0.72.1", default-features = false, features = ["revision"] }
 gix-discover = "0.40.1"
 glob = "0.3.2"
+ignore = "0.4.23"
 num_cpus = "1.16.0"
 pathdiff = "0.2.3"
 run_script = "0.11.0"
@@ -360,16 +404,20 @@ regex = "1.11.1"
 rsa = "0.9"
 rust-lapper = "1.1.0"
 sha2 = "0.10.8"
+similar = "2.6"
+siphasher = { version = "1.0.1" }
 url = "2.5.4"
 ustr = "1.0.0"
 zstd-safe = "7"
 
 # testing
 difference = "2.0.0"
+fake = { version = "4.4.0", features = ["derive", "uuid", "time"] }
 goldie = "0.5.0"
 indoc = "2.0.6"
 merge = { version = "0.2.0" }
 mock_instant = "0.5.3"
+mockito = "1.2"
 pretty_assertions = { version = "1.4.1" }
 sqllogictest = "0.26.0"
 

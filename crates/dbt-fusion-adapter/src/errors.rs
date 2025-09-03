@@ -41,6 +41,8 @@ pub enum AdapterErrorKind {
     Io,
     /// JSON ser/deserialization error
     SerdeJSON,
+    /// YAML ser/deserialization error
+    SerdeYAML,
     /// Replay of an error
     Replay,
     /// Not supported
@@ -62,6 +64,7 @@ impl AdapterErrorKind {
             Self::UnsupportedType => "Unsupported type",
             Self::Io => "Input/output",
             Self::SerdeJSON => "JSON",
+            Self::SerdeYAML => "YAML",
             Self::Replay => "Replay error",
             Self::NotSupported => "Not supported",
         }
@@ -103,7 +106,16 @@ impl AdapterError {
     }
 
     pub fn message(&self) -> &str {
-        &self.message
+        let stripped_message = if matches!(self.kind, AdapterErrorKind::Xdbc(_)) {
+            // Remove prefixes like "Unknown: " or "Internal: " which don't
+            // add any informational value to the error message.
+            self.message
+                .strip_prefix("Unknown: ")
+                .or_else(|| self.message.strip_prefix("Internal: "))
+        } else {
+            None
+        };
+        stripped_message.unwrap_or(&self.message)
     }
 
     /// Get SQLSTATE as an ASCII string.
@@ -131,10 +143,17 @@ impl AdapterError {
 
 impl fmt::Display for AdapterError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.message.is_empty() {
+        let message = self.message();
+        if message.is_empty() {
             write!(f, "{}", self.kind)?;
         } else {
-            write!(f, "{}: {}", self.kind, self.message)?;
+            // Some error kinds do not have to be part of the message because the error
+            // message is already descriptive enough and prefixed with context like
+            // "[Snowflake] ...".
+            match self.kind {
+                AdapterErrorKind::Xdbc(_) => write!(f, "{message}")?,
+                _ => write!(f, "{}: {message}", self.kind)?,
+            }
         }
         let sqlstate: &str = self.sqlstate();
         if sqlstate != "00000" || self.vendor_code.is_some() {
@@ -226,6 +245,12 @@ impl From<serde_json::Error> for AdapterError {
     }
 }
 
+impl From<dbt_serde_yaml::Error> for AdapterError {
+    fn from(err: dbt_serde_yaml::Error) -> Self {
+        AdapterError::new(AdapterErrorKind::SerdeYAML, err.to_string())
+    }
+}
+
 impl From<JoinError> for AdapterError {
     fn from(err: JoinError) -> Self {
         if err.is_cancelled() {
@@ -245,6 +270,7 @@ impl From<AuthError> for AdapterError {
             AuthError::Adbc(adbc_err) => adbc_err.into(),
             AuthError::Config(msg) => AdapterError::new(AdapterErrorKind::Configuration, msg),
             AuthError::JSON(json_err) => json_err.into(),
+            AuthError::YAML(yaml_err) => yaml_err.into(),
             AuthError::Io(io_err) => io_err.into(),
         }
     }
@@ -281,38 +307,50 @@ mod tests {
         let adbc_err = AdbcError::with_message_and_status("Test ADBC error", Status::Internal);
         let err: AdapterError = adbc_err.into();
         assert_eq!(err.kind(), AdapterErrorKind::Xdbc(Status::Internal));
-        assert_eq!(err.to_string(), "ADBC error: Test ADBC error");
+        assert_eq!(err.to_string(), "Test ADBC error");
+
+        let adbc_err =
+            AdbcError::with_message_and_status("Internal: Test ADBC error", Status::Internal);
+        let err: AdapterError = adbc_err.into();
+        assert_eq!(err.kind(), AdapterErrorKind::Xdbc(Status::Internal));
+        assert_eq!(err.to_string(), "Test ADBC error");
+
+        let adbc_err =
+            AdbcError::with_message_and_status("Unknown: Test ADBC error", Status::Unknown);
+        let err: AdapterError = adbc_err.into();
+        assert_eq!(err.kind(), AdapterErrorKind::Xdbc(Status::Unknown));
+        assert_eq!(err.to_string(), "Test ADBC error");
     }
 
     #[test]
     fn test_adapter_error_from_adbc_with_sqlstate() {
-        let mut adbc_err = AdbcError::with_message_and_status("Test ADBC error", Status::Internal);
+        let mut adbc_err =
+            AdbcError::with_message_and_status("Internal: Test ADBC error", Status::Internal);
         adbc_err.sqlstate = [b'H' as i8, b'Y' as i8, b'1' as i8, b'0' as i8, b'7' as i8];
 
         let err: AdapterError = adbc_err.into();
         assert_eq!(err.kind(), AdapterErrorKind::Xdbc(Status::Internal));
-        assert_eq!(
-            err.to_string(),
-            "ADBC error: Test ADBC error (SQLSTATE: HY107)"
-        );
+        assert_eq!(err.to_string(), "Test ADBC error (SQLSTATE: HY107)");
     }
 
     #[test]
     fn test_adapter_error_from_adbc_with_vendor_code() {
-        let mut adbc_err = AdbcError::with_message_and_status("Test ADBC error", Status::Internal);
+        let mut adbc_err =
+            AdbcError::with_message_and_status("Internal: Test ADBC error", Status::Internal);
         adbc_err.vendor_code = 1234;
 
         let err: AdapterError = adbc_err.into();
         assert_eq!(err.kind(), AdapterErrorKind::Xdbc(Status::Internal));
         assert_eq!(
             err.to_string(),
-            "ADBC error: Test ADBC error (SQLSTATE: 00000, Vendor code: 1234)"
+            "Test ADBC error (SQLSTATE: 00000, Vendor code: 1234)"
         );
     }
 
     #[test]
     fn test_adapter_error_from_adbc_with_sqlstate_and_vendor_code() {
-        let mut adbc_err = AdbcError::with_message_and_status("Test ADBC error", Status::Internal);
+        let mut adbc_err =
+            AdbcError::with_message_and_status("Internal: Test ADBC error", Status::Internal);
         adbc_err.sqlstate = [b'H' as i8, b'Y' as i8, b'1' as i8, b'0' as i8, b'7' as i8];
         adbc_err.vendor_code = 1234;
 
@@ -320,7 +358,7 @@ mod tests {
         assert_eq!(err.kind(), AdapterErrorKind::Xdbc(Status::Internal));
         assert_eq!(
             err.to_string(),
-            "ADBC error: Test ADBC error (SQLSTATE: HY107, Vendor code: 1234)"
+            "Test ADBC error (SQLSTATE: HY107, Vendor code: 1234)"
         );
     }
 }

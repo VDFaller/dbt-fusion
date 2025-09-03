@@ -7,7 +7,7 @@ use crate::databricks::relation_configs::base::{
     DatabricksRelationResults,
 };
 
-use dbt_schemas::schemas::{InternalDbtNodeAttributes, nodes::DbtModel};
+use dbt_schemas::schemas::InternalDbtNodeAttributes;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -112,17 +112,12 @@ impl DatabricksComponentProcessor for ColumnCommentsProcessor {
         let columns = &relation_config.base().columns;
 
         // Check if persist_docs.relation is enabled
-        // Downcast is necessary due to not being available yet on InternalDbtNodeAttributes
-        let persist = if let Some(model) = relation_config.as_any().downcast_ref::<DbtModel>() {
-            model
-                .deprecated_config
-                .persist_docs
-                .as_ref()
-                .map(|pd| pd.relation.unwrap_or(false))
-                .unwrap_or(false)
-        } else {
-            false
-        };
+        let persist = relation_config
+            .base()
+            .persist_docs
+            .as_ref()
+            .map(|pd| pd.relation.unwrap_or(false))
+            .unwrap_or(false);
 
         let mut comments = BTreeMap::new();
         let mut quoted = BTreeMap::new();
@@ -155,6 +150,7 @@ mod tests {
     use arrow::csv::ReaderBuilder;
     use arrow_schema::{DataType, Field, Schema};
     use dbt_agate::AgateTable;
+    use dbt_schemas::schemas::DbtModel;
     use dbt_schemas::schemas::relations::relation_configs::{ComponentConfig, RelationChangeSet};
     use regex::Regex;
     use std::collections::BTreeMap;
@@ -190,7 +186,7 @@ email,string,\n\
     }
 
     fn create_mock_dbt_model(
-        columns: BTreeMap<String, dbt_schemas::schemas::dbt_column::DbtColumn>,
+        columns: BTreeMap<String, dbt_schemas::schemas::dbt_column::DbtColumnRef>,
         meta: BTreeMap<String, serde_json::Value>,
     ) -> DbtModel {
         use dbt_schemas::schemas::project::*;
@@ -213,6 +209,7 @@ email,string,\n\
             static_analysis: dbt_common::io_args::StaticAnalysisKind::On,
             enabled: true,
             extended_model: false,
+            persist_docs,
             columns,
             refs: vec![],
             sources: vec![],
@@ -220,10 +217,7 @@ email,string,\n\
             depends_on: NodeDependsOn::default(),
         };
 
-        let deprecated_config = ModelConfig {
-            persist_docs,
-            ..Default::default()
-        };
+        let deprecated_config = ModelConfig::default();
 
         DbtModel {
             __base_attr__: base_attrs,
@@ -471,21 +465,21 @@ name,string,User name\n\
         let mut columns = BTreeMap::new();
         columns.insert(
             "id".to_string(),
-            DbtColumn {
+            Arc::new(DbtColumn {
                 name: "id".to_string(),
                 description: Some("Primary key".to_string()),
                 quote: Some(false),
                 ..Default::default()
-            },
+            }),
         );
         columns.insert(
             "name".to_string(),
-            DbtColumn {
+            Arc::new(DbtColumn {
                 name: "name".to_string(),
                 description: Some("User name".to_string()),
                 quote: Some(true),
                 ..Default::default()
-            },
+            }),
         );
 
         let mut meta = BTreeMap::new();
@@ -524,12 +518,12 @@ name,string,User name\n\
         let mut columns = BTreeMap::new();
         columns.insert(
             "id".to_string(),
-            DbtColumn {
+            Arc::new(DbtColumn {
                 name: "id".to_string(),
                 description: Some("Primary key".to_string()),
                 quote: Some(false),
                 ..Default::default()
-            },
+            }),
         );
 
         let meta = BTreeMap::new(); // No persist_docs
@@ -560,12 +554,12 @@ name,string,User name\n\
         let mut columns = BTreeMap::new();
         columns.insert(
             "id".to_string(),
-            DbtColumn {
+            Arc::new(DbtColumn {
                 name: "id".to_string(),
                 description: Some("Primary key".to_string()),
                 quote: Some(false),
                 ..Default::default()
-            },
+            }),
         );
 
         let mut meta = BTreeMap::new();

@@ -9,6 +9,7 @@ mod test_namespaced_macro_tracking;
 #[cfg(test)]
 #[allow(clippy::module_inception)]
 mod tests {
+    use dbt_common::adapter::AdapterType;
     use dbt_common::cancellation::never_cancels;
     use dbt_common::{FsResult, io_args::IoArgs};
     use dbt_frontend_common::error::CodeLocation;
@@ -20,7 +21,7 @@ mod tests {
     use dbt_jinja_utils::phases::parse::init::initialize_parse_jinja_environment;
     use dbt_jinja_utils::phases::parse::sql_resource::SqlResource;
     use dbt_jinja_utils::utils::render_sql;
-    use dbt_schemas::schemas::profiles::{DbConfig, PostgresDbConfig};
+    use dbt_schemas::schemas::profiles::PostgresDbConfig;
     use dbt_schemas::schemas::project::{DefaultTo, ModelConfig};
     use dbt_schemas::schemas::relations::DEFAULT_DBT_QUOTING;
     use dbt_schemas::schemas::serde::StringOrInteger;
@@ -46,7 +47,7 @@ mod tests {
     ) -> BTreeMap<String, Value> {
         let mut context = build_resolve_model_context(
             init_config,
-            "postgres",
+            AdapterType::Postgres,
             "db",
             "schema",
             "my_model",
@@ -54,6 +55,7 @@ mod tests {
                 "common",
                 PathBuf::from("test"),
                 vec!["my_model".to_string()],
+                &["models".to_string()],
             ),
             "common",
             "test",
@@ -87,7 +89,7 @@ mod tests {
             "profile",
             "target",
             "postgres",
-            &DbConfig::Postgres(PostgresDbConfig {
+            (PostgresDbConfig {
                 port: Some(StringOrInteger::Integer(5432)),
                 database: Some("postgres".to_string()),
                 host: Some("localhost".to_string()),
@@ -95,7 +97,8 @@ mod tests {
                 password: Some("postgres".to_string()),
                 schema: Some("schema".to_string()),
                 ..Default::default()
-            }),
+            })
+            .into(),
             DEFAULT_DBT_QUOTING,
             BTreeMap::new(),
             BTreeMap::new(),
@@ -287,7 +290,8 @@ mod tests {
         ) -> Result<String, Error> {
             let mut env = Environment::new();
             let adapter =
-                create_parse_adapter("postgres", DEFAULT_DBT_QUOTING, never_cancels()).unwrap();
+                create_parse_adapter(AdapterType::Postgres, DEFAULT_DBT_QUOTING, never_cancels())
+                    .unwrap();
             env.add_global("adapter", adapter.as_value());
             let empty_blocks = BTreeMap::new();
             let vm = Vm::new(&env);

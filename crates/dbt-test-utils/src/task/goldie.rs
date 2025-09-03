@@ -8,11 +8,15 @@ use super::{
         normalize_version,
     },
 };
+use futures::FutureExt as _;
 use itertools::Itertools;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::{
     env,
+    fs::File,
+    io::{Read as _, Write as _},
+    panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -20,9 +24,11 @@ use std::{
 use dbt_test_primitives::is_update_golden_files_mode;
 
 use dbt_common::{
-    ErrorCode, FsResult, err,
+    FsResult,
     stdfs::{self},
 };
+
+type TextualPatch = String;
 
 // Snowflake prompt for our REPL
 static SNOWFLAKE_PROMPT: Lazy<Regex> =
@@ -46,6 +52,7 @@ fn postprocess_golden(content: String, sort_output: bool) -> String {
     let res = [
         maybe_normalize_slashes,
         maybe_normalize_schema_name,
+        maybe_normalize_time,
         normalize_version,
         maybe_normalize_tmp_paths,
     ]
@@ -55,7 +62,12 @@ fn postprocess_golden(content: String, sort_output: bool) -> String {
     if sort_output { sort_lines(res) } else { res }
 }
 
-fn assert_output(channel: &str, actual: String, goldie_path: &Path, sort_output: bool) {
+fn diff_goldie(
+    channel: &str,
+    postprocessed_actual: String,
+    goldie_path: &Path,
+    sort_output: bool,
+) -> Option<TextualPatch> {
     let goldie_exists = goldie_path.exists();
     let golden = if goldie_exists {
         stdfs::read_to_string(goldie_path).unwrap_or_else(|_| {
@@ -69,10 +81,10 @@ fn assert_output(channel: &str, actual: String, goldie_path: &Path, sort_output:
         "".to_string()
     };
     let golden = postprocess_golden(golden, sort_output);
-    let actual = maybe_normalize_slashes(actual);
+    let actual = maybe_normalize_slashes(postprocessed_actual);
 
     if goldie_exists && golden == actual {
-        return;
+        return None;
     }
 
     let relative_golden_path =
@@ -95,15 +107,7 @@ fn assert_output(channel: &str, actual: String, goldie_path: &Path, sort_output:
         .set_modified_filename(modified_filename)
         .create_patch(&golden, &actual);
 
-    eprintln!("{patch}");
-    panic!(
-        "Output of {channel} does not match golden file. See diff above. \
-        To accept this output as golden file, open a terminal in the root of the git repository and run: \
-          `git apply -` \
-        then copy-paste the diff above into the terminal and press Ctrl+D.\
-        (Note: if you're copy-pasting from the Github web UI, run `sed 's/^    //' | git apply -` instead) \
-        ",
-    )
+    Some(patch.to_string())
 }
 
 pub struct CompareEnv {
@@ -151,6 +155,14 @@ pub fn create_compare_env(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Executes a command and compares its output to the golden files.
+///
+/// Returns:
+///  - If the command ran successfully and the output matches the golden files,
+///    returns an empty vector.
+///  - If the command ran successfully but the output does not match the golden
+///    files, returns a vector of printable patches for each non-matching file.
+///  - If the command failed to run, returns an error.
 pub async fn execute_and_compare(
     // name of the task used to create file names (this is usually test name)
     name: &str,
@@ -163,28 +175,53 @@ pub async fn execute_and_compare(
     // necessary/common preparation
     sort_output: bool,
     exe: Arc<CommandFn>,
-) -> FsResult<()> {
+) -> FsResult<Vec<TextualPatch>> {
     let compare_env = create_compare_env(name, project_env, test_env, task_index);
 
     let stdout_file = stdfs::File::create(&compare_env.stdout_path)?;
-    let stderr_file = stdfs::File::create_with_read_write(&compare_env.stderr_path)?;
+    let stderr_file = stdfs::File::create(&compare_env.stderr_path)?;
 
-    let _res = exe(
+    let res = AssertUnwindSafe(exe(
         cmd_vec.to_vec(),
         compare_env.project_dir,
         stdout_file,
         stderr_file,
-    )
+    ))
+    .catch_unwind()
     .await;
-    let is_update = is_update_golden_files_mode();
-    compare_or_update(
-        is_update,
-        sort_output,
-        compare_env.stderr_path,
-        compare_env.goldie_stderr_path,
-        compare_env.stdout_path,
-        compare_env.goldie_stdout_path,
-    )
+
+    match res {
+        Ok(Ok(_exit_code)) => compare_or_update(
+            is_update_golden_files_mode(),
+            sort_output,
+            compare_env.stderr_path,
+            compare_env.goldie_stderr_path,
+            compare_env.stdout_path,
+            compare_env.goldie_stdout_path,
+        ),
+        Ok(Err(e)) => {
+            eprintln!("error executing command {cmd_vec:?}: {e}");
+            // TODO: this is kept to preserve existing behavior, where this
+            // error was silently ignored. We should probably
+            // dump_file_to_stderr then propagate the error instead:
+            compare_or_update(
+                is_update_golden_files_mode(),
+                sort_output,
+                compare_env.stderr_path,
+                compare_env.goldie_stderr_path,
+                compare_env.stdout_path,
+                compare_env.goldie_stdout_path,
+            )
+        }
+        Err(payload) => {
+            eprintln!("command {cmd_vec:?} panicked during execution");
+
+            // Best effort attempt to dump the captured stderr:
+            let _ = dump_file_to_stderr(&compare_env.stderr_path);
+
+            std::panic::resume_unwind(payload);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -195,23 +232,7 @@ pub fn compare_or_update(
     goldie_stderr_path: PathBuf,
     stdout_path: PathBuf,
     goldie_stdout_path: PathBuf,
-) -> FsResult<()> {
-    // Check that stdout and stderr exist
-    if !stdout_path.exists() {
-        return err!(
-            ErrorCode::IoError,
-            "stdout file does not exist: {}",
-            stdout_path.display()
-        );
-    }
-    if !stderr_path.exists() {
-        return err!(
-            ErrorCode::IoError,
-            "stderr file does not exist: {}",
-            stderr_path.display()
-        );
-    }
-
+) -> FsResult<Vec<TextualPatch>> {
     let stdout_content = stdfs::read_to_string(&stdout_path)?;
     let stdout_content = postprocess_actual(stdout_content, sort_output);
     let stderr_content = stdfs::read_to_string(&stderr_path)?;
@@ -223,12 +244,20 @@ pub fn compare_or_update(
         // the same filesystem
         stdfs::write(&goldie_stdout_path, stdout_content)?;
         stdfs::write(&goldie_stderr_path, stderr_content)?;
+        Ok(vec![])
     } else {
         // Compare the generated files to the golden files
-        assert_output("stderr", stderr_content, &goldie_stderr_path, sort_output);
-        assert_output("stdout", stdout_content, &goldie_stdout_path, sort_output);
+        let patches = diff_goldie("stderr", stderr_content, &goldie_stderr_path, sort_output)
+            .into_iter()
+            .chain(diff_goldie(
+                "stdout",
+                stdout_content,
+                &goldie_stdout_path,
+                sort_output,
+            ))
+            .collect::<Vec<_>>();
+        Ok(patches)
     }
-    Ok(())
 }
 
 fn sort_lines(content: String) -> String {
@@ -240,20 +269,22 @@ fn filter_lines_internal(content: String, in_emacs: bool) -> String {
         " has been running for over",
         "last updated",
         "Detected unsafe introspection which may lead to non-deterministic static analysis.",
+        "New version available",
     ];
 
     let mut res = content
         .lines()
         .filter_map(|line| {
-            if KNOWN_NOISE.iter().any(|noise| line.contains(noise)) {
-                // Remove known noise lines entirely
+            if KNOWN_NOISE.iter().any(|noise| line.contains(noise)) || is_all_whitespace(line) {
+                // Purge noise and blank lines
                 None
             } else if in_emacs && SNOWFLAKE_PROMPT.is_match(line) {
                 // In Emacs we need to filter our REPL prompt.
                 Some("")
             } else {
-                // Keep other lines unchanged
-                Some(line)
+                // For other lines, trim ending whitespaces to reduce false
+                // negatives:
+                Some(line.trim_end())
             }
         })
         .collect::<Vec<_>>()
@@ -269,6 +300,20 @@ fn filter_lines(content: String) -> String {
     filter_lines_internal(content, env::var("INSIDE_EMACS").is_ok())
 }
 
+fn is_all_whitespace(s: &str) -> bool {
+    s.chars().all(|c| c.is_whitespace())
+}
+
+fn dump_file_to_stderr(path: &Path) -> std::io::Result<()> {
+    let mut file = File::open(path)?;
+    let size = file.metadata().map(|m| m.len() as usize).ok();
+    let mut buffer = Vec::new();
+    buffer.try_reserve_exact(size.unwrap_or(0))?;
+    file.read_to_end(&mut buffer)?;
+
+    std::io::stderr().write_all(&buffer)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,12 +321,49 @@ mod tests {
     #[test]
     fn test_filter_lines() {
         let lines = filter_lines("abc \n has been running for over \n 123".to_string());
-        assert_eq!("abc \n 123", lines);
+        assert_eq!("abc\n 123", lines);
     }
 
     #[test]
     fn test_filter_repl_prompt() {
         let lines = filter_lines_internal("abc \n0(snowflake[local])> \n 123".to_string(), true);
-        assert_eq!("abc \n\n 123", lines);
+        assert_eq!("abc\n\n 123", lines);
+    }
+
+    #[test]
+    fn test_normalize_time() {
+        let line = " Succeeded [ 44.65s] test  fusion_tests_schema__ga_analytics_regression__alex.source_unique_incident_io_severity_id";
+        let postprocess_actual = postprocess_actual(line.to_string(), true);
+        assert_eq!(
+            " Succeeded [000.00s] test  fusion_tests_schema__replaced.source_unique_incident_io_severity_id",
+            postprocess_actual
+        );
+    }
+
+    #[test]
+    fn test_normalize_schema_case_insensitive() {
+        let line = "FUSION_REGRESSION_TESTING_CLONE.FUSION_TESTS_SCHEMA__ALEX.SELF_SERVICE_ACCOUNTING_ACTIVITY_SNAPSHOT";
+        let postprocess_actual = postprocess_actual(line.to_string(), false);
+        assert_eq!(
+            "FUSION_REGRESSION_TESTING_CLONE.fusion_tests_schema__replaced.SELF_SERVICE_ACCOUNTING_ACTIVITY_SNAPSHOT",
+            postprocess_actual
+        );
+    }
+
+    #[test]
+    fn test_normalize_multi_unit_duration_phrase() {
+        let line = "Finished 'run' target 'databricks' with 1 error in 4s 703ms 195us 939ns";
+        let postprocess_actual = postprocess_actual(line.to_string(), false);
+        assert_eq!(
+            "Finished 'run' target 'databricks' with 1 error in duration",
+            postprocess_actual
+        );
+    }
+
+    #[test]
+    fn test_normalize_multi_unit_duration_standalone() {
+        let line = "32ms 101us 694ns";
+        let postprocess_actual = postprocess_actual(line.to_string(), false);
+        assert_eq!("duration", postprocess_actual);
     }
 }

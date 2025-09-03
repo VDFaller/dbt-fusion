@@ -4,6 +4,7 @@ use crate::utils::{
     RelationComponents, get_node_fqn, register_duplicate_resource, trigger_duplicate_errors,
     update_node_relation_components,
 };
+use dbt_common::adapter::AdapterType;
 use dbt_common::{ErrorCode, FsResult, fs_err, show_error, stdfs};
 use dbt_frontend_common::Dialect;
 use dbt_jinja_utils::jinja_environment::JinjaEnv;
@@ -17,7 +18,7 @@ use dbt_schemas::schemas::project::DefaultTo;
 use dbt_schemas::schemas::project::{DbtProject, SeedConfig};
 use dbt_schemas::schemas::properties::SeedProperties;
 use dbt_schemas::schemas::{CommonAttributes, DbtSeed, DbtSeedAttr, NodeBaseAttributes};
-use dbt_schemas::state::{DbtAsset, DbtPackage};
+use dbt_schemas::state::{DbtPackage, GenericTestAsset};
 use dbt_schemas::state::{ModelStatus, RefsAndSourcesTracker};
 use minijinja::value::Value as MinijinjaValue;
 use std::collections::BTreeMap;
@@ -37,16 +38,15 @@ pub fn resolve_seeds(
     root_project_configs: &RootProjectConfigs,
     database: &str,
     schema: &str,
-    adapter_type: &str,
+    adapter_type: AdapterType,
     package_name: &str,
     jinja_env: &JinjaEnv,
     base_ctx: &BTreeMap<String, MinijinjaValue>,
-    collected_tests: &mut Vec<DbtAsset>,
+    collected_generic_tests: &mut Vec<GenericTestAsset>,
     refs_and_sources: &mut RefsAndSources,
 ) -> FsResult<(HashMap<String, Arc<DbtSeed>>, HashMap<String, Arc<DbtSeed>>)> {
     let mut seeds: HashMap<String, Arc<DbtSeed>> = HashMap::new();
     let mut disabled_seeds: HashMap<String, Arc<DbtSeed>> = HashMap::new();
-    let is_replay_mode = arg.replay.is_some();
     let io_args = &arg.io;
     let dependency_package_name = dependency_package_name_from_ctx(jinja_env, base_ctx);
 
@@ -83,7 +83,12 @@ pub fn resolve_seeds(
         };
         let unique_id = format!("seed.{package_name}.{seed_name}");
 
-        let fqn = get_node_fqn(package_name, path.to_owned(), vec![seed_name.to_owned()]);
+        let fqn = get_node_fqn(
+            package_name,
+            path.to_owned(),
+            vec![seed_name.to_owned()],
+            package.dbt_project.seed_paths.as_ref().unwrap_or(&vec![]),
+        );
 
         // Merge schema_file_info
         let (seed, patch_path) = if let Some(mpe) = seed_properties.remove(seed_name) {
@@ -106,16 +111,7 @@ pub fn resolve_seeds(
             (SeedProperties::empty(seed_name.to_owned()), None)
         };
 
-        let project_config = local_project_config.get_config_for_path(
-            &path,
-            package_name,
-            &package
-                .dbt_project
-                .seed_paths
-                .as_ref()
-                .unwrap_or(&vec![])
-                .clone(),
-        );
+        let project_config = local_project_config.get_config_for_fqn(&fqn);
         let mut properties_config = if let Some(properties) = &seed.config {
             let mut properties_config: SeedConfig = properties.clone();
             properties_config.default_to(project_config);
@@ -124,8 +120,8 @@ pub fn resolve_seeds(
             project_config.clone()
         };
 
-        // normalize column_types to uppercase if it is snowflake
-        if adapter_type == "snowflake" || adapter_type == "replay" {
+        // XXX: normalize column_types to uppercase if it is snowflake
+        if matches!(adapter_type, AdapterType::Snowflake) {
             if let Some(column_types) = &properties_config.column_types {
                 let column_types = column_types
                     .iter()
@@ -151,19 +147,7 @@ pub fn resolve_seeds(
         }
 
         if package_name != root_project.name {
-            let mut root_config = root_project_configs
-                .seeds
-                .get_config_for_path(
-                    &path,
-                    package_name,
-                    &package
-                        .dbt_project
-                        .seed_paths
-                        .as_ref()
-                        .unwrap_or(&vec!["seeds".to_string()])
-                        .clone(),
-                )
-                .clone();
+            let mut root_config = root_project_configs.seeds.get_config_for_fqn(&fqn).clone();
             root_config.default_to(&properties_config);
             properties_config = root_config;
         }
@@ -196,7 +180,7 @@ pub fn resolve_seeds(
                         })?
                         .as_slice(),
                 ),
-                patch_path,
+                patch_path: patch_path.clone(),
                 unique_id: unique_id.clone(),
                 fqn,
                 description: seed.description.clone(),
@@ -270,10 +254,10 @@ pub fn resolve_seeds(
                 seed.as_testable().persist(
                     package_name,
                     &root_project.name,
-                    collected_tests,
+                    collected_generic_tests,
                     adapter_type,
-                    is_replay_mode,
                     io_args,
+                    patch_path.as_ref().unwrap_or(&path),
                 )?;
             }
             ModelStatus::Disabled => {

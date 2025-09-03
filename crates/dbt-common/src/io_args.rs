@@ -33,6 +33,7 @@ use crate::{
 pub struct IoArgs {
     pub invocation_id: uuid::Uuid,
     pub show: HashSet<ShowOptions>,
+    pub command: String,
     pub in_dir: PathBuf,
     pub out_dir: PathBuf,
     pub log_path: Option<PathBuf>,
@@ -42,6 +43,7 @@ pub struct IoArgs {
     pub log_format: LogFormat,
     pub log_level: Option<LevelFilter>,
     pub log_level_file: Option<LevelFilter>,
+    pub debug: bool,
 
     // Flags influencing error/warning behavior
     pub show_all_deprecations: bool,
@@ -130,7 +132,12 @@ impl IoArgs {
     }
 
     pub fn should_show(&self, option: ShowOptions) -> bool {
-        self.show.contains(&option) || option == ShowOptions::All
+        (self.show.contains(&option) || option == ShowOptions::All)
+            // TODO: temporary logic to avoid showing skipped nodes for compile.
+            // Should be centralized across all commands, progress message types, and options.
+            && (option != ShowOptions::Completed
+                || self.command.as_str() != "compile"
+                || self.debug)
     }
 
     /// Returns true if the build cache should be used (read or readwrite mode, or --use-build-cache flag).
@@ -567,10 +574,12 @@ impl FromStr for RunCacheMode {
 #[clap(rename_all = "lowercase")]
 pub enum ShowOptions {
     Progress,
-    ProgressRun,
+    ProgressHydrate,
     ProgressParse,
     ProgressRender,
     ProgressAnalyze,
+    ProgressRun,
+    Completed,
     InputFiles,
     Manifest,
     Schedule,
@@ -601,6 +610,7 @@ impl ShowOptions {
             ShowOptions::Stats => BLUE.apply_to("Statistics").to_string(),
             // remark: these come with own titles..
             ShowOptions::Progress
+            | ShowOptions::ProgressHydrate
             | ShowOptions::ProgressRun
             | ShowOptions::ProgressParse
             | ShowOptions::ProgressRender
@@ -611,6 +621,7 @@ impl ShowOptions {
             | ShowOptions::All
             | ShowOptions::RawLineage
             | ShowOptions::TaskGraph
+            | ShowOptions::Completed
             | ShowOptions::None => "".to_string(),
         }
     }
@@ -728,6 +739,17 @@ pub fn check_env_var(vars: &str) -> Result<HashMap<String, String>, String> {
     }
 }
 
+pub fn validate_project_name(name: &str) -> Result<String, String> {
+    // Check if the name contains only letters, digits, and underscores
+    if name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        Ok(name.to_string())
+    } else {
+        Err(format!(
+            "{name} is not a valid project name. Only letters, digits and underscore are valid characters in a project name."
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -782,6 +804,45 @@ mod tests {
 
         for var in invalid_vars {
             assert!(check_var(var).is_err(), "Should have failed: {var}");
+        }
+    }
+
+    #[test]
+    fn test_validate_project_name_valid() {
+        let valid_names = vec![
+            "my_project",
+            "project123",
+            "Project_Name",
+            "test_project_1",
+            "a",
+            "project_with_underscores_and_numbers123",
+        ];
+
+        for name in valid_names {
+            assert_eq!(validate_project_name(name).unwrap(), name);
+        }
+    }
+
+    #[test]
+    fn test_validate_project_name_invalid() {
+        let invalid_names = vec![
+            "my-cool-project",      // Contains hyphen
+            "project with spaces",  // Contains spaces
+            "project.with.dots",    // Contains dots
+            "project/with/slashes", // Contains slashes
+            "project@symbol",       // Contains @ symbol
+            "project#hash",         // Contains # symbol
+        ];
+
+        for name in invalid_names {
+            let result = validate_project_name(name);
+            assert!(result.is_err(), "Should have failed: {name}");
+            assert_eq!(
+                result.unwrap_err(),
+                format!(
+                    "{name} is not a valid project name. Only letters, digits and underscore are valid characters in a project name."
+                )
+            );
         }
     }
 }

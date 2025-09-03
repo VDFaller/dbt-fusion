@@ -15,6 +15,7 @@ use crate::utils::update_node_relation_components;
 
 use dbt_common::ErrorCode;
 use dbt_common::FsResult;
+use dbt_common::adapter::AdapterType;
 use dbt_common::cancellation::CancellationToken;
 use dbt_common::error::AbstractLocation;
 use dbt_common::fs_err;
@@ -34,13 +35,14 @@ use dbt_schemas::schemas::common::DbtQuoting;
 use dbt_schemas::schemas::common::ModelFreshnessRules;
 use dbt_schemas::schemas::common::NodeDependsOn;
 use dbt_schemas::schemas::dbt_column::process_columns;
+use dbt_schemas::schemas::nodes::AdapterAttr;
 use dbt_schemas::schemas::project::DbtProject;
 use dbt_schemas::schemas::project::ModelConfig;
 use dbt_schemas::schemas::properties::ModelProperties;
 use dbt_schemas::schemas::ref_and_source::{DbtRef, DbtSourceWrapper};
-use dbt_schemas::state::DbtAsset;
 use dbt_schemas::state::DbtPackage;
 use dbt_schemas::state::DbtRuntimeConfig;
+use dbt_schemas::state::GenericTestAsset;
 use dbt_schemas::state::ModelStatus;
 use dbt_schemas::state::RefsAndSourcesTracker;
 use minijinja::MacroSpans;
@@ -63,12 +65,12 @@ pub async fn resolve_models(
     model_properties: &mut BTreeMap<String, MinimalPropertiesEntry>,
     database: &str,
     schema: &str,
-    adapter_type: &str,
+    adapter_type: AdapterType,
     package_name: &str,
     env: Arc<JinjaEnv>,
     base_ctx: &BTreeMap<String, minijinja::Value>,
     runtime_config: Arc<DbtRuntimeConfig>,
-    collected_tests: &mut Vec<DbtAsset>,
+    collected_generic_tests: &mut Vec<GenericTestAsset>,
     refs_and_sources: &mut RefsAndSources,
     token: &CancellationToken,
 ) -> FsResult<(
@@ -81,8 +83,6 @@ pub async fn resolve_models(
     let mut disabled_models: HashMap<String, Arc<DbtModel>> = HashMap::new();
     let mut node_names = HashSet::new();
     let mut rendering_results: HashMap<String, (String, MacroSpans)> = HashMap::new();
-
-    let is_replay_mode = arg.replay.is_some();
 
     let local_project_config = if package.dbt_project.name == root_project.name {
         root_project_configs.models.clone()
@@ -107,7 +107,7 @@ pub async fn resolve_models(
             package_quoting,
             base_ctx: base_ctx.clone(),
             package_name: package_name.to_string(),
-            adapter_type: adapter_type.to_string(),
+            adapter_type,
             database: database.to_string(),
             schema: schema.to_string(),
             local_project_config: local_project_config.clone(),
@@ -209,7 +209,12 @@ pub async fn resolve_models(
         } else {
             vec![model_name.to_owned()]
         };
-        let fqn = get_node_fqn(package_name, dbt_asset.path.to_owned(), fqn_components);
+        let fqn = get_node_fqn(
+            package_name,
+            dbt_asset.path.to_owned(),
+            fqn_components,
+            package.dbt_project.model_paths.as_ref().unwrap_or(&vec![]),
+        );
 
         let properties = if let Some(properties) = maybe_properties {
             properties
@@ -248,10 +253,13 @@ pub async fn resolve_models(
                 path: dbt_asset.path.to_owned(),
                 name_span: dbt_common::Span::default(),
                 original_file_path,
-                patch_path,
+                patch_path: patch_path.clone(),
                 unique_id: unique_id.clone(),
                 fqn,
-                description: properties.description.clone(),
+                description: model_config
+                    .description
+                    .clone()
+                    .or_else(|| properties.description.clone()),
                 checksum: sql_file_info.checksum.clone(),
                 raw_code: Some("--placeholder--".to_string()),
                 language: Some("sql".to_string()),
@@ -269,6 +277,7 @@ pub async fn resolve_models(
                 relation_name: None,            // will be updated below
                 enabled: model_config.enabled.unwrap_or(true),
                 extended_model: false,
+                persist_docs: model_config.persist_docs.clone(),
                 columns,
                 depends_on: NodeDependsOn {
                     macros: convert_macro_names_to_unique_ids(&macro_calls),
@@ -327,6 +336,10 @@ pub async fn resolve_models(
                 freshness: model_config.freshness.clone(),
                 event_time: model_config.event_time.clone(),
             },
+            __adapter_attr__: AdapterAttr::from_config_and_dialect(
+                &model_config.__warehouse_specific_config__,
+                adapter_type,
+            ),
             // Derived from the model config
             deprecated_config: model_config.clone(),
             __other__: BTreeMap::new(),
@@ -371,10 +384,10 @@ pub async fn resolve_models(
                 properties.as_testable().persist(
                     package_name,
                     &root_project.name,
-                    collected_tests,
+                    collected_generic_tests,
                     adapter_type,
-                    is_replay_mode,
                     &arg.io,
+                    patch_path.as_ref().unwrap_or(&dbt_asset.path),
                 )?;
             }
             ModelStatus::Disabled => {

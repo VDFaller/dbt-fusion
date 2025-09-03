@@ -10,12 +10,14 @@ pub mod cache;
 pub mod convert_type;
 pub mod errors;
 pub mod factory;
-pub(crate) mod formatter;
+pub mod formatter;
 pub mod funcs;
 pub mod information_schema;
+pub mod need_quotes;
 pub mod query_ctx;
 pub mod record_and_replay;
 pub mod render_constraint;
+pub mod reserved_keywords;
 pub mod response;
 pub mod snapshots;
 pub mod sql_engine;
@@ -43,12 +45,15 @@ pub mod metadata;
 pub mod parse;
 /// Postgres adapter
 pub mod postgres;
-/// Record batch utils
-pub mod record_batch_utils;
 /// Redshift adapter
 pub mod redshift;
+/// Salesforce adapter
+pub mod salesforce;
 /// Snowflake adapter
 pub mod snowflake;
+
+/// Record batch utils
+pub mod record_batch_utils;
 
 pub mod cast_util;
 /// Utils

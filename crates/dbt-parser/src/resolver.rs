@@ -1,6 +1,7 @@
 //! Module containing the entrypoint for the resolve phase.
 #[allow(unused_imports)]
 use dbt_common::FsError;
+use dbt_common::adapter::AdapterType;
 use dbt_common::cancellation::CancellationToken;
 use dbt_common::constants::{DBT_GENERIC_TESTS_DIR_NAME, RESOLVING};
 use dbt_common::once_cell_vars::DISPATCH_CONFIG;
@@ -18,7 +19,7 @@ use dbt_schemas::schemas::{InternalDbtNode, Nodes};
 
 use dbt_jinja_utils::jinja_environment::JinjaEnv;
 use dbt_schemas::state::RenderResults;
-use dbt_schemas::state::{DbtPackage, Macros};
+use dbt_schemas::state::{DbtPackage, GenericTestAsset, Macros};
 use dbt_schemas::state::{DbtRuntimeConfig, Operations};
 
 use crate::args::ResolveArgs;
@@ -37,9 +38,11 @@ use crate::resolve::resolve_analyses::resolve_analyses;
 use crate::resolve::resolve_exposures::resolve_exposures;
 use crate::resolve::resolve_macros::resolve_docs_macros;
 use crate::resolve::resolve_macros::resolve_macros;
+use crate::resolve::resolve_metrics::resolve_metrics;
 use crate::resolve::resolve_models::resolve_models;
 use crate::resolve::resolve_properties::resolve_minimal_properties;
 use crate::resolve::resolve_seeds::resolve_seeds;
+use crate::resolve::resolve_semantic_models::resolve_semantic_models;
 use crate::resolve::resolve_snapshots::resolve_snapshots;
 use crate::resolve::resolve_sources::resolve_sources;
 use crate::resolve::resolve_tests::resolve_data_tests::resolve_data_tests;
@@ -77,7 +80,6 @@ pub async fn resolve(
 
     // Get the root project name
     let root_project_name = dbt_state.root_project_name();
-    let adapter_type = dbt_state.dbt_profile.db_config.adapter_type();
 
     // let mut macros = Macros::default();
     let mut macros = macros;
@@ -105,18 +107,28 @@ pub async fn resolve(
         operations.on_run_end.extend(on_run_end);
     }
 
+    let adapter_type = dbt_state
+        .dbt_profile
+        .db_config
+        .adapter_type_if_supported()
+        .ok_or_else(|| {
+            fs_err!(
+                ErrorCode::InvalidConfig,
+                "Invalid or unsupported adapter type in profile: {}",
+                dbt_state.dbt_profile.db_config.adapter_type()
+            )
+        })?;
+
     // Build the root project config
-    let root_project_quoting = resolve_package_quoting(
-        *dbt_state.root_project().quoting,
-        &dbt_state.dbt_profile.db_config.adapter_type(),
-    );
+    let root_project_quoting =
+        resolve_package_quoting(*dbt_state.root_project().quoting, adapter_type);
 
     let jinja_env = Arc::new(initialize_parse_jinja_environment(
         root_project_name,
         &dbt_state.dbt_profile.profile,
         &dbt_state.dbt_profile.target,
-        &dbt_state.dbt_profile.db_config.adapter_type(),
-        &dbt_state.dbt_profile.db_config,
+        adapter_type.as_ref(),
+        dbt_state.dbt_profile.db_config.clone(),
         root_project_quoting,
         build_macro_units(&macros.macros),
         dbt_state.vars.clone(),
@@ -136,7 +148,6 @@ pub async fn resolve(
 
     // Compute final selectors
     let resolved_selectors = resolve_final_selectors(root_project_name, &jinja_env, arg)?;
-    // dbg!(&resolved_selectors);
 
     // Create a map to store full runtime configs for ALL packages
     let mut all_runtime_configs: BTreeMap<String, Arc<DbtRuntimeConfig>> = BTreeMap::new();
@@ -146,11 +157,10 @@ pub async fn resolve(
     let root_project_configs =
         build_root_project_configs(&arg.io, dbt_state.root_project(), root_project_quoting)?;
     let root_project_configs = Arc::new(root_project_configs);
-
     // Process packages in topological order
     let mut refs_and_sources = RefsAndSources::from_dbt_nodes(
         &nodes,
-        &adapter_type,
+        adapter_type,
         root_project_name.to_string(),
         None,
         arg.sample_config.clone(),
@@ -170,7 +180,7 @@ pub async fn resolve(
                 dbt_state.clone(),
                 root_project_name,
                 root_project_configs.clone(),
-                &adapter_type,
+                adapter_type,
                 &macros,
                 jinja_env.clone(),
                 &mut refs_and_sources,
@@ -193,7 +203,7 @@ pub async fn resolve(
                 dbt_state.clone(),
                 root_project_name,
                 root_project_configs.clone(),
-                &adapter_type,
+                adapter_type,
                 &macros,
                 jinja_env.clone(),
                 &mut refs_and_sources,
@@ -208,7 +218,6 @@ pub async fn resolve(
             .rendering_results
             .extend(resolved_collector.rendering_results);
     }
-
     // Ensure that there are no duplicate relations
     check_relation_uniqueness(&nodes)?;
 
@@ -239,7 +248,9 @@ pub async fn resolve(
         .unwrap();
 
     // take refs and sources, resolve them to a unique_id and put in depends_on
-    resolve_dependencies(&arg.io, &mut nodes, &mut disabled_nodes, &refs_and_sources);
+    // This returns a set of node IDs that had resolution errors (unresolved refs/sources)
+    let nodes_with_resolution_errors =
+        resolve_dependencies(&arg.io, &mut nodes, &mut disabled_nodes, &refs_and_sources);
 
     // Check access
     check_access(arg, &nodes, &all_runtime_configs);
@@ -256,6 +267,7 @@ pub async fn resolve(
             dbt_profile: dbt_state.dbt_profile.clone(),
             render_results: collector,
             run_started_at: dbt_state.run_started_at,
+            nodes_with_resolution_errors,
             refs_and_sources: Arc::new(refs_and_sources),
             get_relation_calls: call_get_relation?,
             get_columns_in_relation_calls: call_get_columns_in_relation?,
@@ -365,7 +377,7 @@ pub async fn resolve_inner(
     dbt_state: Arc<DbtState>,
     root_package_name: &str,
     root_project_configs: &RootProjectConfigs,
-    adapter_type: &str,
+    adapter_type: AdapterType,
     macros: &Macros,
     jinja_env: Arc<JinjaEnv>,
     refs_and_sources: &mut RefsAndSources,
@@ -399,7 +411,7 @@ pub async fn resolve_inner(
 
     let package_name = package.dbt_project.name.as_str();
 
-    let mut collected_tests = Vec::new();
+    let mut collected_generic_tests: Vec<GenericTestAsset> = Vec::new();
 
     let dbt_tests_dir = arg.io.out_dir.join(DBT_GENERIC_TESTS_DIR_NAME);
     stdfs::create_dir_all(&dbt_tests_dir)?;
@@ -416,7 +428,7 @@ pub async fn resolve_inner(
         adapter_type,
         &base_ctx,
         &jinja_env,
-        &mut collected_tests,
+        &mut collected_generic_tests,
         refs_and_sources,
     )?;
     nodes.sources.extend(sources);
@@ -436,7 +448,7 @@ pub async fn resolve_inner(
         package_name,
         &jinja_env,
         &base_ctx,
-        &mut collected_tests,
+        &mut collected_generic_tests,
         refs_and_sources,
     )?;
     nodes.seeds.extend(seeds);
@@ -479,7 +491,7 @@ pub async fn resolve_inner(
         jinja_env.clone(),
         &base_ctx,
         runtime_config.clone(),
-        &mut collected_tests,
+        &mut collected_generic_tests,
         refs_and_sources,
         token,
     )
@@ -524,6 +536,16 @@ pub async fn resolve_inner(
     nodes.exposures.extend(exposures);
     disabled_nodes.exposures.extend(disabled_exposures);
 
+    let (semantic_models, disabled_semantic_models) = resolve_semantic_models().await?;
+    nodes.semantic_models.extend(semantic_models);
+    disabled_nodes
+        .semantic_models
+        .extend(disabled_semantic_models);
+
+    let (metrics, disabled_metrics) = resolve_metrics().await?;
+    nodes.metrics.extend(metrics);
+    disabled_nodes.metrics.extend(disabled_metrics);
+
     let (data_tests, disabled_tests) = resolve_data_tests(
         arg,
         package,
@@ -537,7 +559,7 @@ pub async fn resolve_inner(
         jinja_env.clone(),
         &base_ctx,
         runtime_config.clone(),
-        &collected_tests,
+        &collected_generic_tests,
         token,
     )
     .await?;
@@ -614,7 +636,7 @@ async fn resolve_package(
     dbt_state: Arc<DbtState>,
     root_project_name: String,
     root_project_configs: Arc<RootProjectConfigs>,
-    adapter_type: String,
+    adapter_type: AdapterType,
     macros: Macros,
     jinja_env: Arc<JinjaEnv>,
     refs_and_sources: RefsAndSources,
@@ -660,7 +682,7 @@ async fn resolve_package(
             dbt_state.clone(),
             &root_project_name,
             &root_project_configs,
-            &adapter_type,
+            adapter_type,
             &macros,
             jinja_env.clone(),
             &mut refs_and_sources.clone(),
@@ -688,7 +710,7 @@ async fn resolve_packages_sequentially(
     dbt_state: Arc<DbtState>,
     root_project_name: &str,
     root_project_configs: Arc<RootProjectConfigs>,
-    adapter_type: &str,
+    adapter_type: AdapterType,
     macros: &Macros,
     jinja_env: Arc<JinjaEnv>,
     refs_and_sources: &mut RefsAndSources,
@@ -711,7 +733,7 @@ async fn resolve_packages_sequentially(
                 dbt_state.clone(),
                 root_project_name.to_string(),
                 root_project_configs.clone(),
-                adapter_type.to_string(),
+                adapter_type,
                 macros.clone(),
                 jinja_env.clone(),
                 refs_and_sources.clone(),
@@ -753,7 +775,7 @@ async fn resolve_packages_parallel(
     dbt_state: Arc<DbtState>,
     root_project_name: &str,
     root_project_configs: Arc<RootProjectConfigs>,
-    adapter_type: &str,
+    adapter_type: AdapterType,
     macros: &Macros,
     jinja_env: Arc<JinjaEnv>,
     refs_and_sources: &mut RefsAndSources,
@@ -775,7 +797,6 @@ async fn resolve_packages_parallel(
             let dbt_state = dbt_state.clone();
             let root_project_name = root_project_name.to_string();
             let root_project_configs = root_project_configs.clone();
-            let adapter_type = adapter_type.to_string();
             let macros = macros.clone();
             let jinja_env = jinja_env.clone();
             let refs_and_sources = refs_and_sources.clone();

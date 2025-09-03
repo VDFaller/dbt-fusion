@@ -2,18 +2,23 @@ use core::fmt;
 use std::str::FromStr;
 use std::{any::Any, collections::BTreeMap, fmt::Display, path::PathBuf, sync::Arc};
 
+use chrono::{DateTime, Utc};
+use dbt_common::adapter::AdapterType;
 use dbt_common::{ErrorCode, FsResult, err, io_args::StaticAnalysisKind};
 use dbt_telemetry::NodeIdentifier;
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 type YmlValue = dbt_serde_yaml::Value;
-use crate::schemas::common::{NodeInfo, NodeInfoWrapper};
+use crate::schemas::common::{NodeInfo, NodeInfoWrapper, PersistDocsConfig};
+use crate::schemas::dbt_column::DbtColumnRef;
+use crate::schemas::manifest::{BigqueryClusterConfig, GrantAccessToTarget, PartitionConfig};
+use crate::schemas::project::WarehouseSpecificNodeConfig;
+use crate::schemas::serde::StringOrArrayOfStrings;
 use crate::schemas::{
     common::{
         Access, DbtChecksum, DbtContract, DbtIncrementalStrategy, DbtMaterialization, Expect,
-        FreshnessDefinition, Given, IncludeExclude, NodeDependsOn, ResolvedQuoting,
+        FreshnessDefinition, Given, IncludeExclude, NodeDependsOn, ResolvedQuoting, ScheduleConfig,
     },
-    dbt_column::DbtColumn,
     macros::DbtMacro,
     manifest::common::DbtOwner,
     manifest::{DbtMetric, DbtSavedQuery, DbtSemanticModel},
@@ -95,6 +100,7 @@ pub enum InternalDbtNodeWrapper {
     UnitTest(Box<DbtUnitTest>),
     Source(Box<DbtSource>),
     Snapshot(Box<DbtSnapshot>),
+    Exposure(Box<DbtExposure>),
 }
 
 impl InternalDbtNodeWrapper {
@@ -122,6 +128,7 @@ impl InternalDbtNodeWrapper {
             InternalDbtNodeWrapper::UnitTest(unit_test) => unit_test.as_ref(),
             InternalDbtNodeWrapper::Source(source) => source.as_ref(),
             InternalDbtNodeWrapper::Snapshot(snapshot) => snapshot.as_ref(),
+            InternalDbtNodeWrapper::Exposure(exposure) => exposure.as_ref(),
         }
     }
 }
@@ -177,49 +184,52 @@ pub trait InternalDbtNode: Any + Send + Sync + fmt::Debug {
         Ok(())
     }
 
-    fn get_node_start_data(&self) -> YmlValue {
-        let node_info_wrapper = NodeInfoWrapper {
+    fn get_node_start_data(&self, node_started_at: DateTime<Utc>) -> NodeInfoWrapper {
+        NodeInfoWrapper {
             unique_id: None,
             skipped_nodes: None,
             node_info: NodeInfo {
                 node_name: self.common().name.clone(),
                 unique_id: self.common().unique_id.clone(),
-                node_started_at: Some(
-                    chrono::Utc::now()
-                        .format("%Y-%m-%dT%H:%M:%S%.6f")
-                        .to_string(),
-                ),
+                node_started_at: Some(node_started_at.format("%Y-%m-%dT%H:%M:%S%.6f").to_string()),
                 node_finished_at: None,
                 node_status: "executing".to_string(),
             },
-        };
-        dbt_serde_yaml::to_value(node_info_wrapper).expect("Failed to serialize NodeInfoWrapper")
+        }
     }
 
-    fn get_node_end_data(&self, status: &str) -> YmlValue {
-        dbt_serde_yaml::to_value(NodeInfoWrapper {
+    fn get_node_end_data(
+        &self,
+        status: &str,
+        node_started_at: DateTime<Utc>,
+        node_finished_at: DateTime<Utc>,
+    ) -> NodeInfoWrapper {
+        NodeInfoWrapper {
             unique_id: None,
             skipped_nodes: None,
             node_info: NodeInfo {
                 node_name: self.common().name.clone(),
                 unique_id: self.common().unique_id.clone(),
+                node_started_at: Some(node_started_at.format("%Y-%m-%dT%H:%M:%S%.6f").to_string()),
                 node_finished_at: Some(
-                    chrono::Utc::now()
-                        .format("%Y-%m-%dT%H:%M:%S%.6f")
-                        .to_string(),
+                    node_finished_at.format("%Y-%m-%dT%H:%M:%S%.6f").to_string(),
                 ),
-                node_started_at: None,
                 node_status: status.to_string(),
             },
-        })
-        .expect("Failed to serialize NodeInfoWrapper")
+        }
     }
 }
 
 pub trait InternalDbtNodeAttributes: InternalDbtNode {
     // Required Fields
+    fn skip_generate_database_name_macro(&self) -> bool {
+        false
+    }
     fn database(&self) -> String {
         self.base().database.clone()
+    }
+    fn skip_generate_schema_name_macro(&self) -> bool {
+        false
     }
     fn schema(&self) -> String {
         self.base().schema.clone()
@@ -806,6 +816,30 @@ impl InternalDbtNode for DbtSnapshot {
 }
 
 impl InternalDbtNodeAttributes for DbtSnapshot {
+    fn skip_generate_schema_name_macro(&self) -> bool {
+        self.deprecated_config.target_schema.is_some()
+    }
+
+    fn schema(&self) -> String {
+        // prefer legacy config
+        self.deprecated_config
+            .target_schema
+            .clone()
+            .unwrap_or_else(|| self.base().schema.clone())
+    }
+
+    fn skip_generate_database_name_macro(&self) -> bool {
+        self.deprecated_config.target_database.is_some()
+    }
+
+    fn database(&self) -> String {
+        // prefer legacy config
+        self.deprecated_config
+            .target_database
+            .clone()
+            .unwrap_or_else(|| self.base().database.clone())
+    }
+
     fn static_analysis(&self) -> StaticAnalysisKind {
         self.__base_attr__.static_analysis
     }
@@ -869,8 +903,9 @@ impl InternalDbtNode for DbtSemanticModel {
     }
 
     fn has_same_config(&self, other: &dyn InternalDbtNode) -> bool {
-        if let Some(other_semantic_model) = other.as_any().downcast_ref::<DbtSemanticModel>() {
-            self.config == other_semantic_model.config
+        if let Some(_other_semantic_model) = other.as_any().downcast_ref::<DbtSemanticModel>() {
+            // TODO: implement proper config comparison when needed
+            true
         } else {
             false
         }
@@ -1001,17 +1036,23 @@ impl InternalDbtNode for DbtSavedQuery {
 
 impl InternalDbtNode for DbtMetric {
     fn common(&self) -> &CommonAttributes {
-        unimplemented!("metric common attributes access")
-    }
-    fn base(&self) -> &NodeBaseAttributes {
-        unimplemented!("metric base attributes access")
-    }
-    fn base_mut(&mut self) -> &mut NodeBaseAttributes {
-        unimplemented!("metric base attributes mutation")
+        &self.__common_attr__
     }
     fn common_mut(&mut self) -> &mut CommonAttributes {
-        unimplemented!("metric common attributes mutation")
+        &mut self.__common_attr__
     }
+
+    // TODO: do we have to use NodeBaseAttributes if we're missing so much of it?
+    // DbtExposure has similar characteristics, but resolve_exposures sets many default values for NodeBaseAttributes...
+    fn base(&self) -> &NodeBaseAttributes {
+        // Metrics don't have base attributes - they don't have database/schema/alias
+        panic!("DbtMetric does not have base attributes - use common() instead")
+    }
+    fn base_mut(&mut self) -> &mut NodeBaseAttributes {
+        // Metrics don't have base attributes - they don't have database/schema/alias
+        panic!("DbtMetric does not have base attributes - use common_mut() instead")
+    }
+
     fn resource_type(&self) -> &str {
         "metric"
     }
@@ -1021,11 +1062,19 @@ impl InternalDbtNode for DbtMetric {
     fn serialize_inner(&self) -> YmlValue {
         dbt_serde_yaml::to_value(self).expect("Failed to serialize to YAML")
     }
-    fn has_same_config(&self, _other: &dyn InternalDbtNode) -> bool {
-        unimplemented!("metric config comparison")
+    fn has_same_config(&self, other: &dyn InternalDbtNode) -> bool {
+        if let Some(other_metric) = other.as_any().downcast_ref::<DbtMetric>() {
+            self.deprecated_config == other_metric.deprecated_config
+        } else {
+            false
+        }
     }
-    fn has_same_content(&self, _other: &dyn InternalDbtNode) -> bool {
-        unimplemented!("metric content comparison")
+    fn has_same_content(&self, other: &dyn InternalDbtNode) -> bool {
+        if let Some(other_metric) = other.as_any().downcast_ref::<DbtMetric>() {
+            self.__common_attr__.checksum == other_metric.__common_attr__.checksum
+        } else {
+            false
+        }
     }
     fn set_detected_introspection(&mut self, _introspection: IntrospectionKind) {
         panic!("DbtMetric does not support setting detected_unsafe");
@@ -1075,6 +1124,8 @@ pub struct Nodes {
     pub snapshots: BTreeMap<String, Arc<DbtSnapshot>>,
     pub analyses: BTreeMap<String, Arc<DbtModel>>,
     pub exposures: BTreeMap<String, Arc<DbtExposure>>,
+    pub semantic_models: BTreeMap<String, Arc<DbtSemanticModel>>,
+    pub metrics: BTreeMap<String, Arc<DbtMetric>>,
 }
 
 impl Nodes {
@@ -1119,6 +1170,16 @@ impl Nodes {
             .iter()
             .map(|(id, node)| (id.clone(), Arc::new((**node).clone())))
             .collect();
+        let semantic_models = self
+            .semantic_models
+            .iter()
+            .map(|(id, node)| (id.clone(), Arc::new((**node).clone())))
+            .collect();
+        let metrics = self
+            .metrics
+            .iter()
+            .map(|(id, node)| (id.clone(), Arc::new((**node).clone())))
+            .collect();
         Nodes {
             models,
             seeds,
@@ -1128,10 +1189,13 @@ impl Nodes {
             snapshots,
             analyses,
             exposures,
+            semantic_models,
+            metrics,
         }
     }
 
-    pub fn keys(&self) -> impl Iterator<Item = &String> {
+    /// Return only the keys of materializable nodes (this excludes exposures and semantic resources)
+    pub fn materializable_keys(&self) -> impl Iterator<Item = &String> {
         self.models
             .keys()
             .chain(self.seeds.keys())
@@ -1140,6 +1204,7 @@ impl Nodes {
             .chain(self.sources.keys())
             .chain(self.snapshots.keys())
             .chain(self.analyses.keys())
+            .chain(self.exposures.keys())
     }
 
     pub fn get_node(&self, unique_id: &str) -> Option<&dyn InternalDbtNodeAttributes> {
@@ -1173,6 +1238,11 @@ impl Nodes {
             })
             .or_else(|| {
                 self.analyses
+                    .get(unique_id)
+                    .map(|n| Arc::as_ref(n) as &dyn InternalDbtNodeAttributes)
+            })
+            .or_else(|| {
+                self.exposures
                     .get(unique_id)
                     .map(|n| Arc::as_ref(n) as &dyn InternalDbtNodeAttributes)
             })
@@ -1212,8 +1282,16 @@ impl Nodes {
                     .get(unique_id)
                     .map(|n| n.clone() as Arc<dyn InternalDbtNodeAttributes>)
             })
+            .or_else(|| {
+                self.exposures
+                    .get(unique_id)
+                    .map(|n| n.clone() as Arc<dyn InternalDbtNodeAttributes>)
+            })
     }
 
+    /// Check if a node exists in the graph.
+    /// Used with [`Nodes::materializable_keys`], so intent could be to only check for materializable nodes.
+    /// TODO: Determine if this function should be updated to only check for materializable nodes.
     pub fn contains(&self, unique_id: &str) -> bool {
         self.models.contains_key(unique_id)
             || self.seeds.contains_key(unique_id)
@@ -1222,6 +1300,8 @@ impl Nodes {
             || self.sources.contains_key(unique_id)
             || self.snapshots.contains_key(unique_id)
             || self.analyses.contains_key(unique_id)
+            || self.exposures.contains_key(unique_id)
+            || self.metrics.contains_key(unique_id)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&String, &dyn InternalDbtNodeAttributes)> + '_ {
@@ -1258,6 +1338,11 @@ impl Nodes {
                     .iter()
                     .map(|(id, node)| (id, Arc::as_ref(node) as &dyn InternalDbtNodeAttributes)),
             )
+            .chain(
+                self.exposures
+                    .iter()
+                    .map(|(id, node)| (id, Arc::as_ref(node) as &dyn InternalDbtNodeAttributes)),
+            )
     }
 
     pub fn into_iter(
@@ -1291,6 +1376,10 @@ impl Nodes {
             .analyses
             .iter()
             .map(|(id, node)| (id.clone(), upcast(node.clone())));
+        let exposures = self
+            .exposures
+            .iter()
+            .map(|(id, node)| (id.clone(), upcast(node.clone())));
 
         models
             .chain(seeds)
@@ -1299,6 +1388,7 @@ impl Nodes {
             .chain(sources)
             .chain(snapshots)
             .chain(analyses)
+            .chain(exposures)
     }
 
     pub fn iter_values_mut(
@@ -1438,6 +1528,14 @@ impl Nodes {
                     })
                     .map(|arc| Arc::as_ref(arc) as &dyn InternalDbtNodeAttributes)
             })
+            .or_else(|| {
+                self.exposures
+                    .values()
+                    .find(|exposure| {
+                        exposure.base().relation_name == Some(relation_name.to_string())
+                    })
+                    .map(|arc| Arc::as_ref(arc) as &dyn InternalDbtNodeAttributes)
+            })
     }
 
     pub fn extend(&mut self, other: Nodes) {
@@ -1449,6 +1547,7 @@ impl Nodes {
         self.snapshots.extend(other.snapshots);
         self.analyses.extend(other.analyses);
         self.exposures.extend(other.exposures);
+        self.metrics.extend(other.metrics);
     }
 
     pub fn warn_on_custom_materializations(&self) -> FsResult<()> {
@@ -1487,7 +1586,6 @@ fn upcast<T: InternalDbtNodeAttributes + 'static>(
     arc
 }
 
-#[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub struct CommonAttributes {
@@ -1546,9 +1644,12 @@ pub struct NodeBaseAttributes {
     #[serde(skip_serializing, default = "default_false")]
     pub extended_model: bool,
 
+    // Documentation persistence configuration
+    pub persist_docs: Option<PersistDocsConfig>,
+
     // Derived
     #[serde(default)]
-    pub columns: BTreeMap<String, DbtColumn>,
+    pub columns: BTreeMap<String, DbtColumnRef>,
 
     // Raw Refs, Source, and Metric Dependencies from SQL
     #[serde(default)]
@@ -1726,6 +1827,10 @@ pub struct DbtSource {
     #[serde(rename = "config")]
     pub deprecated_config: SourceConfig,
 
+    // Other untyped (or rather externally typed) keys that can be used by dbt packages.
+    // For example, the `external` key is used by `dbt-external-tables`, but it's not
+    // explicitly typed by dbt itself.
+    // See: https://github.com/dbt-labs/dbt-external-tables
     pub __other__: BTreeMap<String, YmlValue>,
 }
 
@@ -1774,11 +1879,288 @@ pub struct DbtModel {
 
     pub __model_attr__: DbtModelAttr,
 
+    pub __adapter_attr__: AdapterAttr,
+
     // TO BE DEPRECATED
     #[serde(rename = "config")]
     pub deprecated_config: ModelConfig,
 
     pub __other__: BTreeMap<String, YmlValue>,
+}
+
+#[skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct AdapterAttr {
+    pub snowflake_attr: Option<Box<SnowflakeAttr>>,
+    pub databricks_attr: Option<Box<DatabricksAttr>>,
+    pub bigquery_attr: Option<Box<BigQueryAttr>>,
+    pub redshift_attr: Option<Box<RedshiftAttr>>,
+}
+
+impl AdapterAttr {
+    pub fn with_snowflake_attr(mut self, snowflake_attr: Option<Box<SnowflakeAttr>>) -> Self {
+        self.snowflake_attr = snowflake_attr;
+        self
+    }
+
+    pub fn with_databricks_attr(mut self, databricks_attr: Option<Box<DatabricksAttr>>) -> Self {
+        self.databricks_attr = databricks_attr;
+        self
+    }
+
+    pub fn with_bigquery_attr(mut self, bigquery_attr: Option<Box<BigQueryAttr>>) -> Self {
+        self.bigquery_attr = bigquery_attr;
+        self
+    }
+
+    pub fn with_redshift_attr(mut self, redshift_attr: Option<Box<RedshiftAttr>>) -> Self {
+        self.redshift_attr = redshift_attr;
+        self
+    }
+
+    /// Creates a new [AdapterAttr] from a given [&WarehouseSpecificNodeConfig] and adapter type string
+    pub fn from_config_and_dialect(
+        config: &WarehouseSpecificNodeConfig,
+        adapter_type: AdapterType,
+    ) -> Self {
+        // TODO: Make all None inputs result in a None for that attr
+        // TODO: Creation of configs should be delegated to the adapter specific attr struct
+        // Here we naively initialize the resolved adapter attributes.
+        // This allows propagation of configurations and switching on the adapter type
+        // allows us to save memory for unused configurations.
+        //
+        // A further optimization can be done by only setting inner fields of [AdapterAttr] if at least one field of the
+        // input is not None
+        match adapter_type {
+            AdapterType::Snowflake => {
+                AdapterAttr::default().with_snowflake_attr(Some(Box::new(SnowflakeAttr {
+                    table_tag: config.table_tag.clone(),
+                    row_access_policy: config.row_access_policy.clone(),
+                    external_volume: config.external_volume.clone(),
+                    base_location_root: config.base_location_root.clone(),
+                    base_location_subpath: config.base_location_subpath.clone(),
+                    target_lag: config.target_lag.clone(),
+                    snowflake_warehouse: config.snowflake_warehouse.clone(),
+                    refresh_mode: config.refresh_mode.clone(),
+                    initialize: config.initialize.clone(),
+                    tmp_relation_type: config.tmp_relation_type.clone(),
+                    query_tag: config.query_tag.clone(),
+                    automatic_clustering: config.automatic_clustering,
+                    copy_grants: config.copy_grants,
+                    secure: config.secure,
+                    transient: config.transient,
+                })))
+            }
+            AdapterType::Postgres => AdapterAttr::default(),
+            AdapterType::Bigquery => {
+                AdapterAttr::default().with_bigquery_attr(Some(Box::new(BigQueryAttr {
+                    partition_by: config.partition_by.clone(),
+                    cluster_by: config.cluster_by.clone(),
+                    hours_to_expiration: config.hours_to_expiration,
+                    labels: config.labels.clone(),
+                    labels_from_meta: config.labels_from_meta,
+                    kms_key_name: config.kms_key_name.clone(),
+                    require_partition_filter: config.require_partition_filter,
+                    partition_expiration_days: config.partition_expiration_days,
+                    grant_access_to: config.grant_access_to.clone(),
+                    partitions: config.partitions.clone(),
+                    enable_refresh: config.enable_refresh,
+                    refresh_interval_minutes: config.refresh_interval_minutes,
+                    max_staleness: config.max_staleness.clone(),
+                })))
+            }
+            AdapterType::Redshift => {
+                AdapterAttr::default().with_redshift_attr(Some(Box::new(RedshiftAttr {
+                    auto_refresh: config.auto_refresh,
+                    backup: config.backup,
+                    bind: config.bind,
+                    dist: config.dist.clone(),
+                    sort: config.sort.clone(),
+                    sort_type: config.sort_type.clone(),
+                })))
+            }
+            AdapterType::Databricks => {
+                AdapterAttr::default().with_databricks_attr(Some(Box::new(DatabricksAttr {
+                    partition_by: config.partition_by.clone(),
+                    file_format: config.file_format.clone(),
+                    location_root: config.location_root.clone(),
+                    tblproperties: config.tblproperties.clone(),
+                    include_full_name_in_path: config.include_full_name_in_path,
+                    liquid_clustered_by: config.liquid_clustered_by.clone(),
+                    auto_liquid_cluster: config.auto_liquid_cluster,
+                    clustered_by: config.clustered_by.clone(),
+                    buckets: config.buckets,
+                    catalog: config.catalog.clone(),
+                    databricks_tags: config.databricks_tags.clone(),
+                    compression: config.compression.clone(),
+                    databricks_compute: config.databricks_compute.clone(),
+                    target_alias: config.target_alias.clone(),
+                    source_alias: config.source_alias.clone(),
+                    matched_condition: config.matched_condition.clone(),
+                    not_matched_condition: config.not_matched_condition.clone(),
+                    not_matched_by_source_condition: config.not_matched_by_source_condition.clone(),
+                    not_matched_by_source_action: config.not_matched_by_source_action.clone(),
+                    merge_with_schema_evolution: config.merge_with_schema_evolution,
+                    skip_matched_step: config.skip_matched_step,
+                    skip_not_matched_step: config.skip_not_matched_step,
+                    schedule: config.schedule.clone(),
+                })))
+            }
+            _ => {
+                // Unknown input, populate ALL adapter attributes to maximize compatibility downstream
+                AdapterAttr::default()
+                    .with_snowflake_attr(Some(Box::new(SnowflakeAttr {
+                        table_tag: config.table_tag.clone(),
+                        row_access_policy: config.row_access_policy.clone(),
+                        external_volume: config.external_volume.clone(),
+                        base_location_root: config.base_location_root.clone(),
+                        base_location_subpath: config.base_location_subpath.clone(),
+                        target_lag: config.target_lag.clone(),
+                        snowflake_warehouse: config.snowflake_warehouse.clone(),
+                        refresh_mode: config.refresh_mode.clone(),
+                        initialize: config.initialize.clone(),
+                        tmp_relation_type: config.tmp_relation_type.clone(),
+                        query_tag: config.query_tag.clone(),
+                        automatic_clustering: config.automatic_clustering,
+                        copy_grants: config.copy_grants,
+                        secure: config.secure,
+                        transient: config.transient,
+                    })))
+                    .with_bigquery_attr(Some(Box::new(BigQueryAttr {
+                        partition_by: config.partition_by.clone(),
+                        cluster_by: config.cluster_by.clone(),
+                        hours_to_expiration: config.hours_to_expiration,
+                        labels: config.labels.clone(),
+                        labels_from_meta: config.labels_from_meta,
+                        kms_key_name: config.kms_key_name.clone(),
+                        require_partition_filter: config.require_partition_filter,
+                        partition_expiration_days: config.partition_expiration_days,
+                        grant_access_to: config.grant_access_to.clone(),
+                        partitions: config.partitions.clone(),
+                        enable_refresh: config.enable_refresh,
+                        refresh_interval_minutes: config.refresh_interval_minutes,
+                        max_staleness: config.max_staleness.clone(),
+                    })))
+                    .with_redshift_attr(Some(Box::new(RedshiftAttr {
+                        auto_refresh: config.auto_refresh,
+                        backup: config.backup,
+                        bind: config.bind,
+                        dist: config.dist.clone(),
+                        sort: config.sort.clone(),
+                        sort_type: config.sort_type.clone(),
+                    })))
+                    .with_databricks_attr(Some(Box::new(DatabricksAttr {
+                        partition_by: config.partition_by.clone(),
+                        file_format: config.file_format.clone(),
+                        location_root: config.location_root.clone(),
+                        tblproperties: config.tblproperties.clone(),
+                        include_full_name_in_path: config.include_full_name_in_path,
+                        liquid_clustered_by: config.liquid_clustered_by.clone(),
+                        auto_liquid_cluster: config.auto_liquid_cluster,
+                        clustered_by: config.clustered_by.clone(),
+                        buckets: config.buckets,
+                        catalog: config.catalog.clone(),
+                        databricks_tags: config.databricks_tags.clone(),
+                        compression: config.compression.clone(),
+                        databricks_compute: config.databricks_compute.clone(),
+                        target_alias: config.target_alias.clone(),
+                        source_alias: config.source_alias.clone(),
+                        matched_condition: config.matched_condition.clone(),
+                        not_matched_condition: config.not_matched_condition.clone(),
+                        not_matched_by_source_condition: config
+                            .not_matched_by_source_condition
+                            .clone(),
+                        not_matched_by_source_action: config.not_matched_by_source_action.clone(),
+                        merge_with_schema_evolution: config.merge_with_schema_evolution,
+                        skip_matched_step: config.skip_matched_step,
+                        skip_not_matched_step: config.skip_not_matched_step,
+                        schedule: config.schedule.clone(),
+                    })))
+            }
+        }
+    }
+}
+
+/// A resolved Snowflake configuration
+#[skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SnowflakeAttr {
+    pub table_tag: Option<String>,
+    pub row_access_policy: Option<String>,
+    pub external_volume: Option<String>,
+    pub base_location_root: Option<String>,
+    pub base_location_subpath: Option<String>,
+    pub target_lag: Option<String>,
+    pub snowflake_warehouse: Option<String>,
+    pub refresh_mode: Option<String>,
+    pub initialize: Option<String>,
+    pub tmp_relation_type: Option<String>,
+    pub query_tag: Option<String>,
+    pub automatic_clustering: Option<bool>,
+    pub copy_grants: Option<bool>,
+    pub secure: Option<bool>,
+    pub transient: Option<bool>,
+}
+
+/// A resolved Databricks configuration
+#[skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DatabricksAttr {
+    pub partition_by: Option<PartitionConfig>,
+    pub file_format: Option<String>,
+    pub location_root: Option<String>,
+    pub tblproperties: Option<BTreeMap<String, YmlValue>>,
+    pub include_full_name_in_path: Option<bool>,
+    pub liquid_clustered_by: Option<StringOrArrayOfStrings>,
+    pub auto_liquid_cluster: Option<bool>,
+    pub clustered_by: Option<String>,
+    pub buckets: Option<i64>,
+    pub catalog: Option<String>,
+    pub databricks_tags: Option<BTreeMap<String, YmlValue>>,
+    pub compression: Option<String>,
+    pub databricks_compute: Option<String>,
+    pub target_alias: Option<String>,
+    pub source_alias: Option<String>,
+    pub matched_condition: Option<String>,
+    pub not_matched_condition: Option<String>,
+    pub not_matched_by_source_condition: Option<String>,
+    pub not_matched_by_source_action: Option<String>,
+    pub merge_with_schema_evolution: Option<bool>,
+    pub skip_matched_step: Option<bool>,
+    pub skip_not_matched_step: Option<bool>,
+    pub schedule: Option<ScheduleConfig>,
+}
+
+/// A resolved BigQuery configuration
+#[skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BigQueryAttr {
+    pub partition_by: Option<PartitionConfig>,
+    pub cluster_by: Option<BigqueryClusterConfig>,
+    pub hours_to_expiration: Option<u64>,
+    pub labels: Option<BTreeMap<String, String>>,
+    pub labels_from_meta: Option<bool>,
+    pub kms_key_name: Option<String>,
+    pub require_partition_filter: Option<bool>,
+    pub partition_expiration_days: Option<u64>,
+    pub grant_access_to: Option<Vec<GrantAccessToTarget>>,
+    pub partitions: Option<Vec<String>>,
+    pub enable_refresh: Option<bool>,
+    pub refresh_interval_minutes: Option<u64>,
+    pub max_staleness: Option<String>,
+}
+
+/// A resolved Redshift configuration
+#[skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RedshiftAttr {
+    pub auto_refresh: Option<bool>,
+    pub backup: Option<bool>,
+    pub bind: Option<bool>,
+    pub dist: Option<String>,
+    pub sort: Option<StringOrArrayOfStrings>,
+    pub sort_type: Option<String>,
 }
 
 fn default_false() -> bool {

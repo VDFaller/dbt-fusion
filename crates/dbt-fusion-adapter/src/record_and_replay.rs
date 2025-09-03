@@ -9,13 +9,14 @@ use arrow_json::writer::LineDelimitedWriter;
 use arrow_schema::{ArrowError, Field, Schema, SchemaBuilder};
 use dashmap::DashMap;
 use dbt_common::cancellation::CancellationToken;
-use dbt_xdbc::{Connection, QueryCtx, Statement};
+use dbt_xdbc::{Backend, Connection, QueryCtx, Statement};
 use once_cell::sync::Lazy;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::properties::WriterProperties;
 use regex::Regex;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
@@ -102,17 +103,21 @@ impl RecordEngine {
         RecordEngine(Arc::new(inner))
     }
 
+    pub fn backend(&self) -> Backend {
+        self.0.engine.backend()
+    }
+
     pub fn new_connection(&self, node_id: Option<String>) -> AdapterResult<Box<dyn Connection>> {
         let actual_conn = self.0.engine.new_connection(None)?;
         let conn = RecordEngineConnection(self.0.clone(), actual_conn, node_id);
         Ok(Box::new(conn))
     }
 
-    pub fn get_configured_database_name(&self) -> AdapterResult<Option<String>> {
+    pub fn get_configured_database_name(&self) -> Option<Cow<'_, str>> {
         self.0.engine.get_configured_database_name()
     }
 
-    pub fn config(&self, key: &str) -> AdapterResult<Option<String>> {
+    pub fn config(&self, key: &str) -> Option<Cow<'_, str>> {
         self.0.engine.config(key)
     }
 
@@ -351,6 +356,8 @@ impl Statement for RecordEngineStatement {
 }
 
 struct ReplayEngineInner {
+    /// The XDBC backend responsible for the recordings we are replaying
+    backend: Backend,
     /// Path to recordings
     path: PathBuf,
     /// Adapter config
@@ -369,8 +376,14 @@ impl ReplayEngineInner {
 pub struct ReplayEngine(Arc<ReplayEngineInner>);
 
 impl ReplayEngine {
-    pub fn new(path: PathBuf, config: AdapterConfig, token: CancellationToken) -> Self {
+    pub fn new(
+        backend: Backend,
+        path: PathBuf,
+        config: AdapterConfig,
+        token: CancellationToken,
+    ) -> Self {
         let inner = ReplayEngineInner {
+            backend,
             path,
             config,
             cancellation_token: token,
@@ -383,9 +396,12 @@ impl ReplayEngine {
         Ok(Box::new(conn))
     }
 
-    pub fn config(&self, key: &str) -> AdapterResult<Option<String>> {
-        let opt = self.0.config.maybe_get_str(key)?;
-        Ok(opt)
+    pub fn backend(&self) -> Backend {
+        self.0.backend
+    }
+
+    pub fn config(&self, key: &str) -> Option<Cow<'_, str>> {
+        self.0.config.get_string(key)
     }
 
     pub fn cancellation_token(&self) -> CancellationToken {

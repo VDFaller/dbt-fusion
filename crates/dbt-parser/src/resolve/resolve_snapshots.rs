@@ -1,3 +1,4 @@
+use dbt_common::adapter::AdapterType;
 use dbt_common::cancellation::CancellationToken;
 use dbt_common::constants::DBT_SNAPSHOTS_DIR_NAME;
 use dbt_common::error::AbstractLocation;
@@ -27,7 +28,7 @@ use crate::dbt_project_config::{RootProjectConfigs, init_project_config};
 use crate::renderer::{
     RenderCtx, RenderCtxInner, SqlFileRenderResult, render_unresolved_sql_files,
 };
-use crate::utils::{RelationComponents, update_node_relation_components};
+use crate::utils::{RelationComponents, get_node_fqn, update_node_relation_components};
 
 use super::resolve_properties::MinimalPropertiesEntry;
 
@@ -42,7 +43,7 @@ pub async fn resolve_snapshots(
     macros: &BTreeMap<String, DbtMacro>,
     database: &str,
     schema: &str,
-    adapter_type: &str,
+    adapter_type: AdapterType,
     jinja_env: Arc<JinjaEnv>,
     base_ctx: &BTreeMap<String, MinijinjaValue>,
     runtime_config: Arc<DbtRuntimeConfig>,
@@ -156,7 +157,7 @@ pub async fn resolve_snapshots(
             package_quoting,
             base_ctx: base_ctx.clone(),
             package_name: package_name.to_string(),
-            adapter_type: adapter_type.to_string(),
+            adapter_type,
             database: database.to_string(),
             schema: schema.to_string(),
             local_project_config,
@@ -202,8 +203,6 @@ pub async fn resolve_snapshots(
     {
         {
             let mut final_config = *sql_file_info.config;
-            let database = final_config.database.clone().unwrap_or(database.to_owned());
-            let schema = final_config.schema.clone().unwrap_or(schema.to_owned());
             let snapshot_name = dbt_asset.path.file_stem().unwrap().to_str().unwrap();
 
             let properties = if let Some(properties) = maybe_properties {
@@ -226,6 +225,17 @@ pub async fn resolve_snapshots(
                 final_config.materialized = Some(DbtMaterialization::Table);
             }
 
+            let fqn = get_node_fqn(
+                &package_name,
+                dbt_asset.path.clone(),
+                vec![snapshot_name.to_string()],
+                package
+                    .dbt_project
+                    .snapshot_paths
+                    .as_ref()
+                    .unwrap_or(&vec![]),
+            );
+
             // Create initial snapshot with default values
             let mut dbt_snapshot = DbtSnapshot {
                 __common_attr__: CommonAttributes {
@@ -237,7 +247,7 @@ pub async fn resolve_snapshots(
                     // The path to the YML file, if it is specified
                     original_file_path: dbt_asset.path.clone(),
                     unique_id: unique_id.clone(),
-                    fqn: vec![package_name.to_owned(), snapshot_name.to_owned()],
+                    fqn,
                     description: properties.description.to_owned(),
                     patch_path,
                     checksum: sql_file_info.checksum,
@@ -250,14 +260,15 @@ pub async fn resolve_snapshots(
                     meta: final_config.meta.clone().unwrap_or_default(),
                 },
                 __base_attr__: NodeBaseAttributes {
-                    database: database.to_owned(), // will be updated below
-                    schema: schema.to_owned(),     // will be updated below
-                    alias: "".to_owned(),          // will be updated below
-                    relation_name: None,           // will be updated below
+                    database: "".to_owned(), // will be updated below
+                    schema: "".to_owned(),   // will be updated below
+                    alias: "".to_owned(),    // will be updated below
+                    relation_name: None,     // will be updated below
                     columns,
                     depends_on: NodeDependsOn::default(),
                     enabled: final_config.enabled.unwrap_or(true),
                     extended_model: false,
+                    persist_docs: final_config.persist_docs.clone(),
                     materialized: final_config
                         .materialized
                         .clone()

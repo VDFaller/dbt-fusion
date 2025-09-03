@@ -1,6 +1,6 @@
 use std::sync::{Arc, OnceLock, RwLock};
 
-use dbt_telemetry::TelemetryAttributes;
+use dbt_telemetry::{ProcessInfo, TelemetryAttributes};
 use tracing::{Subscriber, level_filters::LevelFilter, span};
 
 use tracing_subscriber::{
@@ -10,9 +10,8 @@ use tracing_subscriber::{
 };
 
 use super::{
-    ToTracingValue,
     config::FsTraceConfig,
-    constants::TRACING_ATTR_FIELD,
+    event_info::store_event_attributes,
     file_writer::TelemetryFileWriter,
     layers::{
         data_layer::TelemetryDataLayer, jsonl_writer::TelemetryWriterLayer,
@@ -74,14 +73,6 @@ impl TelemetryHandle {
             items,
             process_span_handle: Some(process_span_handle),
         }
-    }
-
-    /// Return handle to the process level span created during
-    /// initialization
-    pub fn process_span(&self) -> &span::Span {
-        self.process_span_handle
-            .as_ref()
-            .expect("Do not call this function after shutdown")
     }
 
     /// Gracefully shuts down telemetry
@@ -146,21 +137,16 @@ where
         return Err(unexpected_fs_err!("Tracing is already initialized"));
     }
 
+    let package = config.package;
+
     let (subscriber, shutdown_items) = create_tracing_subcriber_with_layer(config, extra_layer)?;
 
     tracing::subscriber::set_global_default(subscriber)
         .map_err(|_| unexpected_fs_err!("Failed to set-up tracing"))?;
 
     // Create the process span and store it in the global PROCESS_SPAN
-    let process_span = tracing::info_span!(
-        "Process",
-        { TRACING_ATTR_FIELD } = TelemetryAttributes::Process {
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            host_os: std::env::consts::OS.to_string(),
-            host_arch: std::env::consts::ARCH.to_string(),
-        }
-        .to_tracing_value(),
-    );
+    store_event_attributes(TelemetryAttributes::Process(ProcessInfo::new(package)));
+    let process_span = tracing::info_span!("Process");
 
     PROCESS_SPAN
         .set(process_span.id().expect("Process span must have an ID"))
@@ -255,7 +241,7 @@ where
         None
     };
 
-    // Create progress bar layer if log-format fancy enabled
+    // Create progress bar layer if log-format default enabled
     let progress_bar_layer = if config.enable_progress {
         // Create layer and apply user specified filtering
         Some(ProgressBarLayer.with_filter(config.max_log_verbosity))

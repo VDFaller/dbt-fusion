@@ -10,9 +10,10 @@ use core::result::Result;
 use dbt_common::cancellation::{Cancellable, CancellationToken};
 use dbt_common::constants::EXECUTING;
 use dbt_xdbc::semaphore::Semaphore;
-use dbt_xdbc::{Connection, Database, QueryCtx, connection, database, driver};
+use dbt_xdbc::{Backend, Connection, Database, QueryCtx, connection, database, driver};
 use log;
 use serde_json::json;
+use std::borrow::Cow;
 use tracy_client::span;
 
 use std::collections::HashMap;
@@ -80,10 +81,14 @@ pub struct ActualEngine {
 impl ActualEngine {
     pub fn new(auth: Arc<dyn Auth>, config: AdapterConfig, token: CancellationToken) -> Self {
         let threads = config
-            .get_str("threads")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or_default();
+            .get("threads")
+            .and_then(|t| {
+                let u = t.as_u64();
+                debug_assert!(u.is_some(), "threads must be an integer if specified");
+                u
+            })
+            .map(|t| t as u32)
+            .unwrap_or(0u32);
 
         let permits = if threads > 0 { threads } else { u32::MAX };
         Self {
@@ -178,11 +183,12 @@ impl SqlEngine {
 
     /// Create a new [`SqlEngine::Replay`] based on the given path and adapter type.
     pub fn new_for_replaying(
+        backend: Backend,
         path: PathBuf,
         config: AdapterConfig,
         token: CancellationToken,
     ) -> Arc<Self> {
-        let engine = ReplayEngine::new(path, config, token);
+        let engine = ReplayEngine::new(backend, path, config, token);
         Arc::new(SqlEngine::Replay(engine))
     }
 
@@ -204,6 +210,14 @@ impl SqlEngine {
             Self::Replay(replay_engine) => replay_engine.new_connection(None),
         }?;
         Ok(conn)
+    }
+
+    pub fn backend(&self) -> Backend {
+        match self {
+            SqlEngine::Warehouse(actual_engine) => actual_engine.auth.backend(),
+            SqlEngine::Record(record_engine) => record_engine.backend(),
+            SqlEngine::Replay(replay_engine) => replay_engine.backend(),
+        }
     }
 
     /// Create a new connection to the warehouse.
@@ -288,7 +302,7 @@ impl SqlEngine {
 
     /// Get the configured database name. Used by
     /// adapter.verify_database to check if the database is valid.
-    pub fn get_configured_database_name(&self) -> AdapterResult<Option<String>> {
+    pub fn get_configured_database_name(&self) -> Option<Cow<'_, str>> {
         self.config("database")
     }
 
@@ -296,12 +310,9 @@ impl SqlEngine {
     ///
     /// ## Returns
     /// always is Ok(None) for non Warehouse/Record variance
-    pub fn config(&self, key: &str) -> AdapterResult<Option<String>> {
+    pub fn config(&self, key: &str) -> Option<Cow<'_, str>> {
         match self {
-            Self::Warehouse(actual_engine) => {
-                let opt = actual_engine.config.maybe_get_str(key)?;
-                Ok(opt)
-            }
+            Self::Warehouse(actual_engine) => actual_engine.config.get_string(key),
             Self::Record(record_engine) => record_engine.config(key),
             Self::Replay(replay_engine) => replay_engine.config(key),
         }

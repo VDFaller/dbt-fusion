@@ -1,5 +1,7 @@
 //! Utility functions for the resolver
+use crate::dbt_project_config::strip_resource_paths_from_ref_path;
 use crate::resolve::resolve_properties::MinimalPropertiesEntry;
+use dbt_common::adapter::AdapterType;
 use dbt_common::io_args::IoArgs;
 use dbt_common::{ErrorCode, FsError, FsResult, fs_err, show_error, stdfs};
 use dbt_jinja_utils::jinja_environment::JinjaEnv;
@@ -50,19 +52,20 @@ pub fn get_node_fqn(
     package_name: &str,
     original_file_path: PathBuf,
     fqn_components: Vec<String>,
+    resource_paths: &[String],
 ) -> Vec<String> {
     let mut fqn = vec![package_name.to_owned()];
 
-    let mut components = if let Some(parent) = original_file_path.parent() {
+    // Strip resource paths from the file path
+    let stripped_path = strip_resource_paths_from_ref_path(&original_file_path, resource_paths);
+
+    let components = if let Some(parent) = stripped_path.parent() {
         parent.components().collect::<Vec<_>>()
     } else {
-        original_file_path.components().collect::<Vec<_>>()
+        stripped_path.components().collect::<Vec<_>>()
     };
 
-    // Remove the first component, which is the root directory
-    if !components.is_empty() {
-        components.remove(0);
-    }
+    // Add path components to fqn (after stripping resource paths)
     for component in components {
         let component_str = component.as_os_str().to_str().unwrap().to_string();
         fqn.push(component_str);
@@ -135,7 +138,6 @@ pub fn prepare_package_dependency_levels(
         .iter()
         .map(|p| (p.dbt_project.name.clone(), p.dependencies.clone()))
         .collect::<BTreeMap<_, _>>();
-    // dbg!(dependency_map.clone());
 
     // Return packages in topological order
     dbt_dag::deps_mgmt::topological_levels(&dependency_map)
@@ -202,17 +204,15 @@ pub fn generate_relation_components(
     base_ctx: &BTreeMap<String, minijinja::Value>,
     components: &RelationComponents,
     node: &dyn InternalDbtNodeAttributes,
-    adapter_type: &str,
+    adapter_type: AdapterType,
 ) -> FsResult<(String, String, String, String, ResolvedQuoting)> {
-    // Determine node type
-    let is_snapshot = node.resource_type() == "snapshot";
     // TODO handle jinja rendering errors on each component name rendering
     // Get default values from the node
     let (default_database, default_schema, default_alias) =
         (node.database(), node.schema(), node.base().alias.clone());
     // Generate database name
-    let database = if is_snapshot && components.database.is_some() {
-        components.database.clone().unwrap()
+    let database = if node.skip_generate_database_name_macro() {
+        components.database.clone().unwrap_or(default_database)
     } else {
         generate_component_name(
             env,
@@ -227,8 +227,8 @@ pub fn generate_relation_components(
     };
 
     // Generate schema name
-    let schema = if is_snapshot && components.schema.is_some() {
-        components.schema.clone().unwrap()
+    let schema = if node.skip_generate_schema_name_macro() {
+        components.schema.clone().unwrap_or(default_schema)
     } else {
         generate_component_name(
             env,
@@ -252,7 +252,21 @@ pub fn generate_relation_components(
         components.alias.clone(),
         Some(node),
     )
-    .unwrap_or_else(|_| default_alias.to_owned()); // todo handle this error
+    .unwrap_or_else(|_| {
+        // If alias generation fails and default_alias is empty, use the node name as fallback
+        if default_alias.is_empty() {
+            node.common().name.clone()
+        } else {
+            default_alias.to_owned()
+        }
+    });
+
+    // Ensure alias is never empty - use node name as ultimate fallback
+    let alias = if alias.is_empty() {
+        node.common().name.clone()
+    } else {
+        alias
+    };
 
     let (database, schema, alias, quoting) =
         normalize_quoting(&node.quoting(), adapter_type, &database, &schema, &alias);
@@ -310,7 +324,7 @@ pub fn update_node_relation_components(
     package_name: &str,
     base_ctx: &BTreeMap<String, minijinja::Value>,
     components: &RelationComponents,
-    adapter_type: &str,
+    adapter_type: AdapterType,
 ) -> FsResult<()> {
     // Source and unit test nodes do not have relation components
     if ["source", "unit_test"].contains(&node.resource_type()) {

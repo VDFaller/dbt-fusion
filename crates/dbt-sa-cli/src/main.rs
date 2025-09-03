@@ -50,6 +50,7 @@ fn main() -> ExitCode {
         cli.project_dir(),
         cli.target_path(),
         &arg.io,
+        "dbt-sa",
     )) {
         Ok(handle) => handle,
         Err(e) => {
@@ -58,6 +59,12 @@ fn main() -> ExitCode {
             std::process::exit(1);
         }
     };
+
+    // XXX: when dbt-sa-cli and dbt-cli are unified, this will be the event emitter
+    // we inject into execute_fs. This instantiation is here as proof that our build
+    // and dependencies are configured such that private .proto files aren't linked
+    // into the SA code.
+    let _event_emitter = vortex_events::fusion_sa_event_emitter(false);
 
     // Setup tokio runtime and set stack-size to 8MB
     // DO NOT USE Rayon, it is not compatible with Tokio
@@ -109,9 +116,8 @@ fn main() -> ExitCode {
 
     // Run within the process span
     let future = Box::pin(execute_fs(arg, cli, token));
-    let result = telemetry_handle
-        .process_span()
-        .in_scope(|| tokio_rt.block_on(async { tokio_rt.spawn(future).await.unwrap() }));
+
+    let result = tokio_rt.block_on(async { tokio_rt.spawn(future).await.unwrap() });
 
     // Shut down telemetry
     for err in telemetry_handle.shutdown() {

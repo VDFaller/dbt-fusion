@@ -3,6 +3,7 @@ use crate::args::ResolveArgs;
 use crate::dbt_project_config::{RootProjectConfigs, init_project_config};
 use crate::utils::get_node_fqn;
 
+use dbt_common::adapter::AdapterType;
 use dbt_common::io_args::StaticAnalysisKind;
 use dbt_common::{ErrorCode, FsResult, err, show_error};
 use dbt_jinja_utils::jinja_environment::JinjaEnv;
@@ -17,7 +18,7 @@ use dbt_schemas::schemas::dbt_column::process_columns;
 use dbt_schemas::schemas::project::{DefaultTo, SourceConfig};
 use dbt_schemas::schemas::properties::{SourceProperties, Tables};
 use dbt_schemas::schemas::{CommonAttributes, DbtSource, DbtSourceAttr, NodeBaseAttributes};
-use dbt_schemas::state::{DbtAsset, DbtPackage, ModelStatus, RefsAndSourcesTracker};
+use dbt_schemas::state::{DbtPackage, GenericTestAsset, ModelStatus, RefsAndSourcesTracker};
 use minijinja::Value as MinijinjaValue;
 use regex::Regex;
 use std::collections::BTreeMap;
@@ -36,16 +37,15 @@ pub fn resolve_sources(
     root_project_configs: &RootProjectConfigs,
     source_properties: BTreeMap<(String, String), MinimalPropertiesEntry>,
     database: &str,
-    adapter_type: &str,
+    adapter_type: AdapterType,
     base_ctx: &BTreeMap<String, MinijinjaValue>,
     jinja_env: &JinjaEnv,
-    collected_tests: &mut Vec<DbtAsset>,
+    collected_generic_tests: &mut Vec<GenericTestAsset>,
     refs_and_sources: &mut RefsAndSources,
 ) -> FsResult<(
     HashMap<String, Arc<DbtSource>>,
     HashMap<String, Arc<DbtSource>>,
 )> {
-    let is_replay_mode = arg.replay.is_some();
     let io_args = &arg.io;
     let mut sources: HashMap<String, Arc<DbtSource>> = HashMap::new();
     let mut disabled_sources: HashMap<String, Arc<DbtSource>> = HashMap::new();
@@ -96,23 +96,18 @@ pub fn resolve_sources(
             .unwrap_or(database.to_owned());
         let schema = source.schema.clone().unwrap_or(source.name.clone());
 
-        // sources exist within the context of the model paths so we need to pass this into get config for path to get the config relative to the model paths
-        let model_resource_paths = package
-            .dbt_project
-            .model_paths
-            .as_ref()
-            .unwrap_or(&vec![])
-            .clone();
-
-        let global_config = local_project_config.get_config_for_path(
-            &mpe.relative_path,
+        let fqn = get_node_fqn(
             package_name,
-            &model_resource_paths,
+            mpe.relative_path.clone(),
+            vec![source_name.to_owned(), table_name.to_owned()],
+            &package.dbt_project.all_source_paths(),
         );
+
+        let global_config = local_project_config.get_config_for_fqn(&fqn);
 
         let mut project_config = root_project_configs
             .sources
-            .get_config_for_path(&mpe.relative_path, package_name, &model_resource_paths)
+            .get_config_for_fqn(&fqn)
             .clone();
         project_config.default_to(global_config);
 
@@ -134,11 +129,6 @@ pub fn resolve_sources(
         let unique_id = format!(
             "source.{}.{}.{}",
             &package_name, source_name, &normalized_table_name
-        );
-        let fqn = get_node_fqn(
-            package_name,
-            mpe.relative_path.clone(),
-            vec![source_name.to_owned(), table_name.to_owned()],
         );
 
         let merged_loaded_at_field = Some(
@@ -227,6 +217,17 @@ pub fn resolve_sources(
             FreshnessRules::validate(freshness.warn_after.as_ref())?;
         }
 
+        // Add any other non-standard dbt keys that might be used by dbt packages under
+        // the "other" key. This needs to be untyped since it's up to the packages to define
+        // what is a valid configuration entry.
+        //
+        // For example, dbt-external-tables have their own definition of what are valid
+        // values for the `external` property of a source: https://github.com/dbt-labs/dbt-external-tables
+        let other = match &table.external {
+            None => BTreeMap::new(),
+            Some(external) => BTreeMap::from([("external".to_owned(), external.clone())]),
+        };
+
         let dbt_source = DbtSource {
             __common_attr__: CommonAttributes {
                 name: table_name.to_owned(),
@@ -259,6 +260,7 @@ pub fn resolve_sources(
                 quoting_ignore_case,
                 enabled: is_enabled,
                 extended_model: false,
+                persist_docs: None,
                 materialized: DbtMaterialization::External,
                 static_analysis: source_properties_config
                     .static_analysis
@@ -279,7 +281,7 @@ pub fn resolve_sources(
                 loaded_at_query: merged_loaded_at_query.clone(),
             },
             deprecated_config: source_properties_config.clone(),
-            __other__: BTreeMap::new(),
+            __other__: other,
         };
         let status = if is_enabled {
             ModelStatus::Enabled
@@ -306,10 +308,10 @@ pub fn resolve_sources(
                 .persist(
                     package_name,
                     root_package_name,
-                    collected_tests,
+                    collected_generic_tests,
                     adapter_type,
-                    is_replay_mode,
                     io_args,
+                    &mpe.relative_path,
                 )?;
             }
             ModelStatus::Disabled => {

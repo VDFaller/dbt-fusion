@@ -1,16 +1,18 @@
 use super::TestResult;
 use clap::Parser;
 use dbt_common::{
+    DiscreteEventEmitter,
     cancellation::{CancellationToken, never_cancels},
     logging::dbt_compat_log::LogEntry,
 };
 use std::{
     fs::File,
     future::Future,
-    io::Read,
     path::{Component, Path, PathBuf},
+    sync::Arc,
 };
 
+use once_cell::sync::Lazy;
 use regex::Regex;
 
 use dbt_common::{
@@ -19,6 +21,25 @@ use dbt_common::{
     stdfs::{self},
     tokiofs, unexpected_err,
 };
+
+// Pre-compiled regex patterns for optimal performance
+static SCHEMA_PATTERN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)fusion_tests_schema__[a-zA-Z0-9_]*").unwrap());
+static ISO_TIMESTAMP_PATTERN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z").unwrap());
+static TIME_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b\d{2}:\d{2}:\d{2}\b").unwrap());
+static BRACKETED_DURATION_PATTERN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\[\s*\d+(?:\.\d+)?s\s*\]").unwrap());
+static IN_DURATION_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    // Matches: "in 1s", "in 500ms", "in 1s 298ms", "in 2m 10s", etc.
+    Regex::new(r"\bin\s+\d+(?:\.\d+)?(?:ns|us|μs|µs|ms|s|m|h)(?:\s+\d+(?:\.\d+)?(?:ns|us|μs|µs|ms|s|m|h))*\b")
+        .unwrap()
+});
+static MULTI_UNIT_DURATION_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    // Matches sequences of 2+ duration tokens (e.g., "32ms 101us", "4s 703ms 195us 939ns")
+    Regex::new(r"\b\d+(?:\.\d+)?(?:ns|us|μs|µs|ms|s|m|h)(?:\s+\d+(?:\.\d+)?(?:ns|us|μs|µs|ms|s|m|h)){1,}\b").unwrap()
+});
+static AGE_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r"\bage:\s*\d+").unwrap());
 
 /// Copies a directory and its contents, excluding .gitignored files.
 pub fn copy_dir_non_ignored(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> FsResult<()> {
@@ -155,41 +176,41 @@ pub fn maybe_normalize_slashes(output: String) -> String {
 }
 
 pub fn maybe_normalize_schema_name(output: String) -> String {
-    let parts: Vec<&str> = output.split('.').collect();
-    let mut result = Vec::new();
-    let mut i = 0;
-    while i < parts.len() {
-        if parts[i].to_lowercase().contains("fusion_tests_schema__") {
-            result.push("fusion_tests_schema__replaced");
-        } else {
-            result.push(parts[i]);
-        }
-        i += 1;
-    }
-    result.join(".")
+    // Use pre-compiled regex to replace schema patterns like "fusion_tests_schema__alex"
+    // with "fusion_tests_schema__replaced" without breaking duration patterns like "44.65s"
+    SCHEMA_PATTERN
+        .replace_all(&output, "fusion_tests_schema__replaced")
+        .to_string()
 }
 
 pub fn maybe_normalize_time(output: String) -> String {
     let mut result = output;
+
     // Replace ISO 8601 timestamps like "2025-05-27T22:38:47.667Z" and "2017-09-01T00:00:00Z"
-    let iso_regex = Regex::new(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z").unwrap();
-    result = iso_regex
+    result = ISO_TIMESTAMP_PATTERN
         .replace_all(&result, "YYYY-MM-DDTHH:MM:SS.sssZ")
         .to_string();
 
     // Replace time formats like "15:39:21"
-    let time_regex = Regex::new(r"\b\d{2}:\d{2}:\d{2}\b").unwrap();
-    result = time_regex.replace_all(&result, "HH:MM:SS").to_string();
+    result = TIME_PATTERN.replace_all(&result, "HH:MM:SS").to_string();
 
-    // Replace duration formats like "1ms", "123s", etc. and multiple durations with spaces
-    let duration_regex = Regex::new(r"(?:\b\d+(?:h|m|s|ms|us|ns)\b\s*)+").unwrap();
-    result = duration_regex
-        .replace_all(&result, "duration\n")
+    // Replace bracketed duration formats like "[ 44.65s]" with "[000.00s]"
+    result = BRACKETED_DURATION_PATTERN
+        .replace_all(&result, "[000.00s]")
+        .to_string();
+
+    // Replace trailing "in ..." duration phrases with a stable token
+    result = IN_DURATION_PATTERN
+        .replace_all(&result, "in duration")
+        .to_string();
+
+    // Replace multi-unit duration sequences like "32ms 101us 694ns" with a stable token
+    result = MULTI_UNIT_DURATION_PATTERN
+        .replace_all(&result, "duration")
         .to_string();
 
     // Replace age patterns like "age: 244165330" with normalized value
-    let age_regex = Regex::new(r"\bage:\s*\d+").unwrap();
-    result = age_regex
+    result = AGE_PATTERN
         .replace_all(&result, "age: NORMALIZED")
         .to_string();
 
@@ -235,12 +256,13 @@ pub async fn exec_fs<Fut, P: Parser>(
     project_dir: PathBuf,
     stdout_file: File,
     stderr_file: File,
-    execute_fs: impl FnOnce(SystemArgs, P, CancellationToken) -> Fut,
+    execute_fs: impl FnOnce(SystemArgs, P, Arc<dyn DiscreteEventEmitter>, CancellationToken) -> Fut,
     from_lib: impl FnOnce(&P) -> SystemArgs,
 ) -> FsResult<i32>
 where
     Fut: Future<Output = FsResult<i32>>,
 {
+    let event_emitter: Arc<dyn DiscreteEventEmitter> = vortex_events::noop_event_emitter().into();
     let token = never_cancels();
     // Check if project_dir has a .env.conformance file
     // NOTE: this has to be done before we parse Cli
@@ -259,7 +281,7 @@ where
     let cli = P::parse_from(cmd_vec);
     let arg = from_lib(&cli);
 
-    execute_fs(arg, cli, token).await
+    execute_fs(arg, cli, event_emitter, token).await
 }
 
 /// The purpose of this guard is two fold:
@@ -271,7 +293,7 @@ where
 /// we don't restore here, then terminal output will be disabled after the first
 /// time `exec_fs` gets called, which would be surprising for the test author.
 struct FdRedirectionGuard {
-    file: File,
+    _file: File,
     #[cfg(not(target_os = "windows"))]
     target_fd: std::os::unix::io::RawFd,
     #[cfg(not(target_os = "windows"))]
@@ -296,29 +318,6 @@ impl Drop for FdRedirectionGuard {
             // Restore the original stdout
             SetStdHandle(self.target_fd as _, self.original_fd as _);
         }
-
-        // In the testing framework, the self.file is created from a temp file,
-        // so we need to read the content and print it to ensure that the errors are not sunken
-        let is_stderr = {
-            #[cfg(not(target_os = "windows"))]
-            {
-                self.target_fd == libc::STDERR_FILENO
-            }
-            #[cfg(target_os = "windows")]
-            {
-                use winapi::um::winbase::STD_ERROR_HANDLE;
-                self.target_fd == STD_ERROR_HANDLE as usize
-            }
-        };
-
-        if is_stderr {
-            let mut content = String::new();
-            use std::io::Seek;
-            let _ = self.file.seek(std::io::SeekFrom::Start(0));
-            let _ = self.file.read_to_string(&mut content);
-            eprintln!("{content}");
-        }
-        // self._file will be closed automatically after this point
     }
 }
 
@@ -340,7 +339,7 @@ fn with_redirected_stdout(file: File) -> FdRedirectionGuard {
     }
 
     FdRedirectionGuard {
-        file,
+        _file: file,
         target_fd: STD_OUTPUT_HANDLE as usize,
         original_fd,
     }
@@ -364,7 +363,7 @@ fn with_redirected_stderr(file: File) -> FdRedirectionGuard {
     }
 
     FdRedirectionGuard {
-        file,
+        _file: file,
         target_fd: STD_ERROR_HANDLE as usize,
         original_fd,
     }
@@ -384,7 +383,7 @@ fn with_redirected_stdout(file: File) -> FdRedirectionGuard {
     }
 
     FdRedirectionGuard {
-        file,
+        _file: file,
         target_fd: libc::STDOUT_FILENO,
         original_fd,
     }
@@ -404,7 +403,7 @@ fn with_redirected_stderr(file: File) -> FdRedirectionGuard {
     }
 
     FdRedirectionGuard {
-        file,
+        _file: file,
         target_fd: libc::STDERR_FILENO,
         original_fd,
     }

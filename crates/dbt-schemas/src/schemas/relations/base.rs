@@ -52,6 +52,14 @@ pub enum TableFormat {
 pub type Policy = ResolvedQuoting;
 
 impl Policy {
+    pub fn new(database: bool, schema: bool, identifier: bool) -> Self {
+        Self {
+            database,
+            schema,
+            identifier,
+        }
+    }
+
     pub fn disabled() -> Self {
         Self {
             database: false,
@@ -269,7 +277,10 @@ pub trait BaseRelation: BaseRelationProperties + Any + Send + Sync + fmt::Debug 
 
     /// Helper: check if the relation is a CTE
     fn is_cte(&self) -> bool {
-        matches!(self.relation_type(), Some(RelationType::CTE))
+        matches!(
+            self.relation_type(),
+            Some(RelationType::CTE) | Some(RelationType::Ephemeral)
+        )
     }
 
     /// Helper: check if the relation is a view
@@ -280,6 +291,16 @@ pub trait BaseRelation: BaseRelationProperties + Any + Send + Sync + fmt::Debug 
     /// Helper: check if the relation is a materialized view
     fn is_materialized_view(&self) -> bool {
         matches!(self.relation_type(), Some(RelationType::MaterializedView))
+    }
+
+    /// Helper: check if the relation is a streaming table
+    fn is_streaming_table(&self) -> bool {
+        matches!(self.relation_type(), Some(RelationType::StreamingTable))
+    }
+
+    /// Helper: check if the relation is a dynamic table
+    fn is_dynamic_table(&self) -> bool {
+        matches!(self.relation_type(), Some(RelationType::DynamicTable))
     }
 
     /// Helper: check if the relation is for a pointer table

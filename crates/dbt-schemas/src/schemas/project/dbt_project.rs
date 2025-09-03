@@ -39,6 +39,8 @@ pub struct ProjectDbtCloudConfig {
     #[serde(rename = "project-id")]
     pub project_id: Option<StringOrInteger>,
     pub account_id: Option<StringOrInteger>,
+    #[serde(rename = "account-host")]
+    pub account_host: Option<String>,
     #[serde(rename = "job-id")]
     pub job_id: Option<StringOrInteger>,
     #[serde(rename = "run-id")]
@@ -170,9 +172,39 @@ pub struct DbtProject {
 impl DbtProject {
     pub fn get_project_id(&self) -> String {
         /*
-        Returns the md5 hash of the project name. Can be used for telemetry.
+        Returns the hash of the project name. Can be used for telemetry.
         */
+        // TODO: do we really need cryptographic hashing here?
         format!("{:x}", md5::compute(self.name.as_bytes()))
+    }
+
+    pub fn all_source_paths(&self) -> Vec<String> {
+        /*
+        Returns a vector of strings combining all path configurations:
+        model_paths, seed_paths, snapshot_paths, analysis_paths, macro_paths, and test_paths.
+        */
+        let mut paths = Vec::new();
+
+        if let Some(ref model_paths) = self.model_paths {
+            paths.extend(model_paths.clone());
+        }
+        if let Some(ref seed_paths) = self.seed_paths {
+            paths.extend(seed_paths.clone());
+        }
+        if let Some(ref snapshot_paths) = self.snapshot_paths {
+            paths.extend(snapshot_paths.clone());
+        }
+        if let Some(ref analysis_paths) = self.analysis_paths {
+            paths.extend(analysis_paths.clone());
+        }
+        if let Some(ref macro_paths) = self.macro_paths {
+            paths.extend(macro_paths.clone());
+        }
+        if let Some(ref test_paths) = self.test_paths {
+            paths.extend(test_paths.clone());
+        }
+
+        paths
     }
 }
 

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::{collections::BTreeMap, sync::Arc};
 
+use dbt_common::adapter::AdapterType;
 use dbt_common::cancellation::CancellationToken;
 use dbt_common::io_args::StaticAnalysisKind;
 use dbt_common::show_error;
@@ -9,6 +10,7 @@ use dbt_jinja_utils::utils::dependency_package_name_from_ctx;
 use dbt_jinja_utils::{jinja_environment::JinjaEnv, refs_and_sources::RefsAndSources};
 use dbt_schemas::schemas::common::{Access, DbtMaterialization, DbtQuoting, ResolvedQuoting};
 use dbt_schemas::schemas::dbt_column::process_columns;
+use dbt_schemas::schemas::nodes::AdapterAttr;
 use dbt_schemas::schemas::project::ModelConfig;
 use dbt_schemas::schemas::{DbtModelAttr, IntrospectionKind};
 use dbt_schemas::state::{ModelStatus, RefsAndSourcesTracker};
@@ -48,7 +50,7 @@ pub async fn resolve_analyses(
     model_properties: &mut BTreeMap<String, MinimalPropertiesEntry>,
     database: &str,
     schema: &str,
-    adapter_type: &str,
+    adapter_type: AdapterType,
     package_name: &str,
     env: Arc<JinjaEnv>,
     base_ctx: &BTreeMap<String, minijinja::Value>,
@@ -85,7 +87,7 @@ pub async fn resolve_analyses(
             package_quoting,
             base_ctx: base_ctx.clone(),
             package_name: package_name.to_string(),
-            adapter_type: adapter_type.to_string(),
+            adapter_type,
             database: database.to_string(),
             schema: schema.to_string(),
             local_project_config: local_project_config.clone(),
@@ -140,6 +142,11 @@ pub async fn resolve_analyses(
             package_name,
             dbt_asset.path.to_owned(),
             vec![analysis_name.to_owned()],
+            package
+                .dbt_project
+                .analysis_paths
+                .as_ref()
+                .unwrap_or(&vec![]),
         );
 
         let properties = if let Some(properties) = maybe_properties {
@@ -188,6 +195,7 @@ pub async fn resolve_analyses(
                 relation_name: None,            // will be updated below
                 enabled: true,
                 extended_model: false,
+                persist_docs: None,
                 materialized: DbtMaterialization::Analysis,
                 quoting: ResolvedQuoting::trues(),
                 quoting_ignore_case: false,
@@ -218,6 +226,10 @@ pub async fn resolve_analyses(
                     .collect(),
                 metrics,
             },
+            __adapter_attr__: AdapterAttr::from_config_and_dialect(
+                &analysis_config.__warehouse_specific_config__,
+                adapter_type,
+            ),
             deprecated_config: ModelConfig {
                 group: analysis_config.group.clone(),
                 ..Default::default()

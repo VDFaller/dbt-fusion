@@ -1,8 +1,8 @@
 use chrono::{DateTime, Utc};
-use dbt_common::{Span, io_args::StaticAnalysisKind};
+use dbt_common::{Span, adapter::AdapterType, io_args::StaticAnalysisKind};
 use dbt_serde_yaml::UntaggedEnumDeserialize;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, str::FromStr as _, sync::Arc};
 
 // Type aliases for clarity
 type YmlValue = dbt_serde_yaml::Value;
@@ -16,7 +16,7 @@ use crate::{
         manifest::manifest_nodes::{
             ManifestDataTest, ManifestModel, ManifestOperation, ManifestSeed, ManifestSnapshot,
         },
-        nodes::{DbtSeedAttr, DbtSnapshotAttr, DbtSourceAttr, DbtTestAttr},
+        nodes::{AdapterAttr, DbtSeedAttr, DbtSnapshotAttr, DbtSourceAttr, DbtTestAttr},
     },
     state::ResolverState,
 };
@@ -93,6 +93,8 @@ pub fn serialize_with_resource_type(mut value: YmlValue, resource_type: &str) ->
 }
 
 pub fn build_manifest(invocation_id: &str, resolver_state: &ResolverState) -> DbtManifest {
+    let (parent_map, child_map) = build_parent_and_child_maps(&resolver_state.nodes);
+
     DbtManifest {
         metadata: ManifestMetadata {
             __base__: BaseMetadata {
@@ -103,7 +105,11 @@ pub fn build_manifest(invocation_id: &str, resolver_state: &ResolverState) -> Db
                 ..Default::default()
             },
             project_name: resolver_state.root_project_name.clone(),
-            adapter_type: resolver_state.dbt_profile.db_config.adapter_type(),
+            adapter_type: resolver_state
+                .dbt_profile
+                .db_config
+                .adapter_type()
+                .to_string(),
             ..Default::default()
         },
         nodes: resolver_state
@@ -164,6 +170,10 @@ pub fn build_manifest(invocation_id: &str, resolver_state: &ResolverState) -> Db
             .iter()
             .map(|(id, exposure)| (id.clone(), (**exposure).clone().into()))
             .collect(),
+        // TODO: map from resolver_state.nodes after they are implemented
+        semantic_models: BTreeMap::new(),
+        metrics: BTreeMap::new(),
+        saved_queries: BTreeMap::new(),
         unit_tests: resolver_state
             .nodes
             .unit_tests
@@ -172,8 +182,94 @@ pub fn build_manifest(invocation_id: &str, resolver_state: &ResolverState) -> Db
             .collect(),
         macros: resolver_state.macros.macros.clone(),
         docs: resolver_state.macros.docs_macros.clone(),
+        parent_map,
+        child_map,
         ..Default::default()
     }
+}
+
+/// Build parent and child dependency maps from the nodes.
+/// Returns a tuple of (parent_map, child_map) where:
+/// - parent_map: maps each node ID to a list of node IDs it depends on
+/// - child_map: maps each node ID to a list of node IDs that depend on it
+fn build_parent_and_child_maps(
+    nodes: &Nodes,
+) -> (BTreeMap<String, Vec<String>>, BTreeMap<String, Vec<String>>) {
+    let mut parent_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut child_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+    // Collect all nodes with their dependencies
+    let mut all_nodes: Vec<(String, NodeDependsOn)> = Vec::new();
+
+    for (id, model) in &nodes.models {
+        all_nodes.push((id.clone(), model.__base_attr__.depends_on.clone()));
+    }
+
+    for (id, test) in &nodes.tests {
+        all_nodes.push((id.clone(), test.__base_attr__.depends_on.clone()));
+    }
+
+    for (id, seed) in &nodes.seeds {
+        all_nodes.push((id.clone(), seed.__base_attr__.depends_on.clone()));
+    }
+
+    for (id, snapshot) in &nodes.snapshots {
+        all_nodes.push((id.clone(), snapshot.__base_attr__.depends_on.clone()));
+    }
+
+    for (id, analysis) in &nodes.analyses {
+        all_nodes.push((id.clone(), analysis.__base_attr__.depends_on.clone()));
+    }
+
+    for (id, exposure) in &nodes.exposures {
+        all_nodes.push((id.clone(), exposure.__base_attr__.depends_on.clone()));
+    }
+
+    for (id, unit_test) in &nodes.unit_tests {
+        all_nodes.push((id.clone(), unit_test.__base_attr__.depends_on.clone()));
+    }
+
+    // Process all collected nodes
+    for (node_id, depends_on) in all_nodes {
+        // Initialize parent list for this node
+        parent_map.entry(node_id.clone()).or_default();
+
+        // Add parents and update child map
+        for parent_id in &depends_on.nodes {
+            // Add parent to this node's parent list
+            parent_map
+                .entry(node_id.clone())
+                .or_default()
+                .push(parent_id.clone());
+
+            // Add this node as a child of the parent
+            child_map
+                .entry(parent_id.clone())
+                .or_default()
+                .push(node_id.clone());
+        }
+    }
+
+    // Process sources (they typically don't have dependencies but can have children)
+    for id in nodes.sources.keys() {
+        // Sources usually don't depend on anything, but we ensure they exist in maps
+        parent_map.entry(id.clone()).or_default();
+        child_map.entry(id.clone()).or_default();
+    }
+
+    // Ensure all nodes that are referenced but don't have their own entry exist in the maps
+    // This handles cases where a node is referenced as a parent but isn't in our nodes
+    let all_parent_ids: Vec<String> = parent_map
+        .values()
+        .flat_map(|parents| parents.clone())
+        .collect();
+
+    for parent_id in all_parent_ids {
+        parent_map.entry(parent_id.clone()).or_default();
+        child_map.entry(parent_id).or_default();
+    }
+
+    (parent_map, child_map)
 }
 
 pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -> Nodes {
@@ -230,6 +326,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                                 .try_into()
                                 .expect("DbtQuoting should be set"),
                             quoting_ignore_case: false,
+                            persist_docs: model.config.persist_docs.clone(),
                             columns: model.__base_attr__.columns,
                             depends_on: model.__base_attr__.depends_on,
                             refs: model.__base_attr__.refs,
@@ -251,6 +348,11 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                             time_spine: model.time_spine,
                             event_time: model.config.event_time.clone(),
                         },
+                        __adapter_attr__: AdapterAttr::from_config_and_dialect(
+                            &model.config.__warehouse_specific_config__,
+                            AdapterType::from_str(&manifest.metadata.adapter_type)
+                                .expect("Unknown or unsupported adapter type"),
+                        ),
                         deprecated_config: model.config,
                         __other__: model.__other__,
                     }),
@@ -301,6 +403,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                                 .try_into()
                                 .expect("DbtQuoting should be set"),
                             quoting_ignore_case: false,
+                            persist_docs: None,
                             columns: test.__base_attr__.columns,
                             depends_on: test.__base_attr__.depends_on,
                             refs: test.__base_attr__.refs,
@@ -367,6 +470,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                                 .try_into()
                                 .expect("DbtQuoting should be set"),
                             quoting_ignore_case: false,
+                            persist_docs: snapshot.config.persist_docs.clone(),
                             columns: snapshot.__base_attr__.columns,
                             depends_on: snapshot.__base_attr__.depends_on,
                             refs: snapshot.__base_attr__.refs,
@@ -432,6 +536,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                                 .expect("DbtQuoting should be set"),
                             quoting_ignore_case: false,
                             extended_model: false,
+                            persist_docs: seed.config.persist_docs.clone(),
                             columns: seed.__base_attr__.columns,
                             depends_on: seed.__base_attr__.depends_on,
                             refs: seed.__base_attr__.refs,
@@ -499,6 +604,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                                 .try_into()
                                 .expect("DbtQuoting should be set"),
                             quoting_ignore_case: false,
+                            persist_docs: analysis.config.persist_docs.clone(),
                             columns: analysis.__base_attr__.columns,
                             depends_on: analysis.__base_attr__.depends_on,
                             refs: analysis.__base_attr__.refs,
@@ -520,6 +626,11 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                             time_spine: analysis.time_spine,
                             event_time: analysis.config.event_time.clone(),
                         },
+                        __adapter_attr__: AdapterAttr::from_config_and_dialect(
+                            &analysis.config.__warehouse_specific_config__,
+                            AdapterType::from_str(&manifest.metadata.adapter_type)
+                                .expect("Unknown or unsupported adapter type"),
+                        ),
                         deprecated_config: analysis.config,
                         __other__: analysis.__other__,
                     }),
@@ -571,6 +682,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                         .try_into()
                         .expect("DbtQuoting should be set"),
                     quoting_ignore_case: false,
+                    persist_docs: None,
                     columns: source.columns,
                     depends_on: NodeDependsOn::default(),
                     refs: vec![],
@@ -621,6 +733,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                     static_analysis: Default::default(),
                     enabled: true,
                     extended_model: false,
+                    persist_docs: None,
                     columns: BTreeMap::new(),
                     refs: exposure.__base_attr__.refs,
                     sources: exposure.__base_attr__.sources,
@@ -677,6 +790,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                     quoting_ignore_case: false,
                     enabled: unit_test.config.enabled.unwrap_or(true),
                     extended_model: false,
+                    persist_docs: None,
                     columns: unit_test.__base_attr__.columns,
                     depends_on: unit_test.__base_attr__.depends_on,
                     refs: unit_test.__base_attr__.refs,
@@ -695,6 +809,277 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
             }),
         );
     }
+    for (_unique_id, _metric) in manifest.metrics {
+        // TODO: insert DbtMetric into node.metrics
+    }
 
     nodes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schemas::{CommonAttributes, Nodes};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    fn create_test_nodes() -> Nodes {
+        Nodes {
+            models: BTreeMap::new(),
+            tests: BTreeMap::new(),
+            snapshots: BTreeMap::new(),
+            analyses: BTreeMap::new(),
+            seeds: BTreeMap::new(),
+            exposures: BTreeMap::new(),
+            sources: BTreeMap::new(),
+            unit_tests: BTreeMap::new(),
+            metrics: BTreeMap::new(),
+            semantic_models: BTreeMap::new(),
+        }
+    }
+
+    fn create_test_model(id: &str, depends_on: Vec<String>) -> Arc<DbtModel> {
+        Arc::new(DbtModel {
+            __common_attr__: CommonAttributes {
+                unique_id: id.to_string(),
+                name: id.split('.').next_back().unwrap_or(id).to_string(),
+                package_name: "test".to_string(),
+                ..Default::default()
+            },
+            __base_attr__: NodeBaseAttributes {
+                database: "db".to_string(),
+                schema: "schema".to_string(),
+                depends_on: NodeDependsOn {
+                    nodes: depends_on,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn test_build_parent_and_child_maps_empty_nodes() {
+        let nodes = create_test_nodes();
+        let (parent_map, child_map) = build_parent_and_child_maps(&nodes);
+
+        assert!(parent_map.is_empty());
+        assert!(child_map.is_empty());
+    }
+
+    #[test]
+    fn test_build_parent_and_child_maps_single_model_no_deps() {
+        let mut nodes = create_test_nodes();
+        nodes.models.insert(
+            "model.test.model_a".to_string(),
+            create_test_model("model.test.model_a", vec![]),
+        );
+
+        let (parent_map, child_map) = build_parent_and_child_maps(&nodes);
+
+        assert_eq!(parent_map.len(), 1);
+        assert!(parent_map.contains_key("model.test.model_a"));
+        assert_eq!(parent_map.get("model.test.model_a").unwrap().len(), 0);
+
+        // child_map should be empty since no dependencies
+        assert!(child_map.is_empty());
+    }
+
+    #[test]
+    fn test_build_parent_and_child_maps_simple_dependency() {
+        let mut nodes = create_test_nodes();
+
+        nodes.models.insert(
+            "model.test.model_a".to_string(),
+            create_test_model("model.test.model_a", vec![]),
+        );
+        nodes.models.insert(
+            "model.test.model_b".to_string(),
+            create_test_model("model.test.model_b", vec!["model.test.model_a".to_string()]),
+        );
+
+        let (parent_map, child_map) = build_parent_and_child_maps(&nodes);
+
+        // Check parent_map
+        assert_eq!(parent_map.len(), 2);
+        assert_eq!(parent_map.get("model.test.model_a").unwrap().len(), 0);
+        assert_eq!(
+            parent_map.get("model.test.model_b").unwrap(),
+            &vec!["model.test.model_a".to_string()]
+        );
+
+        // Check child_map
+        assert_eq!(child_map.len(), 1);
+        assert_eq!(
+            child_map.get("model.test.model_a").unwrap(),
+            &vec!["model.test.model_b".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_build_parent_and_child_maps_multiple_dependencies() {
+        let mut nodes = create_test_nodes();
+
+        nodes.models.insert(
+            "model.test.model_a".to_string(),
+            create_test_model("model.test.model_a", vec![]),
+        );
+        nodes.models.insert(
+            "model.test.model_b".to_string(),
+            create_test_model("model.test.model_b", vec![]),
+        );
+        nodes.models.insert(
+            "model.test.model_c".to_string(),
+            create_test_model(
+                "model.test.model_c",
+                vec![
+                    "model.test.model_a".to_string(),
+                    "model.test.model_b".to_string(),
+                ],
+            ),
+        );
+
+        let (parent_map, child_map) = build_parent_and_child_maps(&nodes);
+
+        // Check parent_map
+        assert_eq!(parent_map.len(), 3);
+        assert_eq!(parent_map.get("model.test.model_a").unwrap().len(), 0);
+        assert_eq!(parent_map.get("model.test.model_b").unwrap().len(), 0);
+        assert_eq!(
+            parent_map.get("model.test.model_c").unwrap(),
+            &vec![
+                "model.test.model_a".to_string(),
+                "model.test.model_b".to_string()
+            ]
+        );
+
+        // Check child_map
+        assert_eq!(child_map.len(), 2);
+        assert_eq!(
+            child_map.get("model.test.model_a").unwrap(),
+            &vec!["model.test.model_c".to_string()]
+        );
+        assert_eq!(
+            child_map.get("model.test.model_b").unwrap(),
+            &vec!["model.test.model_c".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_build_parent_and_child_maps_chain_dependency() {
+        let mut nodes = create_test_nodes();
+
+        nodes.models.insert(
+            "model.test.model_a".to_string(),
+            create_test_model("model.test.model_a", vec![]),
+        );
+        nodes.models.insert(
+            "model.test.model_b".to_string(),
+            create_test_model("model.test.model_b", vec!["model.test.model_a".to_string()]),
+        );
+        nodes.models.insert(
+            "model.test.model_c".to_string(),
+            create_test_model("model.test.model_c", vec!["model.test.model_b".to_string()]),
+        );
+
+        let (parent_map, child_map) = build_parent_and_child_maps(&nodes);
+
+        // Check parent_map
+        assert_eq!(parent_map.len(), 3);
+        assert_eq!(parent_map.get("model.test.model_a").unwrap().len(), 0);
+        assert_eq!(
+            parent_map.get("model.test.model_b").unwrap(),
+            &vec!["model.test.model_a".to_string()]
+        );
+        assert_eq!(
+            parent_map.get("model.test.model_c").unwrap(),
+            &vec!["model.test.model_b".to_string()]
+        );
+
+        // Check child_map
+        assert_eq!(child_map.len(), 2);
+        assert_eq!(
+            child_map.get("model.test.model_a").unwrap(),
+            &vec!["model.test.model_b".to_string()]
+        );
+        assert_eq!(
+            child_map.get("model.test.model_b").unwrap(),
+            &vec!["model.test.model_c".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_build_parent_and_child_maps_with_source() {
+        let mut nodes = create_test_nodes();
+
+        nodes.sources.insert(
+            "source.test.my_source.table1".to_string(),
+            Arc::new(DbtSource {
+                __common_attr__: CommonAttributes {
+                    unique_id: "source.test.my_source.table1".to_string(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        );
+
+        nodes.models.insert(
+            "model.test.model_a".to_string(),
+            create_test_model(
+                "model.test.model_a",
+                vec!["source.test.my_source.table1".to_string()],
+            ),
+        );
+
+        let (parent_map, child_map) = build_parent_and_child_maps(&nodes);
+
+        // Check parent_map
+        assert_eq!(parent_map.len(), 2);
+        assert_eq!(
+            parent_map.get("model.test.model_a").unwrap(),
+            &vec!["source.test.my_source.table1".to_string()]
+        );
+        assert_eq!(
+            parent_map
+                .get("source.test.my_source.table1")
+                .unwrap()
+                .len(),
+            0
+        );
+
+        // Check child_map
+        assert_eq!(child_map.len(), 1);
+        assert_eq!(
+            child_map.get("source.test.my_source.table1").unwrap(),
+            &vec!["model.test.model_a".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_build_parent_and_child_maps_missing_dependency() {
+        let mut nodes = create_test_nodes();
+
+        nodes.models.insert(
+            "model.test.model_b".to_string(),
+            create_test_model("model.test.model_b", vec!["model.test.model_a".to_string()]),
+        );
+
+        let (parent_map, child_map) = build_parent_and_child_maps(&nodes);
+
+        // Both the existing model and the missing dependency should have entries
+        assert_eq!(parent_map.len(), 2);
+        assert_eq!(
+            parent_map.get("model.test.model_b").unwrap(),
+            &vec!["model.test.model_a".to_string()]
+        );
+        assert_eq!(parent_map.get("model.test.model_a").unwrap().len(), 0); // Missing node gets empty entry
+
+        // Child map should track the relationship
+        assert_eq!(child_map.len(), 1);
+        assert_eq!(
+            child_map.get("model.test.model_a").unwrap(),
+            &vec!["model.test.model_b".to_string()]
+        );
+    }
 }

@@ -16,12 +16,10 @@ workspace = true
 dbt-error = { workspace = true }
 dbt-frontend-common = { workspace = true }
 dbt-telemetry = { workspace = true }
-
 # leaf dependencies (depend on little more than std lib)
 dbt-cancel = { workspace = true }
 dbt-proc-macros = { workspace = true }
-
-datafusion = { workspace = true }
+md5 = { workspace = true }
 
 clap = { workspace = true, features = ["derive", "env"] }
 counter = { workspace = true }

@@ -21,7 +21,7 @@ use dbt_schemas::schemas::common::ConstraintSupport;
 use dbt_schemas::schemas::common::ConstraintType;
 use dbt_schemas::schemas::common::DbtIncrementalStrategy;
 use dbt_schemas::schemas::common::ResolvedQuoting;
-use dbt_schemas::schemas::dbt_column::DbtColumn;
+use dbt_schemas::schemas::dbt_column::{DbtColumn, DbtColumnRef};
 use dbt_schemas::schemas::manifest::{BigqueryClusterConfig, BigqueryPartitionConfig};
 use dbt_schemas::schemas::project::ModelConfig;
 use dbt_schemas::schemas::relations::base::{BaseRelation, ComponentName};
@@ -30,6 +30,7 @@ use dbt_schemas::schemas::{CommonAttributes, InternalDbtNodeAttributes};
 use dbt_xdbc::{Connection, QueryCtx};
 use minijinja::{State, Value, args};
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
@@ -54,7 +55,7 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
     }
 
     /// Get DB config by key
-    fn get_db_config(&self, _key: &str) -> Option<String> {
+    fn get_db_config(&self, _key: &str) -> Option<Cow<'_, str>> {
         unimplemented!("typed adapter method implementation")
     }
 
@@ -347,10 +348,15 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         }
     }
 
-    fn convert_type_inner(&self, data_type: &DataType) -> AdapterResult<String>;
+    fn convert_type_inner(&self, _state: &State, data_type: &DataType) -> AdapterResult<String>;
 
     /// Convert type.
-    fn convert_type(&self, table: Arc<AgateTable>, col_idx: i64) -> AdapterResult<String> {
+    fn convert_type(
+        &self,
+        state: &State,
+        table: Arc<AgateTable>,
+        col_idx: i64,
+    ) -> AdapterResult<String> {
         let schema = table.to_record_batch().schema();
         let data_type = schema.field(col_idx as usize).data_type();
 
@@ -365,7 +371,7 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
             data_type
         };
 
-        self.convert_type_inner(data_type)
+        self.convert_type_inner(state, data_type)
     }
 
     /// Expand the to_relation table's column types to match the schema of from_relation
@@ -511,8 +517,8 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
     fn get_persist_doc_columns(
         &self,
         _existing_columns: Vec<StdColumn>,
-        _model_columns: BTreeMap<String, DbtColumn>,
-    ) -> AdapterResult<BTreeMap<String, DbtColumn>> {
+        _model_columns: BTreeMap<String, DbtColumnRef>,
+    ) -> AdapterResult<BTreeMap<String, DbtColumnRef>> {
         unimplemented!("Only available for Databricks Adapter")
     }
 

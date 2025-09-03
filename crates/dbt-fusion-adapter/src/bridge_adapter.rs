@@ -25,10 +25,9 @@ use dbt_common::{FsError, FsResult, current_function_name};
 use dbt_schemas::schemas::InternalDbtNodeWrapper;
 use dbt_schemas::schemas::columns::base::StdColumn;
 use dbt_schemas::schemas::common::{DbtIncrementalStrategy, ResolvedQuoting};
-use dbt_schemas::schemas::dbt_column::DbtColumn;
+use dbt_schemas::schemas::dbt_column::{DbtColumn, DbtColumnRef};
 use dbt_schemas::schemas::manifest::{
-    BigqueryClusterConfig, BigqueryPartitionConfig, BigqueryPartitionConfigLegacy,
-    GrantAccessToTarget,
+    BigqueryClusterConfig, BigqueryPartitionConfig, GrantAccessToTarget, PartitionConfig,
 };
 use dbt_schemas::schemas::project::ModelConfig;
 use dbt_schemas::schemas::properties::ModelConstraint;
@@ -61,7 +60,7 @@ use std::sync::{Arc, LazyLock};
 // 3. This approach ensures proper transaction management within a DAG node
 // 4. The ConnectionGuard wrapper ensures connections are returned to the thread-local
 thread_local! {
-    static CONNECTION: RefCell<Option<Box<dyn Connection>>> = RefCell::new(None);
+    static CONNECTION: pri::TlsConnectionContainer = pri::TlsConnectionContainer::new();
 }
 
 // https://github.com/dbt-labs/dbt-adapters/blob/3ed165d452a0045887a5032c621e605fd5c57447/dbt-adapters/src/dbt/adapters/base/impl.py#L117
@@ -107,30 +106,7 @@ impl DerefMut for ConnectionGuard<'_> {
 impl Drop for ConnectionGuard<'_> {
     fn drop(&mut self) {
         let conn = self.conn.take();
-        let prev = CONNECTION.replace(conn);
-        if prev.is_some() {
-            // We should avoid nested borrows because they mean we are creating more
-            // than one connection when one would be sufficient. But if we reached
-            // this branch, we did exactly that (!).
-            //
-            //     {
-            //       let outer_guard = adapter.borrow_tlocal_connection()?;
-            //       f(outer_guard.as_mut());  // Pass the conn as ref. GOOD.
-            //       {
-            //         // We tried to borrow, but a new connection had to
-            //         // be created. BAD.
-            //         let inner_guard = adapter.borrow_tlocal_connection()?;
-            //         ...
-            //       }  // Connection from inner_guard returns to CONNECTION.
-            //     }  // Connection from outer_guard is returning to CONNECTION,
-            //        // but one was already there -- the one from inner_guard.
-            //
-            // The right choice is to simply drop the innermost connection.
-            drop(prev);
-            // An assert could be added here to help finding code that creates
-            // a connection instead of taking one as a parameter so that the
-            // outermost caller can pass the thread-local one by reference.
-        }
+        CONNECTION.with(|c| c.replace(conn));
     }
 }
 
@@ -193,7 +169,7 @@ impl BridgeAdapter {
         node_id: Option<String>,
     ) -> Result<ConnectionGuard<'_>, MinijinjaError> {
         let _span = span!("BridgeAdapter::borrow_thread_local_connection");
-        let mut conn = CONNECTION.take();
+        let mut conn = CONNECTION.with(|c| c.take());
         if conn.is_none() {
             self.new_connection(node_id)
                 .map(|new_conn| conn.replace(new_conn))?;
@@ -260,6 +236,14 @@ impl BaseAdapter for BridgeAdapter {
             .into_iter()
             .for_each(|(schema, relations)| self.relation_cache.insert_schema(schema, relations));
         Ok(())
+    }
+
+    fn is_cached(&self, relation: &Arc<dyn BaseRelation>) -> bool {
+        self.relation_cache.contains_relation(relation)
+    }
+
+    fn is_already_fully_cached(&self, schema: &CatalogAndSchema) -> bool {
+        self.relation_cache.contains_full_schema(schema)
     }
 
     #[tracing::instrument(skip_all, level = "trace")]
@@ -376,7 +360,7 @@ impl BaseAdapter for BridgeAdapter {
     }
 
     #[tracing::instrument(skip_all, level = "trace")]
-    fn convert_type(&self, _state: &State, args: &[Value]) -> Result<Value, MinijinjaError> {
+    fn convert_type(&self, state: &State, args: &[Value]) -> Result<Value, MinijinjaError> {
         let parser = ArgParser::new(args, None);
         check_num_args(current_function_name!(), &parser, 2, 2)?;
 
@@ -386,7 +370,7 @@ impl BaseAdapter for BridgeAdapter {
         let col_idx = args.last().expect("col_idx");
         let col_idx = col_idx.as_i64().unwrap();
 
-        let result = self.typed_adapter.convert_type(table, col_idx)?;
+        let result = self.typed_adapter.convert_type(state, table, col_idx)?;
 
         Ok(Value::from(result))
     }
@@ -711,7 +695,7 @@ impl BaseAdapter for BridgeAdapter {
         identifier: &str,
     ) -> Result<Value, MinijinjaError> {
         let temp_relation = relation_object::create_relation(
-            self.typed_adapter.adapter_type().to_string(),
+            self.typed_adapter.adapter_type(),
             database.to_string(),
             schema.to_string(),
             Some(identifier.to_string()),
@@ -1123,7 +1107,7 @@ impl BaseAdapter for BridgeAdapter {
         let columns = parser.get::<Value>("columns")?;
 
         let partition_by =
-            minijinja_value_to_typed_struct::<BigqueryPartitionConfigLegacy>(partition_by.clone()).map_err(|e| {
+            minijinja_value_to_typed_struct::<PartitionConfig>(partition_by.clone()).map_err(|e| {
                 MinijinjaError::new(
                     MinijinjaErrorKind::SerdeDeserializeError,
                     format!("adapter.add_time_ingestion_partition_column failed on partition_by {partition_by:?}: {e}"),
@@ -1486,9 +1470,10 @@ impl BaseAdapter for BridgeAdapter {
                 MinijinjaError::new(MinijinjaErrorKind::SerdeDeserializeError, e.to_string())
             })?;
         let model_columns =
-            minijinja_value_to_typed_struct::<BTreeMap<String, DbtColumn>>(model_columns).map_err(
-                |e| MinijinjaError::new(MinijinjaErrorKind::SerdeDeserializeError, e.to_string()),
-            )?;
+            minijinja_value_to_typed_struct::<BTreeMap<String, DbtColumnRef>>(model_columns)
+                .map_err(|e| {
+                    MinijinjaError::new(MinijinjaErrorKind::SerdeDeserializeError, e.to_string())
+                })?;
 
         Ok(Value::from_serialize(
             self.typed_adapter
@@ -1636,4 +1621,59 @@ fn builtin_incremental_strategies(
         result.push(DbtIncrementalStrategy::Microbatch)
     }
     result
+}
+
+mod pri {
+    use super::*;
+
+    /// A wrapper around a [Connection] stored in thread-local storage
+    ///
+    /// The point of this struct is to avoid calling the `Drop` destructor on
+    /// the wrapped [Connection] during process exit, which dead locks on
+    /// Windows.
+    pub(super) struct TlsConnectionContainer(RefCell<Option<Box<dyn Connection>>>);
+
+    impl TlsConnectionContainer {
+        pub(super) fn new() -> Self {
+            TlsConnectionContainer(RefCell::new(None))
+        }
+
+        pub(super) fn replace(&self, conn: Option<Box<dyn Connection>>) {
+            let prev = self.take();
+            *self.0.borrow_mut() = conn;
+            if prev.is_some() {
+                // We should avoid nested borrows because they mean we are creating more
+                // than one connection when one would be sufficient. But if we reached
+                // this branch, we did exactly that (!).
+                //
+                //     {
+                //       let outer_guard = adapter.borrow_tlocal_connection()?;
+                //       f(outer_guard.as_mut());  // Pass the conn as ref. GOOD.
+                //       {
+                //         // We tried to borrow, but a new connection had to
+                //         // be created. BAD.
+                //         let inner_guard = adapter.borrow_tlocal_connection()?;
+                //         ...
+                //       }  // Connection from inner_guard returns to CONNECTION.
+                //     }  // Connection from outer_guard is returning to CONNECTION,
+                //        // but one was already there -- the one from inner_guard.
+                //
+                // The right choice is to simply drop the innermost connection.
+                drop(prev);
+                // An assert could be added here to help finding code that creates
+                // a connection instead of taking one as a parameter so that the
+                // outermost caller can pass the thread-local one by reference.
+            }
+        }
+
+        pub(super) fn take(&self) -> Option<Box<dyn Connection>> {
+            self.0.borrow_mut().take()
+        }
+    }
+
+    impl Drop for TlsConnectionContainer {
+        fn drop(&mut self) {
+            std::mem::forget(self.take());
+        }
+    }
 }

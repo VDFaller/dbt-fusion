@@ -4,10 +4,17 @@ headerPath: header.tpl.md
 versionHeaderPath: ""
 changelogPath: CHANGELOG.md
 versionExt: md
-versionFormat: '## dbt-fusion {{.Version}} - {{.Time.Format "January 02, 2006"}}'
+envPrefix: "CHANGIE_"
+versionFormat: '## {{.Version}} - {{.Time.Format "January 02, 2006"}}'
 kindFormat: "### {{.Kind}}"
-changeFormat: |-
-  - {{.Body}}
+
+custom:
+  - key: issue
+    label: dbt-fusion issue number (leave empty if not applicable)
+    type: string
+  - key: author
+    label: Your GitHub handle (without the @ symbol)
+    type: string
 
 kinds:
   - label: Breaking Changes
@@ -17,9 +24,7 @@ kinds:
   - label: Dependencies
   - label: Security
 
-newlines:
-  afterChangelogHeader: 1
-  afterKind: 1
-  afterChangelogVersion: 1
-  beforeKind: 1
-  endOfVersion: 1
+# these changelogs are always for dbt-fusion
+post:
+  - key: project
+    value: dbt-fusion

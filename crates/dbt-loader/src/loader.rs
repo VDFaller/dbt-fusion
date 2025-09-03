@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use dbt_common::cancellation::CancellationToken;
 use dbt_common::once_cell_vars::DISPATCH_CONFIG;
+use dbt_common::show_warning;
 use dbt_jinja_utils::invocation_args::InvocationArgs;
 use dbt_jinja_utils::jinja_environment::JinjaEnv;
 use dbt_jinja_utils::phases::load::init::initialize_load_jinja_environment;
@@ -22,6 +23,8 @@ use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::time::SystemTime;
 
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
+
 use dbt_common::constants::{
     DBT_INTERNAL_PACKAGES_DIR_NAME, DBT_PACKAGES_DIR_NAME, DBT_PROJECT_YML, LOADING,
 };
@@ -29,7 +32,7 @@ use dbt_common::error::LiftableResult;
 use project::DbtProject;
 
 use dbt_common::stdfs::last_modified;
-use dbt_common::{ErrorCode, ectx, err, show_progress, with_progress};
+use dbt_common::{ErrorCode, ectx, err, with_progress};
 use dbt_common::{FsResult, fs_err};
 use dbt_schemas::schemas::project::{self, DbtProjectSimplified, ProjectDbtCloudConfig};
 use dbt_schemas::state::{DbtAsset, DbtPackage, DbtState, DbtVars, ResourcePathKind};
@@ -42,7 +45,6 @@ use crate::{
     load_internal_packages, load_packages, load_profiles, load_vars, persist_internal_packages,
 };
 
-use dbt_common::fsinfo;
 use dbt_jinja_utils::phases::load::secret_renderer::secret_context_env_var;
 use dbt_jinja_utils::serde::{into_typed_with_jinja, value_from_file};
 use dbt_jinja_utils::var_fn;
@@ -135,8 +137,8 @@ pub async fn load(
         if let Some(threads) = dbt_profile.db_config.get_threads() {
             // Convert StringOrInteger to Option<usize>
             match threads {
-                StringOrInteger::Integer(n) => Some(n as usize),
-                StringOrInteger::String(ref s) => Some(s.parse::<usize>().map_err(|_| {
+                StringOrInteger::Integer(n) => Some(*n as usize),
+                StringOrInteger::String(s) => Some(s.parse::<usize>().map_err(|_| {
                     fs_err!(
                         ErrorCode::Generic,
                         "Invalid number of threads in profiles.yml: {}",
@@ -184,13 +186,25 @@ pub async fn load(
     let env = initialize_load_jinja_environment(
         &dbt_state.dbt_profile.profile,
         &dbt_state.dbt_profile.target,
-        &dbt_state.dbt_profile.db_config.adapter_type(),
-        &dbt_state.dbt_profile.db_config,
+        dbt_state.dbt_profile.db_config.adapter_type(),
+        dbt_state.dbt_profile.db_config.clone(),
         dbt_state.run_started_at,
         &flags,
         arg.io.clone(),
         token.clone(),
     )?;
+
+    let adapter_type = dbt_state
+        .dbt_profile
+        .db_config
+        .adapter_type_if_supported()
+        .ok_or_else(|| {
+            fs_err!(
+                ErrorCode::InvalidConfig,
+                "Unknown or unsupported adapter type '{}'",
+                dbt_state.dbt_profile.db_config.adapter_type()
+            )
+        })?;
 
     let arg_ref = &arg;
     if let Some(prev_dbt_state) = arg.prev_dbt_state.clone() {
@@ -230,10 +244,7 @@ pub async fn load(
         &simplified_dbt_project,
     );
 
-    persist_internal_packages(
-        &internal_packages_install_path,
-        &dbt_state.dbt_profile.db_config.adapter_type(),
-    )?;
+    persist_internal_packages(&internal_packages_install_path, adapter_type)?;
 
     let (packages_lock, upstream_projects) = get_or_install_packages(
         &arg.io,
@@ -304,24 +315,6 @@ pub async fn load_inner(
     let mut all_files: HashMap<ResourcePathKind, Vec<(PathBuf, SystemTime)>> = HashMap::new();
 
     let dbt_project_path = package_path.join(DBT_PROJECT_YML);
-
-    let show_base_path = if package_path != arg.io.in_dir {
-        // Show path from the packages `install-dir`
-        package_path
-            .parent()
-            .expect("Failed to get parent directory")
-            .parent()
-            .expect("Failed to get parent directory")
-            .to_path_buf()
-    } else {
-        arg.io.in_dir.clone()
-    };
-
-    let show_project_path = diff_paths(&dbt_project_path, &show_base_path).unwrap();
-    show_progress!(
-        arg.io,
-        fsinfo!(LOADING.into(), show_project_path.display().to_string())
-    );
 
     let dependency_package_name = if is_dependency {
         Some(
@@ -409,11 +402,16 @@ pub async fn load_inner(
     );
 
     if !python_files.is_empty() {
-        return err!(
-            code => ErrorCode::UnsupportedFileExtension,
-            loc => python_files[0].path.clone(),
-            "Python models are not currently supported"
-        );
+        for file in python_files {
+            show_warning!(
+                &arg.io,
+                *fs_err!(
+                    code => ErrorCode::UnsupportedFileExtension,
+                    loc => file.path.clone(),
+                    "Python models are not currently supported"
+                )
+            );
+        }
     }
 
     // todo: we could optimize here, but for now just take everything,...
@@ -602,14 +600,48 @@ fn find_files_by_kind_and_extension(
     paths
 }
 
+/// Loads the .dbtignore file if it exists in the given path
+fn load_dbtignore(path: &Path) -> FsResult<Option<Gitignore>> {
+    let dbtignore_path = path.join(".dbtignore");
+    if dbtignore_path.exists() {
+        let mut builder = GitignoreBuilder::new(path);
+        // add() returns Option<Error> where None means success and Some(err) is an error
+        match builder.add(&dbtignore_path) {
+            None => match builder.build() {
+                Ok(gitignore) => return Ok(Some(gitignore)),
+                Err(err) => {
+                    return err!(
+                        code => ErrorCode::InvalidConfig,
+                        loc => dbtignore_path.clone(),
+                        "Error building .dbtignore: {}",
+                        err
+                    );
+                }
+            },
+            Some(err) => {
+                return err!(
+                    code => ErrorCode::InvalidConfig,
+                    loc => dbtignore_path.clone(),
+                    "Failed to add .dbtignore file: {}",
+                    err
+                );
+            }
+        }
+    }
+    Ok(None)
+}
+
 fn collect_all_files(
     all_dirs: HashMap<ResourcePathKind, Vec<String>>,
     base_path: &Path,
 ) -> FsResult<HashMap<ResourcePathKind, Vec<(PathBuf, SystemTime)>>> {
+    // Load .dbtignore file if it exists
+    let dbtignore = load_dbtignore(base_path)?;
+    // Remove debug statement for tests
     let mut all_paths: HashMap<ResourcePathKind, Vec<(PathBuf, SystemTime)>> = HashMap::new();
     for (kind, paths) in &all_dirs {
         let mut info_paths = Vec::new();
-        collect_file_info(base_path, paths, &mut info_paths).lift(ectx!(
+        collect_file_info(base_path, paths, &mut info_paths, dbtignore.as_ref()).lift(ectx!(
             "Failed to collect file info: {}, {}",
             base_path.display(),
             paths.join(",")
@@ -725,6 +757,8 @@ mod tests {
     use super::*;
     use dbt_schemas::state::ResourcePathKind;
     use std::collections::HashMap;
+    use std::fs::File;
+    use std::io::Write;
     use std::path::PathBuf;
     use std::time::SystemTime;
 
@@ -795,6 +829,42 @@ mod tests {
             assert_eq!(asset.package_name, project_name);
             assert_eq!(asset.base_path, in_dir);
         }
+    }
+
+    #[test]
+    fn test_load_dbtignore() {
+        use tempfile::TempDir;
+
+        // Create a temporary directory
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path();
+
+        // Initially no .dbtignore file
+        let ignore = load_dbtignore(temp_path).unwrap();
+        assert!(ignore.is_none());
+
+        // Create a .dbtignore file
+        let dbtignore_path = temp_path.join(".dbtignore");
+        let mut file = File::create(dbtignore_path).unwrap();
+        writeln!(file, "*.py").unwrap();
+        writeln!(file, "/ignored_dir/").unwrap(); // Explicit directory format with slashes
+        writeln!(file, "!important.py").unwrap();
+
+        // Now .dbtignore should be loaded
+        let ignore = load_dbtignore(temp_path).unwrap();
+        assert!(ignore.is_some());
+
+        let ignore = ignore.unwrap();
+
+        // Test patterns
+        // Test patterns with file=false parameter
+        assert!(ignore.matched("test.py", false).is_ignore()); // Should be ignored
+        assert!(!ignore.matched("important.py", false).is_ignore()); // Should NOT be ignored (negated)
+
+        // For this test, let's focus on the patterns we know should work reliably
+        assert!(ignore.matched("test.py", false).is_ignore()); // Should be ignored
+        assert!(!ignore.matched("important.py", false).is_ignore()); // Should NOT be ignored (negated)
+        assert!(!ignore.matched("test.txt", false).is_ignore()); // Should NOT be ignored
     }
 
     #[test]

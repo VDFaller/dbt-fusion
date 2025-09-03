@@ -1,5 +1,74 @@
 pub use humantime as _vendored_human_time;
 
+/// Format duration in a concise way:
+/// - If < 1 minute: show seconds and milliseconds (e.g., "1s 298ms", "500ms")
+/// - If >= 1 minute: show minutes and seconds (e.g., "1m 30s")
+pub fn format_duration_concise(duration: std::time::Duration, show_millis: bool) -> String {
+    let total_secs = duration.as_secs_f64();
+
+    if total_secs >= 60.0 {
+        // >= 1 minute: show minutes and seconds
+        let minutes = (total_secs / 60.0) as u64;
+        let remaining_secs = total_secs % 60.0;
+        if remaining_secs >= 1.0 {
+            format!("{minutes}m {remaining_secs:.0}s")
+        } else {
+            format!("{minutes}m")
+        }
+    } else if total_secs >= 1.0 {
+        // >= 1 second but < 1 minute: show seconds and milliseconds
+        let secs = total_secs as u64;
+        let remaining_millis = ((total_secs - secs as f64) * 1000.0) as u64;
+        if remaining_millis > 0 && show_millis {
+            format!("{secs}s {remaining_millis}ms")
+        } else {
+            format!("{secs}s")
+        }
+    } else {
+        // < 1 second: show most appropriate single unit
+        let millis = duration.as_millis();
+        if millis >= 1 {
+            format!("{millis}ms")
+        } else {
+            let micros = duration.as_micros();
+            if micros >= 1 {
+                format!("{micros}μs")
+            } else {
+                format!("{}ns", duration.as_nanos())
+            }
+        }
+    }
+}
+
+/// Format duration with fixed width for alignment (5 characters total)
+/// Supports ns, μs, ms, s, m, h for materializations
+pub fn format_duration_fixed_width(duration: std::time::Duration) -> String {
+    let total_secs = duration.as_secs_f64();
+
+    if total_secs >= 999.0 {
+        // >= 999 seconds: show fixed indicator for very long operations
+        "LONG!!!".to_string()
+    } else if total_secs == 0.0 {
+        "-------".to_string()
+    } else {
+        // 0-999 seconds: always show in seconds with 2 decimal places, right-aligned with spaces
+        format!("{total_secs:6.2}s")
+    }
+}
+
+/// Format schema and alias with truncation for long schema names
+/// If schema is longer than 20 characters, truncate to "long_schema_na....::alias"
+pub fn format_schema_alias(schema: &str, alias: &str) -> String {
+    const MAX_SCHEMA_LEN: usize = 200;
+
+    let schema = if schema.len() > MAX_SCHEMA_LEN {
+        format!("{}...", &schema[..MAX_SCHEMA_LEN.saturating_sub(4)])
+    } else {
+        format!("{schema}.")
+    };
+    format!("{}{}", CYAN.apply_to(schema), BLUE.apply_to(alias))
+}
+
 // Re-export dbt_error here such that downstream crates could use
 // macros using dbt_error without having to add it as a dependency explicitly.
 pub use dbt_error as _dbt_error;
@@ -7,6 +76,44 @@ pub use dbt_error as _dbt_error;
 // Re-export dbt-telemetry to allow using it in macros without requiring
 // the call-site crate to declare it as a dependency explicitly
 pub use dbt_telemetry as _dbt_telemetry;
+
+use crate::pretty_string::{BLUE, CYAN};
+
+/// Format resource type with minimum width for alignment
+/// Minimum width is 5 characters (length of "model") but allows longer strings
+pub fn format_resource_type_fixed_width(resource_type: &str) -> String {
+    use crate::pretty_string::MAGENTA;
+    const MIN_WIDTH: usize = 5; // Length of "model"
+
+    let formatted = MAGENTA.apply_to(resource_type).to_string();
+
+    // Pad if shorter than minimum width, otherwise return as-is
+    if resource_type.len() < MIN_WIDTH {
+        format!(
+            "{}{}",
+            formatted,
+            " ".repeat(MIN_WIDTH - resource_type.len())
+        )
+    } else {
+        formatted
+    }
+}
+
+/// Format materialization without fixed width (for end of line)
+pub fn format_materialization_suffix(materialization: Option<&str>, desc: Option<&str>) -> String {
+    let truncated_mat = match materialization {
+        Some("materialized_view") => Some("mat_view"),
+        Some("streaming_table") => Some("streaming"),
+        Some("test") | Some("unit_test") | None => None,
+        Some(other) => Some(other),
+    };
+    match (truncated_mat, desc) {
+        (Some(mat), Some(desc)) => format!(" ({mat} - {desc})"),
+        (Some(mat), None) => format!(" ({mat})"),
+        (None, Some(desc)) => format!(" ({desc})"),
+        (None, None) => String::new(),
+    }
+}
 
 /// fsinfo! constructs an FsInfo struct with optional data and desc fields
 #[macro_export]
@@ -181,42 +288,206 @@ macro_rules! show_progress {
     ( $io:expr, $info:expr) => {{
         use $crate::io_args::ShowOptions;
         use $crate::pretty_string::pretty_green;
-        use $crate::logging::{FsInfo, LogEvent};
+        use $crate::logging::{FsInfo, LogEvent, LogFormat};
 
+        if !$info.is_phase_completed() {
 
-        if let Some(reporter) = &$io.status_reporter {
-            reporter.show_progress($info.event.action().as_str(), &$info.target, $info.desc.as_deref());
+            if let Some(reporter) = &$io.status_reporter {
+                reporter.show_progress($info.event.action().as_str(), &$info.target, $info.desc.as_deref());
+            }
+
+            // This whole macro became entirely unweldy, the following condition is a VERY
+            // temporary bandaid fix for a regression where JSON output was not being emitted
+            // for certain progress events. The entire macro is expected to be removed
+            // after migration to new tracing-based logging is complete.
+            let should_emit_json_event = $io.log_format == LogFormat::Json && ($info.is_phase_render()
+                || $info.is_phase_run());
+
+            // TODO: these filtering conditions should be moved to the logger side
+            if (
+                ($io.should_show(ShowOptions::Progress) && $info.is_phase_unknown())
+                || ($io.should_show(ShowOptions::ProgressHydrate) && $info.is_phase_hydrate())
+                || ($io.should_show(ShowOptions::ProgressParse) && $info.is_phase_parse())
+                || ($io.should_show(ShowOptions::ProgressRender) && $info.is_phase_render())
+                || ($io.should_show(ShowOptions::ProgressAnalyze) && $info.is_phase_analyze())
+                || ($io.should_show(ShowOptions::ProgressRun) && $info.is_phase_run())
+                || should_emit_json_event
+            )
+                // Do not show parse/compile generic tests
+                && !($info.target.contains(dbt_common::constants::DBT_GENERIC_TESTS_DIR_NAME)
+                    && ($info.event.action().as_str().contains(dbt_common::constants::PARSING)
+                        || $info.event.action().as_str().contains(dbt_common::constants::RENDERING)
+                        || $info.event.action().as_str().contains(dbt_common::constants::ANALYZING)))
+            {
+                let output = pretty_green($info.event.action().as_str(), &$info.target, $info.desc.as_deref());
+                let event = $info.event;
+                if let Some(data_json) = $info.data {
+                    $crate::_log!(event.level(),
+                        _INVOCATION_ID_ = $io.invocation_id.as_u128(),
+                        _TRACING_HANDLED_ = true,
+                        name = event.name(), data:serde = data_json;
+                        "{}", output
+                    );
+                } else {
+                    $crate::_log!(event.level(),
+                        _INVOCATION_ID_ = $io.invocation_id.as_u128(),
+                        _TRACING_HANDLED_ = true,
+                        name = event.name();
+                        "{}", output
+                    );
+                }
+            }
         }
+    }};
+}
 
-        // TODO: these filtering conditions should be moved to the logger side
-        if (
-            ($io.should_show(ShowOptions::Progress) && $info.is_phase_unknown())
-            || ($io.should_show(ShowOptions::ProgressParse) && $info.is_phase_parse())
-            || ($io.should_show(ShowOptions::ProgressRender) && $info.is_phase_render())
-            || ($io.should_show(ShowOptions::ProgressAnalyze) && $info.is_phase_analyze())
-            || ($io.should_show(ShowOptions::ProgressRun) && $info.is_phase_run())
-        )
-            // Do not show parse/compile generic tests
-            && !($info.target.contains(dbt_common::constants::DBT_GENERIC_TESTS_DIR_NAME)
-                && ($info.event.action().as_str().contains(dbt_common::constants::PARSING)
-                    || $info.event.action().as_str().contains(dbt_common::constants::RENDERING)
-                    || $info.event.action().as_str().contains(dbt_common::constants::ANALYZING)))
-        {
-            let output = pretty_green($info.event.action().as_str(), &$info.target, $info.desc.as_deref());
-            let event = $info.event;
-            if let Some(data_json) = $info.data {
-                $crate::_log!(event.level(),
-                    _INVOCATION_ID_ = $io.invocation_id.as_u128(),
-                    _TRACING_HANDLED_ = true,
-                    name = event.name(), data:serde = data_json;
-                     "{}", output
-                );
+#[macro_export]
+macro_rules! show_completed {
+    // Generic completion for node materializations (model/seed/snapshot)
+    (
+        $io:expr,
+        $task:expr,
+        $node_info:expr,
+        $node_status:expr,
+        $display_path:expr,
+        $start_time:expr,
+        $end_time:expr,
+        $with_cache:expr
+    ) => {{
+        use $crate::io_args::ShowOptions;
+        use $crate::constants::SUCCEEDED;
+        use $crate::logging::LogEvent;
+        use $crate::stats::NodeStatus;
+        use $crate::macros::{format_duration_fixed_width, format_schema_alias, format_resource_type_fixed_width, format_materialization_suffix};
+        use $crate::pretty_string::{GREEN, BLUE};
+        use $crate::macros::_vendored_human_time::{format_duration, FormattedDuration};
+        use chrono::Utc;
+
+        if !matches!($node_status, &NodeStatus::NoOp) {
+            let log_event: LogEvent = $node_status.clone().into();
+            let duration = $end_time
+                .signed_duration_since($start_time)
+                .to_std()
+                .unwrap_or_default();
+            let resource_type = $task.resource_type();
+            let materialization = $task.base().materialized.to_string();
+            let schema = $task.base().schema.clone();
+            let alias = $task.base().alias.clone();
+
+            let desc = if matches!($node_status, NodeStatus::Succeeded) {
+                $with_cache.then_some("New changes detected".to_string())
             } else {
-                $crate::_log!(event.level(),
+                $node_status.get_message()
+            };
+
+            if let Some(reporter) = &$io.status_reporter {
+                reporter.show_progress(log_event.action().as_str(), &$display_path, desc.as_deref());
+            }
+
+            if $io.should_show(ShowOptions::Completed) {
+                let schema_alias = format_schema_alias(&schema, &alias);
+                let resource_type_formatted = format_resource_type_fixed_width(resource_type);
+                let materialization_suffix = format_materialization_suffix(Some(&materialization), desc.as_deref());
+                let duration = format_duration_fixed_width(duration);
+                let output = format!(
+                    "{} [{}] {} {}{}",
+                    log_event.formatted_action(),
+                    duration,
+                    resource_type_formatted,
+                    schema_alias,
+                    materialization_suffix
+                );
+
+                $crate::_log!(
+                    log_event.level(),
                     _INVOCATION_ID_ = $io.invocation_id.as_u128(),
                     _TRACING_HANDLED_ = true,
-                    name = event.name();
-                     "{}", output
+                    name = log_event.name(),
+                    data:serde = dbt_serde_yaml::to_value($node_info).expect("Failed to serialize node info");
+                    "{}",
+                    output
+                );
+            }
+        }
+    }};
+    // Show completed for multiple nodes
+    // Generic completion for node materializations (model/seed/snapshot)
+    (
+        $io:expr,
+        $node_info:expr,
+        $node_status:expr,
+        $start_time:expr,
+        $end_time:expr,
+        $skipped_test_unique_ids:expr,
+        $skipped_test_node_names:expr
+    ) => {{
+        use $crate::io_args::ShowOptions;
+        use $crate::constants::SUCCEEDED;
+        use $crate::logging::LogEvent;
+        use $crate::stats::NodeStatus;
+        use $crate::macros::{format_duration_fixed_width, format_schema_alias, format_resource_type_fixed_width, format_materialization_suffix};
+        use $crate::pretty_string::{GREEN, BLUE, CYAN, YELLOW};
+        use $crate::macros::_vendored_human_time::{format_duration, FormattedDuration};
+        use chrono::Utc;
+
+        if matches!($node_status, &NodeStatus::SkippedUpstreamFailed) {
+
+            let message = if $skipped_test_node_names.len() > 3 {
+                format!(
+                    "{} and {} others",
+                    $skipped_test_node_names
+                        .iter()
+                        .take(2)
+                        .map(|name| format!("'{}'", YELLOW.apply_to(name)))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    $skipped_test_node_names.len() - 2
+                )
+            } else {
+                format!(
+                    "{}",
+                    $skipped_test_node_names
+                        .iter()
+                        .map(|name| format!("'{}'", YELLOW.apply_to(name)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            let log_event: LogEvent = $node_status.clone().into();
+            let duration = $end_time
+                .signed_duration_since($start_time)
+                .to_std()
+                .unwrap_or_default();
+
+            // If unique_ids starts with test or unit_test then resource type should be test,unit_test
+            let any_test = $skipped_test_unique_ids.iter().any(|id| id.starts_with("test"));
+            let any_unit_test = $skipped_test_unique_ids.iter().any(|id| id.starts_with("unit_test"));
+            let resource_type = match (any_test, any_unit_test) {
+                (true, true) => "test,unit_test",
+                (true, false) => "test",
+                (false, true) => "unit_test",
+                (false, false) => "unknown",
+            };
+
+            if $io.should_show(ShowOptions::Completed) {
+                let resource_type_formatted = format_resource_type_fixed_width(resource_type);
+                let duration = format_duration_fixed_width(duration);
+                let output = format!(
+                    "{} [{}] {} {}",
+                    log_event.formatted_action(),
+                    duration,
+                    resource_type_formatted,
+                    message
+                );
+
+                $crate::_log!(
+                    log_event.level(),
+                    _INVOCATION_ID_ = $io.invocation_id.as_u128(),
+                    _TRACING_HANDLED_ = true,
+                    name = log_event.name(),
+                    data:serde = dbt_serde_yaml::to_value($node_info).expect("Failed to serialize node info");
+                    "{}",
+                    output
                 );
             }
         }
@@ -517,20 +788,20 @@ macro_rules! show_warning {
         use $crate::tracing::emit::_tracing::Level as TracingLevel;
         use $crate::tracing::metrics::{increment_metric, MetricKey};
         use $crate::tracing::constants::TRACING_ATTR_FIELD;
-        use $crate::macros::_dbt_telemetry::{TelemetryAttributes, RecordCodeLocation};
+        use $crate::macros::_dbt_telemetry::{LogEventInfo, TelemetryAttributes, RecordCodeLocation};
         increment_metric(MetricKey::TotalWarnings, 1);
 
         let (original_severity_number, original_severity_text) = log_level_to_severity(&$crate::macros::log_adapter::log::Level::Warn);
 
         $crate::emit_tracing_event!(
             level: TracingLevel::WARN,
-            TelemetryAttributes::Log {
+            TelemetryAttributes::Log(LogEventInfo {
                 code: Some(err.code as u16 as u32),
                 dbt_core_code: None,
                 original_severity_number,
                 original_severity_text: original_severity_text.to_string(),
                 location: RecordCodeLocation::none(), // Will be auto injected
-            },
+            }),
             "{}",
             err.pretty().as_str()
         );
@@ -550,23 +821,23 @@ macro_rules! show_warning {
         );
     }};
 
-    ( $io:expr, info => $info:expr) => {{
-        use $crate::io_args::ShowOptions;
-        use $crate::pretty_string::pretty_yellow;
-        use $crate::logging::{FsInfo, LogEvent};
+    // ( $io:expr, info => $info:expr) => {{
+    //     use $crate::io_args::ShowOptions;
+    //     use $crate::pretty_string::pretty_yellow;
+    //     use $crate::logging::{FsInfo, LogEvent};
 
-        if $io.should_show(ShowOptions::Progress)
-            // Do not show parse generic tests
-        {
-            let output = pretty_yellow($info.event.action().as_str(), &$info.target, $info.desc.as_deref());
-            let log_config = $info.event;
-            if let Some(data_json) = $info.data {
-                $crate::_log!(log_config.level(), name = log_config.name(), data:serde = data_json; "{}", output);
-            } else {
-                $crate::_log!(log_config.level(), name = log_config.name(); "{}", output);
-            }
-        }
-    }};
+    //     if $io.should_show(ShowOptions::Progress)
+    //         // Do not show parse generic tests
+    //     {
+    //         let output = pretty_yellow($info.event.action().as_str(), &$info.target, $info.desc.as_deref());
+    //         let log_config = $info.event;
+    //         if let Some(data_json) = $info.data {
+    //             $crate::_log!(log_config.level(), name = log_config.name(), data:serde = data_json; "{}", output);
+    //         } else {
+    //             $crate::_log!(log_config.level(), name = log_config.name(); "{}", output);
+    //         }
+    //     }
+    // }};
 }
 
 #[macro_export]
@@ -636,7 +907,30 @@ macro_rules! show_package_error {
                 status_reporter.collect_warning(&err);
             }
 
-            if std::env::var("_DBT_FUSION_STRICT_MODE").is_ok() {
+            let beta_parsing = match std::env::var("DBT_ENGINE_BETA_PARSING") {
+                Ok(val) => val == "1",
+                Err(_) => false, // default to false (strict mode on)
+            };
+            let beta_package_parsing = match std::env::var("DBT_ENGINE_BETA_PACKAGE_PARSING") {
+                Ok(val) => val == "1",
+                Err(_) => true, // default to true (strict mode off for packages)
+            };
+
+            increment_autofix_suggestion_counter(&$io.invocation_id.to_string());
+
+            if beta_parsing || beta_package_parsing {
+                // Increment once per invocation
+                increment_warning_counter(&$io.invocation_id.to_string());
+                $crate::_log!(
+                    $crate::macros::log_adapter::log::Level::Warn,
+                    _INVOCATION_ID_ = $io.invocation_id.as_u128(),
+                    code = err.code.to_string();
+                    "{} {} {}",
+                    YELLOW.apply_to(WARNING),
+                    "(will error post preview)",
+                    color_quotes(err.pretty().as_str())
+                );
+            } else {
                 // Increment once per invocation
                 increment_error_counter(&$io.invocation_id.to_string());
 
@@ -648,21 +942,31 @@ macro_rules! show_package_error {
                     RED.apply_to(ERROR),
                     color_quotes(err.pretty().as_str())
                 );
-            } else {
-                // Increment once per invocation
-                increment_warning_counter(&$io.invocation_id.to_string());
-                increment_autofix_suggestion_counter(&$io.invocation_id.to_string());
-
-                $crate::_log!(
-                    $crate::macros::log_adapter::log::Level::Warn,
-                    _INVOCATION_ID_ = $io.invocation_id.as_u128(),
-                    code = err.code.to_string();
-                    "{} {} {}",
-                    YELLOW.apply_to(WARNING),
-                    "(will error post beta)",
-                    color_quotes(err.pretty().as_str())
-                );
             }
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! show_strict_error {
+    ($io:expr, $err:expr, $pkg:expr) => {{
+        use dbt_common::{show_error, show_warning_soon_to_be_error};
+        use $crate::error_counter::increment_autofix_suggestion_counter;
+
+        let beta_parsing = match std::env::var("DBT_ENGINE_BETA_PARSING") {
+            Ok(val) => val == "1",
+            Err(_) => false, // default to false (strict mode on)
+        };
+        let beta_package_parsing = match std::env::var("DBT_ENGINE_BETA_PACKAGE_PARSING") {
+            Ok(val) => val == "1",
+            Err(_) => true, // default to true (strict mode off for packages)
+        };
+
+        increment_autofix_suggestion_counter(&$io.invocation_id.to_string());
+        if beta_parsing || (beta_package_parsing && $pkg.is_some()) {
+            show_warning_soon_to_be_error!($io, $err);
+        } else {
+            show_error!($io, $err);
         }
     }};
 }
@@ -693,36 +997,7 @@ macro_rules! show_error {
         );
     }};
 
-    ( $io:expr, info => $info:expr, increment_counter: $increment:expr) => {{
-        use $crate::io_args::ShowOptions;
-        use $crate::pretty_string::pretty_red;
-        use $crate::error_counter::increment_error_counter;
-        use $crate::logging::{FsInfo, LogEvent};
-        if $increment {
-            increment_error_counter(&$io.invocation_id.to_string());
-        }
-        if $io.should_show(ShowOptions::ProgressRun)
-            // Do not show parse generic tests
-        {
-            let output = pretty_red($info.event.action().as_str(), &$info.target, $info.desc.as_deref());
-            let log_config = $info.event;
-            if let Some(data_json) = $info.data {
-                $crate::_log!(
-                    log_config.level(),
-                    _INVOCATION_ID_ = $io.invocation_id.as_u128(),
-                    name = log_config.name(),
-                    data:serde = data_json; "{}", output
-                );
-            } else {
-                $crate::_log!(
-                    log_config.level(),
-                    _INVOCATION_ID_ = $io.invocation_id.as_u128(),
-                    name = log_config.name();
-                     "{}", output
-                );
-            }
-        }
-    }};
+
 }
 
 #[macro_export]
@@ -743,24 +1018,16 @@ macro_rules! show_fail {
 
 #[macro_export]
 macro_rules! show_autofix_suggestion {
-    ($io:expr) => {{
+    ($io:expr, $message:expr) => {{
         use dbt_common::show_warning;
         use $crate::pretty_string::BLUE;
         use $crate::macros::_dbt_error::FsError;
 
-        show_warning!(
-            $io,
-            $crate::macros::_dbt_error::FsError::new(
-                $crate::macros::_dbt_error::ErrorCode::Generic,
-                "Warnings marked (will error post beta) will turn into errors before leaving beta. Please fix them."
-            )
-        );
         $crate::_log!(
             $crate::macros::log_adapter::log::Level::Info,
             _INVOCATION_ID_ = $io.invocation_id.as_u128();
-            "{} Try the autofix script: {}",
-            BLUE.apply_to("suggestion:"),
-            BLUE.apply_to("https://github.com/dbt-labs/dbt-autofix")
+            "{}",
+            $message
         );
     }};
 }
@@ -825,9 +1092,9 @@ macro_rules! show_progress_exit {
         use $crate::io_args::ShowOptions;
         use $crate::constants::FINISHED;
         use $crate::error_counter::{get_autofix_suggestion_counter, get_error_counter, get_warning_counter};
-        use $crate::macros::_vendored_human_time::{format_duration, FormattedDuration};
+        use $crate::macros::format_duration_concise;
         use $crate::pretty_string::color_quotes;
-        use $crate::pretty_string::{GREEN, RED, YELLOW};
+        use $crate::pretty_string::{GREEN, RED, YELLOW, BLUE};
         use $crate::macros::_dbt_error::FsError;
         use serde_json::json;
         let e_ct = get_error_counter(&$arg.io.invocation_id.to_string());
@@ -838,7 +1105,13 @@ macro_rules! show_progress_exit {
 
         // Show autofix suggestion if there are any autofix suggestions
         if a_ct > 0 {
-            $crate::show_autofix_suggestion!($arg.io);
+            let msg = format!(
+                "{} Run '{}' to see the latest fusion compatible packages. For compatibility errors, try the autofix script: {}",
+                BLUE.apply_to("suggestion:"),
+                YELLOW.apply_to("dbt deps"),
+                BLUE.apply_to("https://github.com/dbt-labs/dbt-autofix")
+            );
+            $crate::show_autofix_suggestion!($arg.io, msg);
         }
 
         let (action, msg) = if e_ct > 0 && w_ct > 0 {
@@ -857,7 +1130,7 @@ macro_rules! show_progress_exit {
             (GREEN.apply_to(FINISHED), "".to_owned())
         };
         let duration = if $arg.from_main {
-            let duration = format_duration($start_time.elapsed().unwrap()).to_string();
+            let duration = format_duration_concise($start_time.elapsed().unwrap(), true).to_string();
 
             format!(" in {}", duration)
         } else {
@@ -872,7 +1145,7 @@ macro_rules! show_progress_exit {
             "{} '{}' {}{}{}",
             action, &$arg.command, target, msg, duration
         );
-        if $arg.io.show.contains(&ShowOptions::ProgressRun) || e_ct > 0 {
+        if $arg.io.show.contains(&ShowOptions::Completed) || e_ct > 0 {
             let elapsed = $start_time.elapsed().unwrap().as_secs_f32();
             let completed_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6f").to_string();
             log::info!(elapsed = elapsed, name = "CommandCompleted", data:serde = json!({"completed_at": completed_at, "elapsed": elapsed, "success": e_ct == 0}); "{}", output);

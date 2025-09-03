@@ -4,6 +4,7 @@ pub mod dbt_utils;
 pub mod filter;
 pub mod man;
 pub mod state;
+pub mod stats;
 
 pub mod schemas {
     pub mod columns;
@@ -22,7 +23,8 @@ pub mod schemas {
     mod sources;
     pub use prev_state::{ModificationType, PreviousState};
     pub use run_results::{
-        RunResult, RunResultsArgs, RunResultsArtifact, RunResultsMetadata, TimingInfo,
+        ContextRunResult, RunResultOutput, RunResultsArgs, RunResultsArtifact, RunResultsMetadata,
+        TimingInfo,
     };
 
     // Add re-exports from relation_configs
@@ -55,21 +57,22 @@ pub mod schemas {
         #[allow(clippy::module_inception)]
         mod manifest;
         mod manifest_nodes;
-        mod metric;
+        pub(crate) mod metric;
         mod operation;
-        mod saved_query;
+        pub mod postgres;
+        pub mod saved_query;
         mod selector;
-        mod semantic_model;
+        pub(crate) mod semantic_model;
 
         // Versioned manifest modules
         pub mod v10;
         pub mod v11;
         pub mod v12;
 
-        pub mod common;
+        pub(crate) mod common;
         pub use bigquery_partition::{
             BigqueryClusterConfig, BigqueryPartitionConfig, BigqueryPartitionConfigInner,
-            BigqueryPartitionConfigLegacy, GrantAccessToTarget, Range, RangeConfig, TimeConfig,
+            GrantAccessToTarget, PartitionConfig, Range, RangeConfig, TimeConfig,
         };
         pub use group::DbtGroup;
         pub use manifest::{
@@ -77,8 +80,8 @@ pub mod schemas {
             nodes_from_dbt_manifest,
         };
         pub use manifest_nodes::{
-            ManifestDataTest, ManifestExposure, ManifestModel, ManifestSeed, ManifestSnapshot,
-            ManifestSource, ManifestUnitTest,
+            ManifestDataTest, ManifestExposure, ManifestMetric, ManifestModel, ManifestSeed,
+            ManifestSemanticModel, ManifestSnapshot, ManifestSource, ManifestUnitTest,
         };
         pub use metric::DbtMetric;
         pub use operation::DbtOperation;
@@ -91,6 +94,12 @@ pub mod schemas {
     }
     mod dbt_cloud;
     pub use dbt_cloud::{DbtCloudConfig, DbtCloudContext, DbtCloudProject};
+
+    pub mod semantic_layer {
+        pub mod metric;
+        pub mod semantic_manifest;
+        pub mod semantic_model;
+    }
     pub mod project {
         mod dbt_project;
         mod configs {
@@ -109,7 +118,7 @@ pub mod schemas {
             pub mod unit_test_config;
         }
 
-        pub use configs::common::{BigQueryNodeConfig, DatabricksNodeConfig, SnowflakeNodeConfig};
+        pub use configs::common::WarehouseSpecificNodeConfig;
         pub use configs::data_test_config::{DataTestConfig, ProjectDataTestConfig};
         pub use configs::exposure_config::{ExposureConfig, ProjectExposureConfig};
         pub use configs::metric_config::{MetricConfig, ProjectMetricConfigs};
@@ -133,7 +142,7 @@ pub mod schemas {
     pub mod properties {
         mod data_test_properties;
         mod exposure_properties;
-        mod metrics_properties;
+        pub(crate) mod metrics_properties;
         mod model_properties;
         #[allow(clippy::module_inception)]
         mod properties;

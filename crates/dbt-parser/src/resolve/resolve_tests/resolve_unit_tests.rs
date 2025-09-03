@@ -6,6 +6,7 @@ use crate::utils::get_unique_id;
 use dbt_common::CodeLocation;
 use dbt_common::ErrorCode;
 use dbt_common::FsResult;
+use dbt_common::adapter::AdapterType;
 use dbt_common::err;
 use dbt_common::error::AbstractLocation;
 use dbt_common::fs_err;
@@ -53,7 +54,7 @@ pub fn resolve_unit_tests(
     package_quoting: DbtQuoting,
     root_project: &DbtProject,
     root_project_configs: &RootProjectConfigs,
-    adapter_type: &str,
+    adapter_type: AdapterType,
     package_name: &str,
     jinja_env: &JinjaEnv,
     base_ctx: &BTreeMap<String, minijinja::Value>,
@@ -115,13 +116,13 @@ pub fn resolve_unit_tests(
             package_name,
             mpe.relative_path.to_owned(),
             vec![unit_test.model.to_owned(), unit_test_name.to_owned()],
+            &package.dbt_project.all_source_paths(),
         );
 
-        let global_config =
-            local_project_config.get_config_for_path(&mpe.relative_path, package_name, &[]);
+        let global_config = local_project_config.get_config_for_fqn(&fqn);
         let mut project_config = root_project_configs
             .unit_tests
-            .get_config_for_path(&mpe.relative_path, package_name, &[])
+            .get_config_for_fqn(&fqn)
             .clone();
         project_config.default_to(global_config);
         let properties_config = if let Some(properties) = &unit_test.config {
@@ -194,14 +195,22 @@ pub fn resolve_unit_tests(
                             });
                         }
                         _ => {
-                            return err!(ErrorCode::Unexpected, "Invalid given input: {}", input);
+                            return err!(
+                                ErrorCode::Unexpected,
+                                "Invalid given input: {}",
+                                input.as_str()
+                            );
                         }
                     }
-                } else if input.eq("this") {
+                } else if input.as_str().eq("this") {
                     // this is handled at render time.
                     continue;
                 } else {
-                    return err!(ErrorCode::Unexpected, "Invalid given input: {}", input);
+                    return err!(
+                        ErrorCode::Unexpected,
+                        "Invalid given input: {}",
+                        input.as_str()
+                    );
                 }
             }
         }
@@ -283,6 +292,7 @@ pub fn resolve_unit_tests(
                 sources: dependent_sources,
                 enabled,
                 extended_model: false,
+                persist_docs: None,
                 quoting: package_quoting.try_into()?,
                 quoting_ignore_case: package_quoting.snowflake_ignore_case.unwrap_or(false),
                 materialized: DbtMaterialization::Unit,

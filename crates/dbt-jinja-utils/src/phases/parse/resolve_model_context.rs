@@ -14,6 +14,7 @@ use std::{
 use chrono::TimeZone;
 use chrono_tz::{Europe::London, Tz};
 use dbt_common::{
+    adapter::AdapterType,
     io_args::{IoArgs, StaticAnalysisKind},
     serde_utils::convert_yml_to_map,
 };
@@ -22,6 +23,7 @@ use dbt_fusion_adapter::{load_store::ResultStore, relation_object::create_relati
 use dbt_schemas::schemas::{
     DbtModelAttr, InternalDbtNode, IntrospectionKind,
     common::{Access, DbtMaterialization, ResolvedQuoting},
+    nodes::AdapterAttr,
     project::{DefaultTo, ModelConfig},
 };
 use dbt_schemas::{
@@ -62,7 +64,7 @@ impl Object for ParseExecute {
 #[allow(clippy::too_many_arguments)]
 pub fn build_resolve_model_context<T: DefaultTo<T> + 'static>(
     config: &T,
-    adapter_type: &str,
+    adapter_type: AdapterType,
     database: &str,
     schema: &str,
     model_name: &str,
@@ -79,7 +81,7 @@ pub fn build_resolve_model_context<T: DefaultTo<T> + 'static>(
     // Create a relation for 'this' using config values
     let mut context = BTreeMap::new();
     let this_relation = create_relation(
-        adapter_type.to_string(),
+        adapter_type,
         database.to_string(),
         schema.to_string(),
         Some(model_name.to_string()),
@@ -101,7 +103,7 @@ pub fn build_resolve_model_context<T: DefaultTo<T> + 'static>(
     let ref_function = ResolveRefFunction {
         database: database.to_string(),
         schema: schema.to_string(),
-        adapter_type: adapter_type.to_string(),
+        adapter_type,
         sql_resources: sql_resources_clone,
         runtime_config: runtime_config.clone(),
         package_quoting,
@@ -115,7 +117,7 @@ pub fn build_resolve_model_context<T: DefaultTo<T> + 'static>(
         database: database.to_string(),
         schema: schema.to_string(),
         sql_resources: sql_resources.clone(),
-        adapter_type: adapter_type.to_string(),
+        adapter_type,
         package_quoting,
     };
     let source_value = MinijinjaValue::from_object(source_function);
@@ -217,6 +219,7 @@ pub fn build_resolve_model_context<T: DefaultTo<T> + 'static>(
             static_analysis: StaticAnalysisKind::On,
             enabled: true,
             extended_model: false,
+            persist_docs: None,
             quoting: ResolvedQuoting::trues(),
             quoting_ignore_case: false,
             columns: BTreeMap::new(),
@@ -244,6 +247,7 @@ pub fn build_resolve_model_context<T: DefaultTo<T> + 'static>(
             contract: None,
             event_time: None,
         },
+        __adapter_attr__: AdapterAttr::default(),
         __other__: BTreeMap::new(),
         deprecated_config: ModelConfig::default(),
     };
@@ -338,7 +342,7 @@ fn init_batch_context() -> BTreeMap<String, MinijinjaValue> {
 struct ResolveRefFunction<T: DefaultTo<T> + 'static> {
     database: String,
     schema: String,
-    adapter_type: String,
+    adapter_type: AdapterType,
     sql_resources: Arc<Mutex<Vec<SqlResource<T>>>>,
     runtime_config: Arc<DbtRuntimeConfig>,
     package_quoting: DbtQuoting,
@@ -404,7 +408,7 @@ impl<T: DefaultTo<T>> Object for ResolveRefFunction<T> {
         )));
 
         let relation = create_relation(
-            self.adapter_type.clone(),
+            self.adapter_type,
             self.database.clone(),
             self.schema.clone(),
             Some(model_name),
@@ -424,7 +428,7 @@ impl<T: DefaultTo<T>> Object for ResolveRefFunction<T> {
 struct ResolveSourceFunction<T: DefaultTo<T>> {
     database: String,
     schema: String,
-    adapter_type: String,
+    adapter_type: AdapterType,
     sql_resources: Arc<Mutex<Vec<SqlResource<T>>>>,
     package_quoting: DbtQuoting,
 }
@@ -468,7 +472,7 @@ impl<T: DefaultTo<T>> Object for ResolveSourceFunction<T> {
 
             // At resolve time, fqn do not have to be accurate
             Ok(create_relation(
-                self.adapter_type.clone(),
+                self.adapter_type,
                 self.database.clone(),
                 self.schema.clone(),
                 Some(table_name),
@@ -665,7 +669,6 @@ mod test {
     use super::*;
     #[test]
     fn test_resolve_source_function_rendering() {
-        let adapter_type = "postgres".to_string();
         let sql_resources = Arc::new(Mutex::new(Vec::new()));
 
         // Create a minijinja environment to test rendering
@@ -675,7 +678,7 @@ mod test {
             database: "test_db".to_string(),
             schema: "test_schema".to_string(),
             sql_resources,
-            adapter_type,
+            adapter_type: AdapterType::Postgres,
             package_quoting: DEFAULT_DBT_QUOTING,
         };
         let source_value = MinijinjaValue::from_object(source_function);

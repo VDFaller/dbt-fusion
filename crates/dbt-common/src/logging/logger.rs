@@ -1,5 +1,5 @@
 use crate::FsResult;
-use crate::constants::EXECUTING;
+use crate::constants::{CACHE_LOG, DBT_DEAFULT_LOG_FILE_NAME, DBT_LOG_DIR_NAME, EXECUTING};
 use crate::io_args::IoArgs;
 use crate::pretty_string::remove_ansi_codes;
 use clap::ValueEnum;
@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use tracing_log::LogTracer;
 
 const QUERY_LOG_SQL: &str = "query_log.sql";
+const CACHE_LOG_FILE: &str = "beta_cache.log";
 
 /// Predicate to check if a key in a log [Record] is an internal logging key.
 /// These keys are used internally by the logger for e.g. progress bar control
@@ -39,12 +40,12 @@ struct LoggerConfig {
 pub enum LogFormat {
     Text,
     Json,
-    Fancy,
+    Default,
 }
 
 impl Default for LogFormat {
     fn default() -> Self {
-        Self::Text
+        Self::Default
     }
 }
 impl Display for LogFormat {
@@ -52,7 +53,7 @@ impl Display for LogFormat {
         match self {
             LogFormat::Text => write!(f, "text"),
             LogFormat::Json => write!(f, "json"),
-            LogFormat::Fancy => write!(f, "fancy"),
+            LogFormat::Default => write!(f, "default"),
         }
     }
 }
@@ -309,7 +310,7 @@ impl log::Log for Logger {
                     tracer.log(&record.to_builder().args(format_args!("{text}")).build());
                 }
                 _ => match self.config.format {
-                    LogFormat::Text | LogFormat::Fancy => {
+                    LogFormat::Text | LogFormat::Default => {
                         let mut text = record.args().to_string();
                         if self.remove_ansi_codes {
                             text = remove_ansi_codes(&text);
@@ -421,7 +422,7 @@ impl MultiLoggerBuilder {
         let stdout_logger = self.make_stdout_logger(log_config);
         let stderr_logger = self.make_stderr_logger(log_config);
 
-        if log_config.log_format == LogFormat::Fancy {
+        if log_config.log_format == LogFormat::Default {
             let mut fancy_logger =
                 super::term::FancyLogger::new(vec![stdout_logger, stderr_logger]);
             fancy_logger.start_ticker();
@@ -494,14 +495,17 @@ impl From<&IoArgs> for FsLogConfig {
             file_log_path: args
                 .log_path
                 .as_ref()
-                .map(|p| p.join("dbt.log"))
-                .unwrap_or_else(|| {
-                    if args.out_dir.starts_with(&args.in_dir) {
-                        args.in_dir.join("logs/dbt.log")
+                .map(|p| {
+                    if p.is_relative() {
+                        args.in_dir.join(p).join(DBT_DEAFULT_LOG_FILE_NAME)
                     } else {
-                        // This is because when we do test we do not want to modify in_dir
-                        args.out_dir.join("dbt.log")
+                        p.join(DBT_DEAFULT_LOG_FILE_NAME)
                     }
+                })
+                .unwrap_or_else(|| {
+                    args.in_dir
+                        .join(DBT_LOG_DIR_NAME)
+                        .join(DBT_DEAFULT_LOG_FILE_NAME)
                 }),
             file_log_level: args.log_level.unwrap_or(LevelFilter::Info), // default file log level
             file_log_format: args.log_format,
@@ -563,7 +567,7 @@ pub fn init_logger(log_config: FsLogConfig) -> FsResult<()> {
     // Create parent directories if they don't exist
     if let Some(parent) = log_config.file_log_path.parent() {
         std::fs::create_dir_all(parent)
-            .unwrap_or_else(|_| panic!("Failed to create log directory {parent:?}"));
+            .unwrap_or_else(|_| panic!("Failed to create log directory {parent:?}, do you have sufficient disk space or permissions?"));
     }
     let file = Arc::new(Mutex::new(Box::new(
         std::fs::OpenOptions::new()
@@ -571,7 +575,7 @@ pub fn init_logger(log_config: FsLogConfig) -> FsResult<()> {
             .truncate(true)
             .write(true)
             .open(&log_config.file_log_path)
-            .unwrap_or_else(|_| panic!("Failed to open log file {:?}", &log_config.file_log_path)),
+            .unwrap_or_else(|_| panic!("Failed to open log file {:?}, do you have sufficient disk space or permissions?", &log_config.file_log_path)),
     ) as Box<dyn Write + Send>));
     builder = builder.add_logger("file", file, file_config);
 
@@ -589,7 +593,7 @@ pub fn init_logger(log_config: FsLogConfig) -> FsResult<()> {
         .parent()
         .unwrap_or_else(|| {
             panic!(
-                "Failed to obtain parent from {:?}",
+                "Failed to obtain parent from {:?}, invalid log file path specified",
                 log_config.file_log_path
             )
         })
@@ -600,9 +604,38 @@ pub fn init_logger(log_config: FsLogConfig) -> FsResult<()> {
             .truncate(true)
             .write(true)
             .open(&query_log_path)
-            .unwrap_or_else(|_| panic!("Failed to open log file {query_log_path:?}")),
+            .unwrap_or_else(|_| panic!("Failed to open log file {query_log_path:?}, do you have sufficient disk space or permissions?")),
     ) as Box<dyn Write + Send>));
     builder = builder.add_logger("queries", file, query_file_config);
+
+    // Add logger for caching (relation cache)
+    let cache_log_config = LoggerConfig {
+        level_filter: LevelFilter::Debug,
+        format: LogFormat::Text,
+        min_level: None,
+        max_level: None,
+        includes: Some(vec![CACHE_LOG.to_string()]),
+        excludes: None,
+    };
+    let cache_log_path = log_config
+        .file_log_path
+        .parent()
+        .unwrap_or_else(|| {
+            panic!(
+                "Failed to obtain parent from {:?}",
+                log_config.file_log_path
+            )
+        })
+        .join(CACHE_LOG_FILE);
+    let file = Arc::new(Mutex::new(Box::new(
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&cache_log_path)
+            .unwrap_or_else(|_| panic!("Failed to open log file {cache_log_path:?}, does you have sufficient disk space or permissions?")),
+    ) as Box<dyn Write + Send>));
+    builder = builder.add_logger("cache_stats", file, cache_log_config);
 
     // Add tracing bridge logger
     builder = builder.add_tracing_bridge_logger(&log_config);

@@ -3,9 +3,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 
+use dbt_common::adapter::AdapterType;
 use dbt_common::{CodeLocation, ErrorCode, FsError, FsResult, err, fs_err};
 use dbt_frontend_common::Dialect;
-use dbt_serde_yaml::{JsonSchema, UntaggedEnumDeserialize, Verbatim};
+use dbt_serde_yaml::{JsonSchema, Spanned, UntaggedEnumDeserialize, Verbatim};
 use hex;
 use serde::{Deserialize, Deserializer, Serialize};
 // Type alias for clarity
@@ -15,6 +16,8 @@ use sha2::{Digest, Sha256};
 use strum::{Display, EnumIter, EnumString};
 
 use crate::dbt_types::RelationType;
+use crate::schemas::manifest::common::SourceFileMetadata;
+use crate::schemas::semantic_layer::semantic_manifest::SemanticLayerElementConfig;
 
 use super::serde::StringOrArrayOfStrings;
 #[derive(Default, Deserialize, Serialize, Debug, Clone, JsonSchema, PartialEq, Eq)]
@@ -204,6 +207,8 @@ pub enum DbtMaterialization {
     Analysis,
     /// only for databricks
     StreamingTable,
+    /// only for snowflake
+    DynamicTable,
     #[serde(untagged)]
     Unknown(String),
 }
@@ -222,6 +227,7 @@ impl FromStr for DbtMaterialization {
             "unit" => Ok(DbtMaterialization::Unit),
             "analysis" => Ok(DbtMaterialization::Analysis),
             "streaming_table" => Ok(DbtMaterialization::StreamingTable),
+            "dynamic_table" => Ok(DbtMaterialization::DynamicTable),
             other => Ok(DbtMaterialization::Unknown(other.to_string())),
         }
     }
@@ -244,6 +250,7 @@ impl std::fmt::Display for DbtMaterialization {
             DbtMaterialization::Ephemeral => "ephemeral",
             DbtMaterialization::Unit => "unit",
             DbtMaterialization::StreamingTable => "streaming_table",
+            DbtMaterialization::DynamicTable => "dynamic_table",
             DbtMaterialization::Analysis => "analysis",
             DbtMaterialization::Unknown(s) => s.as_str(),
         };
@@ -264,6 +271,7 @@ impl From<DbtMaterialization> for RelationType {
             DbtMaterialization::Incremental => RelationType::External, // TODO Validate this
             DbtMaterialization::Unit => RelationType::External, // TODO Validate this
             DbtMaterialization::StreamingTable => RelationType::StreamingTable,
+            DbtMaterialization::DynamicTable => RelationType::DynamicTable,
             DbtMaterialization::Analysis => RelationType::External, // TODO Validate this
             DbtMaterialization::Unknown(_) => RelationType::External, // TODO Validate this
         }
@@ -662,7 +670,7 @@ pub enum Formats {
 
 #[derive(Debug, Serialize, Default, Deserialize, Clone, JsonSchema)]
 pub struct Given {
-    pub input: String,
+    pub input: Spanned<String>,
     pub rows: Option<Rows>,
     #[serde(default)]
     pub format: Formats,
@@ -693,6 +701,13 @@ fn default_show() -> bool {
 pub struct PersistDocsConfig {
     pub columns: Option<bool>,
     pub relation: Option<bool>,
+}
+
+#[skip_serializing_none]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+pub struct ScheduleConfig {
+    pub cron: Option<String>,
+    pub time_zone_value: Option<String>,
 }
 
 #[derive(UntaggedEnumDeserialize, Serialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
@@ -769,8 +784,8 @@ pub struct Dimension {
     pub is_partition: bool,
     pub type_params: Option<DimensionTypeParams>,
     pub expr: Option<String>,
-    pub metadata: Option<YmlValue>,
-    pub config: Option<DimensionConfig>,
+    pub metadata: Option<SourceFileMetadata>,
+    pub config: Option<SemanticLayerElementConfig>,
 }
 fn default_false() -> bool {
     false
@@ -787,11 +802,6 @@ pub enum DimensionType {
 pub struct DimensionTypeParams {
     pub time_granularity: Option<TimeGranularity>,
     pub validity_params: Option<DimensionValidityParams>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-pub struct DimensionConfig {
-    pub meta: BTreeMap<String, YmlValue>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -876,12 +886,12 @@ pub struct NodeInfo {
 /// according to the dialect and quoting rules.
 pub fn normalize_quoting(
     quoting: &ResolvedQuoting,
-    adapter_type: &str,
+    adapter_type: AdapterType,
     database: &str,
     schema: &str,
     identifier: &str,
 ) -> (String, String, String, ResolvedQuoting) {
-    let dialect = Dialect::from_str(adapter_type).unwrap_or_default();
+    let dialect: Dialect = Dialect::from(adapter_type);
     let (database, database_quoting) = _normalize_quote(quoting.database, &dialect, database);
     let (schema, schema_quoting) = _normalize_quote(quoting.schema, &dialect, schema);
     let (identifier, identifier_quoting) =
@@ -898,8 +908,8 @@ pub fn normalize_quoting(
     )
 }
 
-pub fn normalize_quote(quoting: bool, adapter_type: &str, name: &str) -> (String, bool) {
-    let dialect: Dialect = Dialect::from_str(adapter_type).unwrap_or_default();
+pub fn normalize_quote(quoting: bool, adapter_type: AdapterType, name: &str) -> (String, bool) {
+    let dialect: Dialect = Dialect::from(adapter_type);
     _normalize_quote(quoting, &dialect, name)
 }
 
@@ -938,14 +948,19 @@ pub fn merge_tags(
     base_tags: Option<Vec<String>>,
     update_tags: Option<Vec<String>>,
 ) -> Option<Vec<String>> {
-    let mut all_tags = base_tags.unwrap_or_default();
-    all_tags.extend(update_tags.unwrap_or_default());
-    if !all_tags.is_empty() {
-        all_tags.sort();
-        all_tags.dedup();
-        Some(all_tags)
-    } else {
-        None
+    match (base_tags, update_tags) {
+        // If both are None, result is None
+        (None, None) => None,
+        // If either has a value (even empty), we preserve that semantic meaning
+        (Some(mut base), Some(update)) => {
+            base.extend(update);
+            base.sort();
+            base.dedup();
+            Some(base)
+        }
+        // If only one side has a value, use it
+        (Some(base), None) => Some(base),
+        (None, Some(update)) => Some(update),
     }
 }
 
@@ -955,87 +970,99 @@ mod tests {
 
     #[test]
     fn test_get_semantic_name_snowflake_simple() {
-        helper("snowflake", false, "xyz", false, "xyz");
+        helper(AdapterType::Snowflake, false, "xyz", false, "xyz");
     }
 
     #[test]
     fn test_get_semantic_name_snowflake_quoted_identifier() {
-        helper("snowflake", false, r#""xyz""#, true, "xyz");
+        helper(AdapterType::Snowflake, false, r#""xyz""#, true, "xyz");
     }
 
     #[test]
     fn test_get_semantic_name_snowflake_quoting() {
-        helper("snowflake", true, "xyz", true, "xyz");
+        helper(AdapterType::Snowflake, true, "xyz", true, "xyz");
     }
     #[test]
     fn test_get_semantic_name_snowflake_quoted_identifier_with_quoting() {
-        helper("snowflake", true, r#""xyz""#, true, r#""xyz""#);
+        helper(AdapterType::Snowflake, true, r#""xyz""#, true, r#""xyz""#);
     }
 
     #[test]
     fn test_get_semantic_name_snowflake_non_identifier() {
         // This will fail because `z.3` should be quoted, but this is a user error
-        helper("snowflake", false, "z.3", false, "z.3");
+        helper(AdapterType::Snowflake, false, "z.3", false, "z.3");
     }
 
     #[test]
     fn test_get_semantic_name_snowflake_reserved() {
         // This will fail because `group` is a reserved keyword, but this is a user error
-        helper("snowflake", false, "group", false, "group");
+        helper(AdapterType::Snowflake, false, "group", false, "group");
     }
 
     #[test]
     fn test_get_semantic_name_snowflake_quoted_reserved() {
-        helper("snowflake", false, r#""GROUP""#, true, "GROUP");
+        helper(AdapterType::Snowflake, false, r#""GROUP""#, true, "GROUP");
     }
 
     #[test]
     fn test_get_semantic_name_snowflake_quoted_reserved_with_quoting() {
-        helper("snowflake", true, r#""GROUP""#, true, r#""GROUP""#);
+        helper(
+            AdapterType::Snowflake,
+            true,
+            r#""GROUP""#,
+            true,
+            r#""GROUP""#,
+        );
     }
 
     #[test]
     fn test_get_semantic_name_postgres_simple() {
-        helper("postgres", false, "xyz", false, "xyz");
+        helper(AdapterType::Postgres, false, "xyz", false, "xyz");
     }
 
     #[test]
     fn test_get_semantic_name_postgres_quoted_identifier() {
-        helper("postgres", false, r#""xyz""#, true, "xyz");
+        helper(AdapterType::Postgres, false, r#""xyz""#, true, "xyz");
     }
 
     #[test]
     fn test_get_semantic_name_postgres_quoting() {
-        helper("postgres", true, "xyz", true, "xyz");
+        helper(AdapterType::Postgres, true, "xyz", true, "xyz");
     }
     #[test]
     fn test_get_semantic_name_postgres_quoted_identifier_with_quoting() {
-        helper("postgres", true, r#""xyz""#, true, r#""xyz""#);
+        helper(AdapterType::Postgres, true, r#""xyz""#, true, r#""xyz""#);
     }
 
     #[test]
     fn test_get_semantic_name_postgres_non_identifier() {
         // This will fail because `z.3` should be quoted, but this is a user error
-        helper("postgres", false, "z.3", false, "z.3");
+        helper(AdapterType::Postgres, false, "z.3", false, "z.3");
     }
 
     #[test]
     fn test_get_semantic_name_postgres_reserved() {
         // This will fail because `group` is a reserved keyword, but this is a user error
-        helper("postgres", false, "group", false, "group");
+        helper(AdapterType::Postgres, false, "group", false, "group");
     }
 
     #[test]
     fn test_get_semantic_name_postgres_quoted_reserved() {
-        helper("postgres", false, r#""GROUP""#, true, "GROUP");
+        helper(AdapterType::Postgres, false, r#""GROUP""#, true, "GROUP");
     }
 
     #[test]
     fn test_get_semantic_name_postgres_quoted_reserved_with_quoting() {
-        helper("postgres", true, r#""GROUP""#, true, r#""GROUP""#);
+        helper(
+            AdapterType::Postgres,
+            true,
+            r#""GROUP""#,
+            true,
+            r#""GROUP""#,
+        );
     }
     fn helper(
-        adapter_type: &str,
+        adapter_type: AdapterType,
         quoting: bool,
         identifier: &str,
         expected_quoting: bool,

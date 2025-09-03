@@ -31,6 +31,7 @@ pub const DBT_TARGET_DIR_NAME: &str = "target";
 pub const DBT_PACKAGES_DIR_NAME: &str = "dbt_packages";
 pub const DBT_INTERNAL_PACKAGES_DIR_NAME: &str = "dbt_internal_packages";
 pub const DBT_MANIFEST_JSON: &str = "manifest.json";
+pub const DBT_SEMANTIC_MANIFEST_JSON: &str = "semantic_manifest.json";
 pub const DBT_CATALOG_JSON: &str = "catalog.json";
 pub const DBT_COMPILED_DIR_NAME: &str = "compiled";
 pub const DBT_METADATA_DIR_NAME: &str = "metadata";
@@ -40,6 +41,7 @@ pub const DBT_CTE_PREFIX: &str = "__dbt__cte__";
 pub const DBT_RUN_DIR_NAME: &str = "run";
 pub const DBT_DB_DIR_NAME: &str = "db";
 pub const DBT_LOG_DIR_NAME: &str = "logs";
+pub const DBT_DEAFULT_LOG_FILE_NAME: &str = "dbt.log";
 pub const DBT_ROOT_PACKAGE_VAR_PREFIX: &str = "__root__";
 pub const DBT_GENERIC_TESTS_DIR_NAME: &str = "generic_tests";
 pub const DBT_SNAPSHOTS_DIR_NAME: &str = "snapshots";
@@ -89,16 +91,17 @@ pub const SEEDING: &str = "   Seeding";
 pub const HYDRATING: &str = "  Hydrating";
 pub const TESTING: &str = "   Testing";
 pub const RUNNING: &str = "   Running";
+pub const DEFERRING: &str = "Deferring State";
 pub const WAITING: &str = "   Waiting";
 pub const CLONING: &str = "   Cloning";
 pub const ABORTED: &str = "   Aborted";
-pub const SUCCESS: &str = "   Success";
-pub const PASS: &str = "      Pass";
-pub const WARN: &str = "      Warn";
+pub const SUCCEEDED: &str = " Succeeded";
+pub const PASSED: &str = "    Passed";
+pub const WARNED: &str = "    Warned";
 pub const FAILED: &str = "    Failed";
-pub const REUSING: &str = "   Reusing";
+pub const REUSED: &str = "    Reused";
 pub const STALE: &str = "     Stale";
-pub const SKIPPING: &str = "  Skipping";
+pub const SKIPPED: &str = "   Skipped";
 pub const ANALYZED: &str = "  Analyzed";
 pub const RENDERED: &str = "  Rendered";
 pub const FRESHNESS: &str = " Freshness";
@@ -118,6 +121,7 @@ pub const NOOP: &str = "noop";
 
 // log targets
 pub const EXECUTING: &str = " ExecutingSql";
+pub const CACHE_LOG: &str = "CacheLogging";
 
 // cas/node read/write
 
@@ -128,3 +132,5 @@ pub const NODES_WR: &str = "   Writing";
 pub const COLUMNS_RD: &str = "   Reading";
 pub const COLUMNS_WR: &str = "   Writing";
 pub const COLUMN_LINEAGE_WR: &str = "   Writing";
+
+pub const DBT_CDN_URL: &str = "https://public.cdn.getdbt.com/fs";

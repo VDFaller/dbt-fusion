@@ -23,6 +23,7 @@ use fs_deps::utils::get_local_package_full_path;
 use serde::{Serialize, de::DeserializeOwned};
 use std::{fs::metadata, io, time::SystemTime};
 
+use ignore::gitignore::Gitignore;
 use walkdir::WalkDir;
 
 // ------------------------------------------------------------------------------------------------
@@ -32,6 +33,7 @@ pub fn collect_file_info<P: AsRef<Path>>(
     base_path: P,
     relative_paths: &[String],
     info_paths: &mut Vec<(PathBuf, SystemTime)>,
+    dbtignore: Option<&Gitignore>,
 ) -> io::Result<()> {
     if !base_path.as_ref().exists() {
         return Ok(());
@@ -41,9 +43,34 @@ pub fn collect_file_info<P: AsRef<Path>>(
         if !full_path.exists() {
             continue;
         }
-        for entry in WalkDir::new(full_path) {
-            let entry = entry?;
+        // Configure WalkDir to respect gitignore patterns at the directory level
+        let walker = WalkDir::new(full_path);
+
+        // Process files as normal, but use a filter function to skip directories that match gitignore
+        for entry_result in walker.into_iter().filter_entry(|e| {
+            // If there's no gitignore or if this is not a directory, always process it
+            if dbtignore.is_none() || !e.file_type().is_dir() {
+                return true;
+            }
+
+            // For directories, check if they should be included
+            let rel_path = e
+                .path()
+                .strip_prefix(base_path.as_ref())
+                .unwrap_or(e.path());
+            !dbtignore.unwrap().matched(rel_path, true).is_ignore()
+        }) {
+            let entry = entry_result?;
             if entry.file_type().is_file() {
+                // Check if this file should be ignored by .dbtignore
+                if let Some(gitignore) = dbtignore {
+                    let path = entry.path();
+                    let relative_to_base = path.strip_prefix(base_path.as_ref()).unwrap_or(path);
+                    let is_dir = entry.file_type().is_dir();
+                    if gitignore.matched(relative_to_base, is_dir).is_ignore() {
+                        continue; // Skip this file as it's ignored
+                    }
+                }
                 let metadata = metadata(entry.path())?;
                 let modified_time = metadata.modified()?;
                 info_paths.push((entry.path().to_path_buf(), modified_time));
@@ -66,15 +93,6 @@ pub fn indent(data: &str, spaces: usize) -> String {
 // ------------------------------------------------------------------------------------------------
 // stupid other helpers:
 
-pub fn coalesce<T: Clone>(values: &[&Option<T>]) -> Option<T> {
-    for value in values {
-        if value.is_some() {
-            return value.to_owned().to_owned();
-        }
-    }
-    None
-}
-
 pub fn get_db_config(
     _io_args: &IoArgs,
     db_targets: DbTargets,
@@ -82,12 +100,12 @@ pub fn get_db_config(
 ) -> FsResult<DbConfig> {
     let target_name = maybe_target.unwrap_or(db_targets.default_target.clone());
     // 6. Find the desired target
-    let db_config = db_targets.outputs.get(&target_name).ok_or(fs_err!(
+    let db_config_yml = db_targets.outputs.get(&target_name).ok_or(fs_err!(
         ErrorCode::InvalidConfig,
         "Could not find target {} in profiles.yml",
         target_name,
     ))?;
-    let db_config: DbConfig = dbt_serde_yaml::from_value(db_config.clone()).map_err(|e| {
+    let db_config: DbConfig = dbt_serde_yaml::from_value(db_config_yml.clone()).map_err(|e| {
         fs_err!(
             ErrorCode::InvalidConfig,
             "Failed to parse profiles.yml: {}",
@@ -116,7 +134,7 @@ pub fn get_db_config(
 
 pub fn read_profiles_and_extract_db_config<S: Serialize>(
     io_args: &IoArgs,
-    dbt_target_override: &Option<String>,
+    target_override: &Option<String>,
     jinja_env: &JinjaEnv,
     ctx: &S,
     profile_str: &str,
@@ -141,7 +159,7 @@ pub fn read_profiles_and_extract_db_config<S: Serialize>(
         ))?;
 
     // if dbt_target_override is None, render the target name in case the user uses an an env_var jinja expression here
-    let rendered_target = if let Some(dbt_target_override) = dbt_target_override {
+    let rendered_target = if let Some(dbt_target_override) = target_override {
         dbt_target_override.clone()
     } else {
         profile_val
