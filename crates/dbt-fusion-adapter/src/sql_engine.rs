@@ -2,13 +2,16 @@ use crate::TrackedStatement;
 use crate::auth::Auth;
 use crate::config::AdapterConfig;
 use crate::errors::{AdapterError, AdapterErrorKind, AdapterResult};
+use crate::stmt_splitter::StmtSplitter;
 
+use adbc_core::options::{OptionStatement, OptionValue};
 use arrow::array::RecordBatch;
 use arrow::compute::concat_batches;
 use arrow_schema::Schema;
 use core::result::Result;
 use dbt_common::cancellation::{Cancellable, CancellationToken};
 use dbt_common::constants::EXECUTING;
+use dbt_frontend_common::dialect::Dialect;
 use dbt_xdbc::semaphore::Semaphore;
 use dbt_xdbc::{Backend, Connection, Database, QueryCtx, connection, database, driver};
 use log;
@@ -25,6 +28,8 @@ use std::sync::RwLock;
 use std::{thread, time::Duration};
 
 use super::record_and_replay::{RecordEngine, ReplayEngine};
+
+type Options = Vec<(String, OptionValue)>;
 
 #[derive(Default)]
 struct IdentityHasher {
@@ -76,10 +81,17 @@ pub struct ActualEngine {
     semaphore: Arc<Semaphore>,
     /// Global CLI cancellation token
     cancellation_token: CancellationToken,
+    /// Statement splitter
+    splitter: Arc<dyn StmtSplitter>,
 }
 
 impl ActualEngine {
-    pub fn new(auth: Arc<dyn Auth>, config: AdapterConfig, token: CancellationToken) -> Self {
+    pub fn new(
+        auth: Arc<dyn Auth>,
+        config: AdapterConfig,
+        token: CancellationToken,
+        splitter: Arc<dyn StmtSplitter>,
+    ) -> Self {
         let threads = config
             .get("threads")
             .and_then(|t| {
@@ -97,6 +109,7 @@ impl ActualEngine {
             configured_databases: RwLock::new(DatabaseMap::default()),
             semaphore: Arc::new(Semaphore::new(permits)),
             cancellation_token: token,
+            splitter,
         }
     }
 
@@ -176,8 +189,13 @@ pub enum SqlEngine {
 
 impl SqlEngine {
     /// Create a new [`SqlEngine::Warehouse`] based on the given configuration.
-    pub fn new(auth: Arc<dyn Auth>, config: AdapterConfig, token: CancellationToken) -> Arc<Self> {
-        let engine = ActualEngine::new(auth, config, token);
+    pub fn new(
+        auth: Arc<dyn Auth>,
+        config: AdapterConfig,
+        token: CancellationToken,
+        splitter: Arc<dyn StmtSplitter>,
+    ) -> Arc<Self> {
+        let engine = ActualEngine::new(auth, config, token, splitter);
         Arc::new(SqlEngine::Warehouse(Arc::new(engine)))
     }
 
@@ -187,8 +205,9 @@ impl SqlEngine {
         path: PathBuf,
         config: AdapterConfig,
         token: CancellationToken,
+        splitter: Arc<dyn StmtSplitter>,
     ) -> Arc<Self> {
-        let engine = ReplayEngine::new(backend, path, config, token);
+        let engine = ReplayEngine::new(backend, path, config, token, splitter);
         Arc::new(SqlEngine::Replay(engine))
     }
 
@@ -196,6 +215,25 @@ impl SqlEngine {
     pub fn new_for_recording(path: PathBuf, engine: Arc<SqlEngine>) -> Arc<Self> {
         let engine = RecordEngine::new(path, engine);
         Arc::new(SqlEngine::Record(engine))
+    }
+
+    /// Get the statement splitter for this engine
+    pub fn splitter(&self) -> Arc<dyn StmtSplitter> {
+        match self {
+            SqlEngine::Warehouse(engine) => engine.splitter.clone(),
+            SqlEngine::Record(engine) => engine.splitter(),
+            SqlEngine::Replay(engine) => engine.splitter(),
+        }
+    }
+
+    /// Split SQL statements using the provided dialect
+    ///
+    /// This method handles the splitting of SQL statements based on the dialect's rules.
+    /// The dialect must be provided by the caller since the mapping from Backend to
+    /// AdapterType/Dialect is not always deterministic (e.g., Generic backend,
+    /// shared drivers like Postgres/Redshift).
+    pub fn split_statements(&self, sql: &str, dialect: Dialect) -> Vec<String> {
+        self.splitter().split(sql, dialect)
     }
 
     /// Create a new connection to the warehouse.
@@ -235,7 +273,7 @@ impl SqlEngine {
         conn: &'_ mut dyn Connection,
         query_ctx: &QueryCtx,
     ) -> AdapterResult<RecordBatch> {
-        self.execute_with_options(query_ctx, conn, &HashMap::new())
+        self.execute_with_options(query_ctx, conn, Options::new())
     }
 
     /// Execute the given SQL query or statement.
@@ -243,10 +281,10 @@ impl SqlEngine {
         &self,
         query_ctx: &QueryCtx,
         conn: &'_ mut dyn Connection,
-        options: &HashMap<String, String>,
+        options: Options,
     ) -> AdapterResult<RecordBatch> {
         assert!(query_ctx.sql().is_some() || !options.is_empty());
-        log_query(query_ctx);
+        Self::log_query_ctx_for_execution(query_ctx);
 
         let token = self.cancellation_token();
         let do_execute = |conn: &'_ mut dyn Connection| -> Result<
@@ -258,12 +296,9 @@ impl SqlEngine {
             let mut stmt = conn.new_statement()?;
             stmt.set_sql_query(query_ctx)?;
 
-            for (key, value) in options {
-                stmt.set_option(
-                    adbc_core::options::OptionStatement::Other(key.clone()),
-                    adbc_core::options::OptionValue::String(value.clone()),
-                )?;
-            }
+            options
+                .into_iter()
+                .try_for_each(|(key, value)| stmt.set_option(OptionStatement::Other(key), value))?;
 
             // Make sure we don't create more statements after global cancellation.
             token.check_cancellation()?;
@@ -298,6 +333,38 @@ impl SqlEngine {
         };
         let total_batch = concat_batches(&schema, &batches)?;
         Ok(total_batch)
+    }
+
+    /// Format query context as we want to see it in a log file and log it in query_log
+    pub fn log_query_ctx_for_execution(ctx: &QueryCtx) {
+        let mut buf = String::new();
+
+        writeln!(&mut buf, "-- created_at: {}", ctx.created_at_as_str()).unwrap();
+        writeln!(&mut buf, "-- dialect: {}", ctx.adapter_type()).unwrap();
+
+        let node_id = match ctx.node_id() {
+            Some(id) => id,
+            None => "not available".to_string(),
+        };
+        writeln!(&mut buf, "-- node_id: {node_id}").unwrap();
+
+        match ctx.desc() {
+            Some(desc) => writeln!(&mut buf, "-- desc: {desc}").unwrap(),
+            None => writeln!(&mut buf, "-- desc: not provided").unwrap(),
+        }
+
+        if let Some(sql) = ctx.sql() {
+            write!(&mut buf, "{sql}").unwrap();
+            if !sql.ends_with(";") {
+                write!(&mut buf, ";").unwrap();
+            }
+        }
+
+        if node_id != "not available" {
+            log::debug!(target: EXECUTING, name = "SQLQuery", data:serde = json!({ "node_info": { "unique_id": node_id } }); "{buf}");
+        } else {
+            log::debug!(target: EXECUTING, name = "SQLQuery"; "{buf}");
+        }
     }
 
     /// Get the configured database name. Used by
@@ -336,11 +403,17 @@ pub fn execute_query_with_retry(
     conn: &'_ mut dyn Connection,
     query_ctx: &QueryCtx,
     retry_limit: u32,
+    options: &HashMap<String, String>,
 ) -> AdapterResult<RecordBatch> {
     let mut attempt = 0;
     let mut last_error = None;
+
+    let options = options
+        .iter()
+        .map(|(key, value)| (key.clone(), OptionValue::String(value.clone())))
+        .collect::<Options>();
     while attempt < retry_limit {
-        match engine.execute(conn, query_ctx) {
+        match engine.execute_with_options(query_ctx, conn, options.clone()) {
             Ok(result) => return Ok(result),
             Err(err) => {
                 last_error = Some(err.clone());
@@ -357,34 +430,20 @@ pub fn execute_query_with_retry(
     }
 }
 
-/// Format query context as we want to see it in a log file.
-fn log_query(query_ctx: &QueryCtx) {
-    let mut buf = String::new();
+#[cfg(test)]
+mod tests {
+    use dbt_xdbc::QueryCtx;
 
-    writeln!(&mut buf, "-- created_at: {}", query_ctx.created_at_as_str()).unwrap();
-    writeln!(&mut buf, "-- dialect: {}", query_ctx.adapter_type()).unwrap();
+    use super::SqlEngine;
 
-    let node_id = match query_ctx.node_id() {
-        Some(id) => id,
-        None => "not available".to_string(),
-    };
-    writeln!(&mut buf, "-- node_id: {node_id}").unwrap();
+    #[test]
+    fn test_log_for_execution() {
+        let query_ctx = QueryCtx::new("test_adapter")
+            .with_node_id("test_node_123")
+            .with_sql("SELECT * FROM test_table")
+            .with_desc("Test query for logging");
 
-    match query_ctx.desc() {
-        Some(desc) => writeln!(&mut buf, "-- desc: {desc}").unwrap(),
-        None => writeln!(&mut buf, "-- desc: not provided").unwrap(),
-    }
-
-    if let Some(sql) = query_ctx.sql() {
-        write!(&mut buf, "{sql}").unwrap();
-        if !sql.ends_with(";") {
-            write!(&mut buf, ";").unwrap();
-        }
-    }
-
-    if node_id != "not available" {
-        log::debug!(target: EXECUTING, name = "SQLQuery", data:serde = json!({ "node_info": { "unique_id": node_id } }); "{buf}");
-    } else {
-        log::debug!(target: EXECUTING, name = "SQLQuery"; "{buf}");
+        // Should not panic
+        SqlEngine::log_query_ctx_for_execution(&query_ctx);
     }
 }

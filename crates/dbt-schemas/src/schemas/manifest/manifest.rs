@@ -13,10 +13,16 @@ use crate::{
         CommonAttributes, DbtModel, DbtModelAttr, DbtSeed, DbtSnapshot, DbtSource, DbtTest,
         DbtUnitTest, DbtUnitTestAttr, IntrospectionKind, NodeBaseAttributes, Nodes,
         common::{DbtChecksum, DbtMaterialization, DbtQuoting, NodeDependsOn},
-        manifest::manifest_nodes::{
-            ManifestDataTest, ManifestModel, ManifestOperation, ManifestSeed, ManifestSnapshot,
+        manifest::{
+            manifest_nodes::{
+                ManifestDataTest, ManifestModel, ManifestOperation, ManifestSeed, ManifestSnapshot,
+            },
+            saved_query::DbtSavedQueryAttr,
         },
-        nodes::{AdapterAttr, DbtSeedAttr, DbtSnapshotAttr, DbtSourceAttr, DbtTestAttr},
+        nodes::{
+            AdapterAttr, DbtGroup, DbtGroupAttr, DbtSeedAttr, DbtSnapshotAttr, DbtSourceAttr,
+            DbtTestAttr,
+        },
     },
     state::ResolverState,
 };
@@ -94,7 +100,7 @@ pub fn serialize_with_resource_type(mut value: YmlValue, resource_type: &str) ->
 
 pub fn build_manifest(invocation_id: &str, resolver_state: &ResolverState) -> DbtManifest {
     let (parent_map, child_map) = build_parent_and_child_maps(&resolver_state.nodes);
-
+    let group_map = build_group_map(&resolver_state.nodes);
     DbtManifest {
         metadata: ManifestMetadata {
             __base__: BaseMetadata {
@@ -170,10 +176,14 @@ pub fn build_manifest(invocation_id: &str, resolver_state: &ResolverState) -> Db
             .iter()
             .map(|(id, exposure)| (id.clone(), (**exposure).clone().into()))
             .collect(),
-        // TODO: map from resolver_state.nodes after they are implemented
-        semantic_models: BTreeMap::new(),
-        metrics: BTreeMap::new(),
-        saved_queries: BTreeMap::new(),
+        semantic_models: BTreeMap::new(), // TODO: map from resolver_state.nodes
+        metrics: BTreeMap::new(),         // TODO: map from resolver_state.nodes
+        saved_queries: resolver_state
+            .nodes
+            .saved_queries
+            .iter()
+            .map(|(id, saved_query)| (id.clone(), (**saved_query).clone().into()))
+            .collect(),
         unit_tests: resolver_state
             .nodes
             .unit_tests
@@ -181,11 +191,44 @@ pub fn build_manifest(invocation_id: &str, resolver_state: &ResolverState) -> Db
             .map(|(id, unit_test)| (id.clone(), (**unit_test).clone().into()))
             .collect(),
         macros: resolver_state.macros.macros.clone(),
+        groups: resolver_state
+            .nodes
+            .groups
+            .iter()
+            .map(|(id, group)| (id.clone(), (**group).clone().into()))
+            .collect(),
         docs: resolver_state.macros.docs_macros.clone(),
         parent_map,
         child_map,
+        group_map,
         ..Default::default()
     }
+}
+
+// Build map of group names to nodes in the group
+fn build_group_map(nodes: &Nodes) -> BTreeMap<String, Vec<String>> {
+    let mut group_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (id, model) in &nodes.models {
+        if let Some(group) = &model.__model_attr__.group {
+            group_map.entry(group.clone()).or_default().push(id.clone());
+        }
+    }
+    for (id, semantic_model) in &nodes.semantic_models {
+        if let Some(group) = &semantic_model.__semantic_model_attr__.group {
+            group_map.entry(group.clone()).or_default().push(id.clone());
+        }
+    }
+    for (id, metric) in &nodes.metrics {
+        if let Some(group) = &metric.__metric_attr__.group {
+            group_map.entry(group.clone()).or_default().push(id.clone());
+        }
+    }
+    for (id, saved_query) in &nodes.saved_queries {
+        if let Some(group) = &saved_query.__saved_query_attr__.group {
+            group_map.entry(group.clone()).or_default().push(id.clone());
+        }
+    }
+    group_map
 }
 
 /// Build parent and child dependency maps from the nodes.
@@ -362,6 +405,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                 nodes.tests.insert(
                     unique_id,
                     Arc::new(DbtTest {
+                        defined_at: None,
                         __common_attr__: CommonAttributes {
                             unique_id: test.__common_attr__.unique_id,
                             name: test.__common_attr__.name,
@@ -809,10 +853,95 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
             }),
         );
     }
+    for (_unique_id, _semantic_model) in manifest.semantic_models {
+        // TODO: insert DbtSemanticModel into node.semantic_models
+    }
     for (_unique_id, _metric) in manifest.metrics {
         // TODO: insert DbtMetric into node.metrics
     }
-
+    for (unique_id, saved_query) in manifest.saved_queries {
+        nodes.saved_queries.insert(
+            unique_id,
+            Arc::new(crate::schemas::manifest::DbtSavedQuery {
+                __common_attr__: CommonAttributes {
+                    unique_id: saved_query.__common_attr__.unique_id,
+                    name: saved_query.__common_attr__.name,
+                    package_name: saved_query.__common_attr__.package_name,
+                    path: saved_query.__common_attr__.path,
+                    original_file_path: saved_query.__common_attr__.original_file_path,
+                    patch_path: None, // TODO: Add to ManifestSavedQueryCommonAttributes if needed
+                    fqn: saved_query.__common_attr__.fqn,
+                    description: saved_query.__common_attr__.description,
+                    raw_code: None,
+                    checksum: DbtChecksum::default(),
+                    name_span: Span::default(),
+                    language: None,
+                    tags: saved_query
+                        .config
+                        .tags
+                        .clone()
+                        .map(|tags| tags.into())
+                        .unwrap_or_default(),
+                    meta: saved_query.config.meta.clone().unwrap_or_default(),
+                },
+                __saved_query_attr__: DbtSavedQueryAttr {
+                    query_params: saved_query.query_params,
+                    exports: saved_query.exports,
+                    label: saved_query.label,
+                    metadata: saved_query.metadata,
+                    unrendered_config: saved_query.__base_attr__.unrendered_config,
+                    depends_on: saved_query.__base_attr__.depends_on,
+                    refs: saved_query.__base_attr__.refs,
+                    created_at: saved_query.__base_attr__.created_at,
+                    group: saved_query.group,
+                },
+                deprecated_config: saved_query.config,
+                __other__: saved_query.__other__,
+            }),
+        );
+    }
+    for (unique_id, group) in manifest.groups {
+        nodes.groups.insert(
+            unique_id.clone(),
+            Arc::new(DbtGroup {
+                __common_attr__: CommonAttributes {
+                    name: group.name.to_string(),
+                    package_name: group.package_name.to_string(),
+                    path: group.path.clone(),
+                    name_span: Span::default(),
+                    original_file_path: group.original_file_path.clone(),
+                    unique_id: unique_id.clone(),
+                    fqn: vec![],
+                    description: Some(group.description.unwrap_or_default()),
+                    patch_path: None,
+                    checksum: Default::default(),
+                    language: None,
+                    raw_code: None,
+                    tags: vec![],
+                    meta: BTreeMap::new(),
+                },
+                __base_attr__: NodeBaseAttributes {
+                    database: "".to_string(),
+                    schema: "".to_string(),
+                    alias: "".to_string(),
+                    relation_name: None,
+                    quoting: Default::default(),
+                    materialized: Default::default(),
+                    static_analysis: Default::default(),
+                    enabled: true,
+                    extended_model: false,
+                    persist_docs: None,
+                    columns: BTreeMap::new(),
+                    depends_on: NodeDependsOn::default(),
+                    quoting_ignore_case: false,
+                    refs: vec![],
+                    sources: vec![],
+                    metrics: vec![],
+                },
+                __group_attr__: DbtGroupAttr { owner: group.owner },
+            }),
+        );
+    }
     nodes
 }
 
@@ -833,8 +962,10 @@ mod tests {
             exposures: BTreeMap::new(),
             sources: BTreeMap::new(),
             unit_tests: BTreeMap::new(),
-            metrics: BTreeMap::new(),
             semantic_models: BTreeMap::new(),
+            metrics: BTreeMap::new(),
+            saved_queries: BTreeMap::new(),
+            groups: BTreeMap::new(),
         }
     }
 

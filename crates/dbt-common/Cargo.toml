@@ -26,6 +26,7 @@ counter = { workspace = true }
 dialoguer = { workspace = true }
 int-enum = { workspace = true }
 itertools = { workspace = true }
+rand = { workspace = true }
 regex = { workspace = true }
 unicode-segmentation = { version = "1.12" }
 uuid = { workspace = true }
@@ -65,6 +66,7 @@ tracing-log = { workspace = true } # temporary until we migrate to tracing exclu
 tracing-subscriber = { workspace = true }
 
 # Embedded OTLP exporter for traces
+dbt-fusion-workspace-hack = { version = "0.1" }
 opentelemetry = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 opentelemetry-semantic-conventions = { workspace = true }
@@ -75,6 +77,7 @@ dunce = "1.0.5"
 powershell_script = "1.1.0"
 
 [dev-dependencies]
+bytes = { workspace = true }
 indoc = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 

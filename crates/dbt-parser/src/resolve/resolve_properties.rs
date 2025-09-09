@@ -41,6 +41,8 @@ pub struct MinimalProperties {
     pub unit_tests: BTreeMap<String, MinimalPropertiesEntry>,
     pub tests: BTreeMap<String, MinimalPropertiesEntry>,
     pub exposures: BTreeMap<String, MinimalPropertiesEntry>,
+    pub saved_queries: BTreeMap<String, MinimalPropertiesEntry>,
+    pub groups: BTreeMap<String, MinimalPropertiesEntry>,
 }
 
 // impl try extend from MinimalResolvedProperties
@@ -261,6 +263,37 @@ impl MinimalProperties {
                 );
             }
         }
+        if let Some(saved_queries) = other.saved_queries {
+            for saved_query_value in saved_queries {
+                let saved_query = into_typed_with_jinja::<MinimalSchemaValue, _>(
+                    io_args,
+                    saved_query_value.clone(),
+                    false,
+                    jinja_env,
+                    base_ctx,
+                    &[],
+                    dependency_package_name_from_ctx(jinja_env, base_ctx),
+                )?;
+                if let Some(existing_saved_query) = self.saved_queries.get_mut(&saved_query.name) {
+                    existing_saved_query
+                        .duplicate_paths
+                        .push(properties_path.to_path_buf());
+                } else {
+                    self.saved_queries.insert(
+                        saved_query.name.clone(),
+                        MinimalPropertiesEntry {
+                            name: validate_resource_name(&saved_query.name)?,
+                            name_span: Span::default(),
+                            relative_path: properties_path.to_path_buf(),
+                            schema_value: saved_query_value,
+                            table_value: None,
+                            version_info: None,
+                            duplicate_paths: vec![],
+                        },
+                    );
+                }
+            }
+        }
         if let Some(unit_tests) = other.unit_tests {
             for unit_test_value in unit_tests {
                 let unit_test = into_typed_with_jinja::<MinimalSchemaValue, _>(
@@ -346,6 +379,37 @@ impl MinimalProperties {
                             name_span: Span::default(),
                             relative_path: properties_path.to_path_buf(),
                             schema_value: test_value,
+                            table_value: None,
+                            version_info: None,
+                            duplicate_paths: vec![],
+                        },
+                    );
+                }
+            }
+        }
+        if let Some(groups) = other.groups {
+            for group_value in groups {
+                let group = into_typed_with_jinja::<MinimalSchemaValue, _>(
+                    io_args,
+                    group_value.clone(),
+                    false,
+                    jinja_env,
+                    base_ctx,
+                    &[],
+                    dependency_package_name_from_ctx(jinja_env, base_ctx),
+                )?;
+                if let Some(existing_group) = self.groups.get_mut(&group.name) {
+                    existing_group
+                        .duplicate_paths
+                        .push(properties_path.to_path_buf());
+                } else {
+                    self.groups.insert(
+                        group.name.clone(),
+                        MinimalPropertiesEntry {
+                            name: group.name.clone(),
+                            name_span: Span::default(),
+                            relative_path: properties_path.to_path_buf(),
+                            schema_value: group_value,
                             table_value: None,
                             version_info: None,
                             duplicate_paths: vec![],

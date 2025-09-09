@@ -153,6 +153,9 @@ pub trait InternalDbtNode: Any + Send + Sync + fmt::Debug {
     fn is_versioned(&self) -> bool {
         false
     }
+    fn defined_at(&self) -> Option<&dbt_common::CodeLocation> {
+        None
+    }
     fn resource_type(&self) -> &str;
     fn as_any(&self) -> &dyn Any;
     fn serialize(&self) -> YmlValue {
@@ -188,6 +191,7 @@ pub trait InternalDbtNode: Any + Send + Sync + fmt::Debug {
         NodeInfoWrapper {
             unique_id: None,
             skipped_nodes: None,
+            defined_at: self.defined_at().cloned(),
             node_info: NodeInfo {
                 node_name: self.common().name.clone(),
                 unique_id: self.common().unique_id.clone(),
@@ -207,6 +211,7 @@ pub trait InternalDbtNode: Any + Send + Sync + fmt::Debug {
         NodeInfoWrapper {
             unique_id: None,
             skipped_nodes: None,
+            defined_at: self.defined_at().cloned(),
             node_info: NodeInfo {
                 node_name: self.common().name.clone(),
                 unique_id: self.common().unique_id.clone(),
@@ -521,6 +526,10 @@ impl InternalDbtNode for DbtTest {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn defined_at(&self) -> Option<&dbt_common::CodeLocation> {
+        self.defined_at.as_ref()
     }
 
     fn serialize_inner(&self) -> YmlValue {
@@ -1021,7 +1030,7 @@ impl InternalDbtNode for DbtSavedQuery {
     }
     fn has_same_config(&self, other: &dyn InternalDbtNode) -> bool {
         if let Some(other_saved_query) = other.as_any().downcast_ref::<DbtSavedQuery>() {
-            self.config == other_saved_query.config
+            self.deprecated_config == other_saved_query.deprecated_config
         } else {
             false
         }
@@ -1126,6 +1135,8 @@ pub struct Nodes {
     pub exposures: BTreeMap<String, Arc<DbtExposure>>,
     pub semantic_models: BTreeMap<String, Arc<DbtSemanticModel>>,
     pub metrics: BTreeMap<String, Arc<DbtMetric>>,
+    pub saved_queries: BTreeMap<String, Arc<DbtSavedQuery>>,
+    pub groups: BTreeMap<String, Arc<DbtGroup>>,
 }
 
 impl Nodes {
@@ -1180,6 +1191,16 @@ impl Nodes {
             .iter()
             .map(|(id, node)| (id.clone(), Arc::new((**node).clone())))
             .collect();
+        let saved_queries = self
+            .saved_queries
+            .iter()
+            .map(|(id, node)| (id.clone(), Arc::new((**node).clone())))
+            .collect();
+        let groups = self
+            .groups
+            .iter()
+            .map(|(id, node)| (id.clone(), Arc::new((**node).clone())))
+            .collect();
         Nodes {
             models,
             seeds,
@@ -1191,6 +1212,8 @@ impl Nodes {
             exposures,
             semantic_models,
             metrics,
+            saved_queries,
+            groups,
         }
     }
 
@@ -1548,6 +1571,8 @@ impl Nodes {
         self.analyses.extend(other.analyses);
         self.exposures.extend(other.exposures);
         self.metrics.extend(other.metrics);
+        self.saved_queries.extend(other.saved_queries);
+        self.groups.extend(other.groups);
     }
 
     pub fn warn_on_custom_materializations(&self) -> FsResult<()> {
@@ -1727,6 +1752,22 @@ pub struct DbtExposureAttr {
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
+pub struct DbtGroup {
+    pub __common_attr__: CommonAttributes,
+    pub __base_attr__: NodeBaseAttributes,
+    pub __group_attr__: DbtGroupAttr,
+}
+
+#[skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct DbtGroupAttr {
+    pub owner: DbtOwner,
+}
+
+#[skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
 pub struct DbtUnitTest {
     pub __common_attr__: CommonAttributes,
 
@@ -1759,6 +1800,7 @@ pub struct DbtTest {
     pub __common_attr__: CommonAttributes,
     pub __base_attr__: NodeBaseAttributes,
     pub __test_attr__: DbtTestAttr,
+    pub defined_at: Option<dbt_common::CodeLocation>,
 
     // To be deprecated
     #[serde(rename = "config")]

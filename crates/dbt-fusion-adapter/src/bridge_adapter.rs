@@ -1,7 +1,6 @@
 use crate::base_adapter::{AdapterType, AdapterTyping};
 use crate::cache::RelationCache;
 use crate::cast_util::{downcast_value_to_dyn_base_relation, dyn_base_columns_to_value};
-use crate::formatter::create_sql_literal_formatter;
 use crate::funcs::{
     dispatch_adapter_calls, dispatch_adapter_get_value, execute_macro, execute_macro_wrapper,
     none_value,
@@ -44,7 +43,7 @@ use tracing;
 use tracy_client::span;
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
@@ -300,7 +299,7 @@ impl BaseAdapter for BridgeAdapter {
     }
 
     #[tracing::instrument(skip_all, level = "trace")]
-    fn quote(&self, _state: &State, args: &[Value]) -> Result<Value, MinijinjaError> {
+    fn quote(&self, state: &State, args: &[Value]) -> Result<Value, MinijinjaError> {
         let parser = ArgParser::new(args, None);
         check_num_args(current_function_name!(), &parser, 1, 1)?;
 
@@ -309,12 +308,12 @@ impl BaseAdapter for BridgeAdapter {
             .expect("quote requires exactly one argument")
             .to_string();
 
-        let quoted_identifier = self.typed_adapter.quote(&identifier);
+        let quoted_identifier = self.typed_adapter.quote(state, &identifier)?;
         Ok(Value::from(quoted_identifier))
     }
 
     #[tracing::instrument(skip_all, level = "trace")]
-    fn quote_as_configured(&self, _state: &State, args: &[Value]) -> Result<Value, MinijinjaError> {
+    fn quote_as_configured(&self, state: &State, args: &[Value]) -> Result<Value, MinijinjaError> {
         let parser = ArgParser::new(args, None);
         check_num_args(current_function_name!(), &parser, 2, 2)?;
 
@@ -339,7 +338,7 @@ impl BaseAdapter for BridgeAdapter {
 
         let result = self
             .typed_adapter
-            .quote_as_configured(identifier, &quote_key);
+            .quote_as_configured(state, identifier, &quote_key)?;
 
         Ok(Value::from(result))
     }
@@ -355,7 +354,7 @@ impl BaseAdapter for BridgeAdapter {
 
         let result = self
             .typed_adapter
-            .quote_seed_column(state, &column, quote_config);
+            .quote_seed_column(state, &column, quote_config)?;
         Ok(Value::from(result))
     }
 
@@ -430,13 +429,19 @@ impl BaseAdapter for BridgeAdapter {
         auto_begin: bool,
         fetch: bool,
         limit: Option<i64>,
+        options: Option<HashMap<String, String>>,
     ) -> AdapterResult<(AdapterResponse, AgateTable)> {
         let mut conn = self.borrow_tlocal_connection(node_id_from_state(state))?;
         let query_ctx =
             query_ctx_from_state_with_sql(state, sql)?.with_desc("execute adapter call");
-        let (response, table) =
-            self.typed_adapter
-                .execute(conn.as_mut(), &query_ctx, auto_begin, fetch, limit)?;
+        let (response, table) = self.typed_adapter.execute(
+            conn.as_mut(),
+            &query_ctx,
+            auto_begin,
+            fetch,
+            limit,
+            options,
+        )?;
         Ok((response, table))
     }
 
@@ -450,10 +455,8 @@ impl BaseAdapter for BridgeAdapter {
         abridge_sql_log: bool,
     ) -> AdapterResult<()> {
         let adapter_type = self.typed_adapter.adapter_type();
-        let formatter = create_sql_literal_formatter(adapter_type);
-
         let formatted_sql = if let Some(bindings) = bindings {
-            format_sql_with_bindings(sql, bindings, formatter)?
+            format_sql_with_bindings(adapter_type, sql, bindings)?
         } else {
             sql.to_string()
         };
@@ -496,6 +499,21 @@ impl BaseAdapter for BridgeAdapter {
     #[tracing::instrument(skip(self, state), level = "trace")]
     fn rename_relation(&self, state: &State, args: &[Value]) -> Result<Value, MinijinjaError> {
         self.cache_renamed(state, args)?;
+        if self.typed_adapter.is_replay() {
+            let iter = ArgsIter::new(
+                current_function_name!(),
+                &["from_relation", "to_relation"],
+                args,
+            );
+            let from_relation_obj = iter.next_arg::<&RelationObject>()?;
+            let to_relation_obj = iter.next_arg::<&RelationObject>()?;
+            let from_relation = from_relation_obj.inner();
+            let to_relation = to_relation_obj.inner();
+            iter.finish()?;
+            let mut conn = self.borrow_tlocal_connection(node_id_from_state(state))?;
+            self.typed_adapter
+                .rename_relation(conn.as_mut(), from_relation, to_relation)?;
+        }
         execute_macro(state, args, "rename_relation")?;
         Ok(none_value())
     }
@@ -694,25 +712,28 @@ impl BaseAdapter for BridgeAdapter {
         schema: &str,
         identifier: &str,
     ) -> Result<Value, MinijinjaError> {
-        let temp_relation = relation_object::create_relation(
-            self.typed_adapter.adapter_type(),
-            database.to_string(),
-            schema.to_string(),
-            Some(identifier.to_string()),
-            None,
-            self.typed_adapter().get_resolved_quoting(),
-        )?;
+        // Skip cache in replay mode
+        if !self.typed_adapter.is_replay() {
+            let temp_relation = relation_object::create_relation(
+                self.typed_adapter.adapter_type(),
+                database.to_string(),
+                schema.to_string(),
+                Some(identifier.to_string()),
+                None,
+                self.typed_adapter().get_resolved_quoting(),
+            )?;
 
-        if let Some(cached_entry) = self.relation_cache.get_relation(&temp_relation) {
-            return Ok(cached_entry.relation().as_value());
-        }
-        // If we have captured the entire schema previously, we can check for non-existence
-        // In these cases, return early with a None value
-        else if self
-            .relation_cache
-            .contains_full_schema_for_relation(&temp_relation)
-        {
-            return Ok(none_value());
+            if let Some(cached_entry) = self.relation_cache.get_relation(&temp_relation) {
+                return Ok(cached_entry.relation().as_value());
+            }
+            // If we have captured the entire schema previously, we can check for non-existence
+            // In these cases, return early with a None value
+            else if self
+                .relation_cache
+                .contains_full_schema_for_relation(&temp_relation)
+            {
+                return Ok(none_value());
+            }
         }
 
         // Move on to query against the remote when we have:
@@ -721,6 +742,7 @@ impl BaseAdapter for BridgeAdapter {
         let mut conn = self.borrow_tlocal_connection(node_id_from_state(state))?;
         let query_ctx = query_ctx_from_state(state)?.with_desc("get_relation adapter call");
         let relation = self.typed_adapter.get_relation(
+            state,
             &query_ctx,
             conn.as_mut(),
             database,
@@ -766,6 +788,16 @@ impl BaseAdapter for BridgeAdapter {
         let relation = parser.get::<Value>("relation")?;
         let relation = downcast_value_to_dyn_base_relation(&relation)?;
 
+        if self.typed_adapter.is_replay() {
+            return match self.typed_adapter.get_columns_in_relation(state, relation) {
+                Ok(result) => Ok(Value::from_iter(result.iter().map(|c| c.as_value()))),
+                Err(e) => Err(MinijinjaError::new(
+                    MinijinjaErrorKind::SerdeDeserializeError,
+                    e.to_string(),
+                )),
+            };
+        }
+
         if let Some(db) = &self.db {
             // skip local compilation results if it's invoked upon a snapshot
             // as we considered risk is too high to trust the types to be consistent with the remote
@@ -775,7 +807,7 @@ impl BaseAdapter for BridgeAdapter {
                 // since the compiled sql in incremental run may represent a schema of which the model that will have when the run is done
                 && !state.is_run_incremental()
             {
-                let schema = db.get_schema_by_fqn(&relation.semantic_fqn());
+                let schema = db.get_schema(&relation.get_fqn().unwrap_or_default());
                 if let Some(schema) = schema {
                     let from_local = self.typed_adapter.arrow_schema_to_dbt_columns(schema)?;
 

@@ -3,6 +3,7 @@ pub mod dbt_types;
 pub mod dbt_utils;
 pub mod filter;
 pub mod man;
+pub mod materialization_resolver;
 pub mod state;
 pub mod stats;
 
@@ -74,18 +75,19 @@ pub mod schemas {
             BigqueryClusterConfig, BigqueryPartitionConfig, BigqueryPartitionConfigInner,
             GrantAccessToTarget, PartitionConfig, Range, RangeConfig, TimeConfig,
         };
-        pub use group::DbtGroup;
+        pub use group::ManifestGroup;
         pub use manifest::{
             BaseMetadata, DbtManifest, DbtNode, ManifestMetadata, build_manifest,
             nodes_from_dbt_manifest,
         };
         pub use manifest_nodes::{
-            ManifestDataTest, ManifestExposure, ManifestMetric, ManifestModel, ManifestSeed,
-            ManifestSemanticModel, ManifestSnapshot, ManifestSource, ManifestUnitTest,
+            ManifestDataTest, ManifestExposure, ManifestMetric, ManifestModel, ManifestSavedQuery,
+            ManifestSeed, ManifestSemanticModel, ManifestSnapshot, ManifestSource,
+            ManifestUnitTest,
         };
         pub use metric::DbtMetric;
         pub use operation::DbtOperation;
-        pub use saved_query::DbtSavedQuery;
+        pub use saved_query::{DbtSavedQuery, DbtSavedQueryAttr};
         pub use selector::DbtSelector;
         pub use semantic_model::DbtSemanticModel;
         pub use v10::DbtManifestV10;
@@ -97,6 +99,7 @@ pub mod schemas {
 
     pub mod semantic_layer {
         pub mod metric;
+        pub mod saved_query;
         pub mod semantic_manifest;
         pub mod semantic_model;
     }
@@ -110,7 +113,7 @@ pub mod schemas {
             pub mod model_config;
             pub mod omissible_utils;
             pub mod omissible_utils_tests;
-            pub mod saved_queries_config;
+            pub mod saved_query_config;
             pub mod seed_config;
             pub mod semantic_model_config;
             pub mod snapshot_config;
@@ -123,8 +126,8 @@ pub mod schemas {
         pub use configs::exposure_config::{ExposureConfig, ProjectExposureConfig};
         pub use configs::metric_config::{MetricConfig, ProjectMetricConfigs};
         pub use configs::model_config::{ModelConfig, ProjectModelConfig};
-        pub use configs::saved_queries_config::{
-            ExportConfigExportAs, SavedQueriesConfig, SavedQueriesConfigCache,
+        pub use configs::saved_query_config::{
+            ExportConfigExportAs, SavedQueryCache, SavedQueryConfig,
         };
         pub use configs::seed_config::{ProjectSeedConfig, SeedConfig};
         pub use configs::semantic_model_config::{ProjectSemanticModelConfig, SemanticModelConfig};
@@ -148,7 +151,6 @@ pub mod schemas {
         mod properties;
         mod saved_queries_properties;
         mod seed_properties;
-        mod semantic_models_properties;
         mod snapshot_properties;
         mod source_properties;
         mod unit_test_properties;
@@ -159,13 +161,14 @@ pub mod schemas {
         pub use model_properties::ModelConstraint;
         pub use model_properties::ModelFreshness;
         pub use model_properties::ModelProperties;
+        pub use properties::GroupConfig;
+        pub use properties::GroupProperties;
         pub use properties::{
             DbtPropertiesFile, DbtPropertiesFileValues, GetConfig, MinimalSchemaValue,
             MinimalTableValue,
         };
         pub use saved_queries_properties::SavedQueriesProperties;
         pub use seed_properties::SeedProperties;
-        pub use semantic_models_properties::SemanticModelsProperties;
         pub use snapshot_properties::SnapshotProperties;
         pub use source_properties::{SourceProperties, Tables};
         pub use unit_test_properties::{UnitTestOverrides, UnitTestProperties};

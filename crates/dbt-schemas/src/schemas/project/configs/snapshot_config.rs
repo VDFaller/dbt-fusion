@@ -395,7 +395,7 @@ impl From<ProjectSnapshotConfig> for SnapshotConfig {
             database: config.database,
             schema: config.schema,
             alias: config.alias,
-            materialized: config.materialized,
+            materialized: Some(DbtMaterialization::Snapshot),
             strategy: config.strategy,
             unique_key: config.unique_key,
             check_cols: config.check_cols,
@@ -486,6 +486,10 @@ impl From<ProjectSnapshotConfig> for SnapshotConfig {
                 table_type: config.table_type,
 
                 indexes: config.indexes,
+
+                // snapshot is unsupported for Salesforce yet
+                primary_key: None,
+                category: None,
             },
         }
     }
@@ -699,6 +703,7 @@ impl DefaultTo<SnapshotConfig> for SnapshotConfig {
                 check_cols,
                 static_analysis,
                 description,
+                materialized,
             ]
         );
     }

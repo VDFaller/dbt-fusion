@@ -31,7 +31,7 @@ use dbt_xdbc::{Connection, QueryCtx};
 use minijinja::{State, Value, args};
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::Arc;
 
@@ -80,9 +80,6 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
     /// Create a new connection
     fn new_connection(&self, node_id: Option<String>) -> AdapterResult<Box<dyn Connection>>;
 
-    /// Split a sql statement into a list of statements
-    fn self_split_statements(&self, sql: &str, dialect: Dialect) -> Vec<String>;
-
     /// Helper method for execute
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
@@ -95,6 +92,7 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         _auto_begin: bool,
         _fetch: bool,
         _limit: Option<i64>,
+        options: Option<HashMap<String, String>>,
     ) -> AdapterResult<(AdapterResponse, AgateTable)> {
         let sql = query_ctx.sql().ok_or_else(|| {
             AdapterError::new(AdapterErrorKind::Internal, "Missing query in the context")
@@ -105,8 +103,9 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         let statements = if self.adapter_type() == AdapterType::Bigquery {
             vec![sql]
         } else {
-            self.self_split_statements(&sql, dialect)
+            engine.split_statements(&sql, dialect)
         };
+        let options = options.unwrap_or_default();
         let mut last_batch = None;
         for statement in statements {
             last_batch = Some(execute_query_with_retry(
@@ -114,6 +113,7 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
                 conn,
                 &query_ctx.with_sql(statement),
                 1,
+                &options,
             )?);
         }
 
@@ -142,6 +142,7 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         auto_begin: bool,
         fetch: bool,
         limit: Option<i64>,
+        options: Option<HashMap<String, String>>,
     ) -> AdapterResult<(AdapterResponse, AgateTable)>;
 
     /// Execute a statement, expect no results.
@@ -158,6 +159,7 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
             auto_begin, // auto_begin
             false,      // fetch
             None,       // limit
+            None,       // options
         )?;
         Ok(response)
     }
@@ -175,6 +177,7 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
             false,     // auto_begin
             true,      // fetch
             limit,     // limit
+            None,      // options
         )
     }
 
@@ -187,7 +190,7 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         limit: Option<i64>,
     ) -> AdapterResult<(AdapterResponse, AgateTable)> {
         let mut conn = self.new_connection(None)?;
-        self.execute(&mut *conn, query_ctx, auto_begin, fetch, limit)
+        self.execute(&mut *conn, query_ctx, auto_begin, fetch, limit, None)
     }
 
     /// Add a query to run.
@@ -206,7 +209,7 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
     ) -> AdapterResult<()>;
 
     /// Quote
-    fn quote(&self, identifier: &str) -> String;
+    fn quote(&self, state: &State, identifier: &str) -> AdapterResult<String>;
 
     /// List schemas
     fn list_schemas(&self, result: Arc<RecordBatch>) -> AdapterResult<Vec<String>>;
@@ -216,6 +219,7 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
     /// relation.
     fn get_relation(
         &self,
+        state: &State,
         query_ctx: &QueryCtx,
         conn: &'_ mut dyn Connection,
         database: &str,
@@ -281,7 +285,7 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         let target_cols_set: std::collections::HashSet<_> =
             target_cols.into_iter().map(|col| col.name()).collect();
 
-        let result: Vec<Box<dyn BaseColumn>> = source_cols_map
+        let result: Vec<Arc<dyn BaseColumn>> = source_cols_map
             .into_iter()
             .filter_map(|(name, col)| {
                 if target_cols_set.contains(&name) {
@@ -300,7 +304,7 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         &self,
         state: &State,
         relation: Arc<dyn BaseRelation>,
-    ) -> AdapterResult<Vec<Box<dyn BaseColumn>>>;
+    ) -> AdapterResult<Vec<Arc<dyn BaseColumn>>>;
 
     /// Convert a Schema of Arrow to be represented via BaseColumn
     fn arrow_schema_to_dbt_columns(
@@ -322,11 +326,16 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
     }
 
     /// Quote as configured
-    fn quote_as_configured(&self, identifier: &str, quote_key: &ComponentName) -> String {
+    fn quote_as_configured(
+        &self,
+        state: &State,
+        identifier: &str,
+        quote_key: &ComponentName,
+    ) -> AdapterResult<String> {
         if self.get_resolved_quoting().get_part(quote_key) {
-            self.quote(identifier)
+            self.quote(state, identifier)
         } else {
-            identifier.to_string()
+            Ok(identifier.to_string())
         }
     }
 
@@ -337,14 +346,14 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
     /// reference: https://github.com/dbt-labs/dbt-adapters/blob/main/dbt-adapters/src/dbt/adapters/base/impl.py#L1072
     fn quote_seed_column(
         &self,
-        _state: &State,
+        state: &State,
         column: &str,
         quote_config: Option<bool>,
-    ) -> String {
+    ) -> AdapterResult<String> {
         if quote_config.unwrap_or(true) {
-            self.quote(column)
+            self.quote(state, column)
         } else {
-            column.to_string()
+            Ok(column.to_string())
         }
     }
 
@@ -357,7 +366,7 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         table: Arc<AgateTable>,
         col_idx: i64,
     ) -> AdapterResult<String> {
-        let schema = table.to_record_batch().schema();
+        let schema = table.original_record_batch().schema();
         let data_type = schema.field(col_idx as usize).data_type();
 
         // XXX: There is divergence here with Core's behavior as Agate only supports a limited
@@ -532,7 +541,7 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         &self,
         grants_table: Arc<AgateTable>,
     ) -> AdapterResult<BTreeMap<String, Vec<String>>> {
-        let record_batch = grants_table.to_record_batch();
+        let record_batch = grants_table.original_record_batch();
 
         let grantee_cols = get_column_values::<StringArray>(&record_batch, "grantee")?;
         let privilege_cols = get_column_values::<StringArray>(&record_batch, "privilege_type")?;
@@ -633,7 +642,7 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         let result = result.downcast_object::<ResultObject>().unwrap();
 
         let table = result.table.as_ref().expect("AgateTable exists");
-        let record_batch = table.to_record_batch();
+        let record_batch = table.original_record_batch();
 
         let identifier_column_values =
             get_column_values::<StringArray>(&record_batch, "IDENTIFIER")?;
@@ -658,14 +667,14 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         &self,
         conn: &mut dyn Connection,
         query_ctx: &QueryCtx,
-    ) -> AdapterResult<Vec<Box<dyn BaseColumn>>>;
+    ) -> AdapterResult<Vec<Arc<dyn BaseColumn>>>;
 
     /// Get columns in select sql
     fn get_columns_in_select_sql(
         &self,
         _conn: &'_ mut dyn Connection,
         _sql: &str,
-    ) -> AdapterResult<Vec<Box<dyn BaseColumn>>> {
+    ) -> AdapterResult<Vec<Arc<dyn BaseColumn>>> {
         unimplemented!("only available with BigQuery adapter")
     }
 
@@ -919,5 +928,10 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
                 )),
             },
         }
+    }
+
+    /// Convenience to check if this [TypedBaseAdapter] implementer is used for replaying recordings
+    fn is_replay(&self) -> bool {
+        false
     }
 }

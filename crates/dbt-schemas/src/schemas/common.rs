@@ -196,6 +196,8 @@ impl<T: Clone + Merge<T>> Merge<Option<T>> for Option<T> {
 #[serde(rename_all = "snake_case")]
 pub enum DbtMaterialization {
     #[default]
+    Snapshot,
+    Seed,
     View,
     Table,
     Incremental,
@@ -253,6 +255,8 @@ impl std::fmt::Display for DbtMaterialization {
             DbtMaterialization::DynamicTable => "dynamic_table",
             DbtMaterialization::Analysis => "analysis",
             DbtMaterialization::Unknown(s) => s.as_str(),
+            DbtMaterialization::Snapshot => "snapshot",
+            DbtMaterialization::Seed => "seed",
         };
         write!(f, "{materialized_str}")
     }
@@ -274,6 +278,8 @@ impl From<DbtMaterialization> for RelationType {
             DbtMaterialization::DynamicTable => RelationType::DynamicTable,
             DbtMaterialization::Analysis => RelationType::External, // TODO Validate this
             DbtMaterialization::Unknown(_) => RelationType::External, // TODO Validate this
+            DbtMaterialization::Snapshot => RelationType::Table,    // TODO Validate this
+            DbtMaterialization::Seed => RelationType::Table,        // TODO Validate this
         }
     }
 }
@@ -861,12 +867,23 @@ pub struct Versions {
     pub __additional_properties__: Verbatim<HashMap<String, YmlValue>>,
 }
 
+impl Versions {
+    pub fn get_version(&self) -> Option<String> {
+        match &self.v {
+            dbt_serde_yaml::Value::String(s, _) => Some(s.to_string()),
+            dbt_serde_yaml::Value::Number(n, _) => Some(n.to_string()),
+            _ => None,
+        }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeInfoWrapper {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unique_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skipped_nodes: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub defined_at: Option<CodeLocation>,
     pub node_info: NodeInfo,
 }
 

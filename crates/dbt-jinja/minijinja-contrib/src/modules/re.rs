@@ -7,7 +7,7 @@
 
 use fancy_regex::{Captures, Expander, Regex}; // like python regex, fancy_regex supports lookadheds/lookbehinds
 use minijinja::{value::Object, Error, ErrorKind, Value};
-use std::{collections::BTreeMap, iter, sync::Arc};
+use std::{collections::BTreeMap, fmt, iter, sync::Arc};
 
 /// Create a namespace with `re`-like functions for pattern matching.
 pub fn create_re_namespace() -> BTreeMap<String, Value> {
@@ -49,14 +49,14 @@ fn re_compile(args: &[Value]) -> Result<Value, Error> {
 #[derive(Debug, Clone)]
 pub struct Pattern {
     raw: String,
-    _compiled: Regex,
+    compiled: Regex,
 }
 
 impl Pattern {
     pub fn new(raw: &str, compiled: Regex) -> Self {
         Self {
             raw: raw.to_string(),
-            _compiled: compiled, // TODO: use this in re methods
+            compiled,
         }
     }
 }
@@ -121,10 +121,14 @@ fn re_match(args: &[Value]) -> Result<Value, Error> {
             .iter()
             .map(|m| Value::from(m.map(|m| m.as_str()).unwrap_or_default()))
             .collect();
-        let capture = Capture::new(groups);
+        let span: Option<(usize, usize)> = captures
+            .iter()
+            .next()
+            .and_then(|m| m.map(|m| (m.start(), m.end())));
+        let capture = Capture::new(groups, span);
         Ok(Value::from_object(capture))
     } else {
-        Ok(Value::from_object(Capture::default()))
+        Ok(Value::NONE)
     }
 }
 
@@ -145,10 +149,14 @@ fn re_search(args: &[Value]) -> Result<Value, Error> {
             .iter()
             .map(|m| Value::from(m.map(|m| m.as_str()).unwrap_or_default()))
             .collect();
-        let capture = Capture::new(groups);
+        let span = captures
+            .iter()
+            .next()
+            .and_then(|m| m.map(|m| (m.start(), m.end())));
+        let capture = Capture::new(groups, span);
         Ok(Value::from_object(capture))
     } else {
-        Ok(Value::from_object(Capture::default()))
+        Ok(Value::NONE)
     }
 }
 
@@ -196,7 +204,11 @@ fn re_findall(args: &[Value]) -> Result<Value, Error> {
                         .skip(1)
                         .map(|m| Value::from(m.map(|m| m.as_str()).unwrap_or_default()))
                         .collect();
-                    let capture = Capture::new(groups);
+                    let span = captures
+                        .iter()
+                        .nth(1)
+                        .and_then(|m| m.map(|m| (m.start(), m.end())));
+                    let capture = Capture::new(groups, span);
                     Value::from_object(capture)
                 }
             })
@@ -295,13 +307,27 @@ fn get_or_compile_regex_and_text(args: &[Value]) -> Result<(Box<Regex>, &str), E
     }
 
     // First arg: either compiled or raw pattern
-    let pattern = args[0].to_string();
-    let compiled = Box::new(Regex::new(&pattern).map_err(|e| {
-        Error::new(
-            ErrorKind::InvalidOperation,
-            format!("Failed to compile regex: {e}"),
-        )
-    })?);
+    let compiled = if let Some(object) = args[0].as_object() {
+        if let Some(pattern) = object.downcast_ref::<Pattern>() {
+            Box::new(pattern.compiled.clone())
+        } else {
+            let pattern = args[0].to_string();
+            Box::new(Regex::new(&pattern).map_err(|e| {
+                Error::new(
+                    ErrorKind::InvalidOperation,
+                    format!("Failed to compile regex: {e}"),
+                )
+            })?)
+        }
+    } else {
+        let pattern = args[0].to_string();
+        Box::new(Regex::new(&pattern).map_err(|e| {
+            Error::new(
+                ErrorKind::InvalidOperation,
+                format!("Failed to compile regex: {e}"),
+            )
+        })?)
+    };
 
     // Second arg: the text to match against
     let text = args[1].to_string();
@@ -322,14 +348,15 @@ fn match_obj_to_list(re: &Regex, text: &str, start: usize, end: usize) -> Value 
         Value::from(&text[start..end])
     }
 }
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Capture {
     groups: Vec<Value>,
+    span: Option<(usize, usize)>,
 }
 
 impl Capture {
-    pub fn new(groups: Vec<Value>) -> Self {
-        Self { groups }
+    pub fn new(groups: Vec<Value>, span: Option<(usize, usize)>) -> Self {
+        Self { groups, span }
     }
 }
 
@@ -363,6 +390,21 @@ impl Object for Capture {
 
     fn is_true(self: &Arc<Self>) -> bool {
         !self.groups.is_empty()
+    }
+
+    fn render(self: &Arc<Self>, f: &mut fmt::Formatter<'_>) -> fmt::Result
+    where
+        Self: Sized + 'static,
+    {
+        write!(f, "<re.Match object; ")?;
+        if let Some(g) = self.groups.first() {
+            if let Some((start, end)) = self.span {
+                write!(f, "span = ({start}, {end}), ")?;
+            }
+            // TODO: escape quotes in g
+            write!(f, "match = '{g}'")?;
+        }
+        write!(f, ">")
     }
 }
 
@@ -398,6 +440,10 @@ mod tests {
         ])
         .unwrap();
         assert!(result.is_true());
+        assert_eq!(
+            result.to_string(),
+            "<re.Match object; span = (0, 3), match = 'xyz'>"
+        );
 
         let result = re_match(&[
             Value::from("\\d{10}".to_string()),
@@ -405,6 +451,10 @@ mod tests {
         ])
         .unwrap();
         assert!(result.is_true());
+        assert_eq!(
+            result.to_string(),
+            "<re.Match object; span = (0, 10), match = '1234567890'>"
+        );
 
         let result = re_match(&[
             Value::from("\\d{10}".to_string()),
@@ -412,5 +462,42 @@ mod tests {
         ])
         .unwrap();
         assert!(!result.is_true());
+        assert_eq!(result.to_string(), "none");
+    }
+
+    #[test]
+    fn test_re_search() {
+        let result = re_search(&[
+            Value::from("world".to_string()),
+            Value::from("hello, world".to_string()),
+        ])
+        .unwrap();
+        assert!(result.is_true());
+        assert_eq!(
+            result.to_string(),
+            "<re.Match object; span = (7, 12), match = 'world'>"
+        );
+
+        let result = re_search(&[
+            Value::from("hello".to_string()),
+            Value::from("world".to_string()),
+        ])
+        .unwrap();
+        assert!(!result.is_true());
+        assert_eq!(result.to_string(), "none");
+    }
+
+    #[test]
+    fn test_re_glob_search() {
+        let result = re_search(&[
+            Value::from(".*".to_string()),
+            Value::from("xyz".to_string()),
+        ])
+        .unwrap();
+        assert!(result.is_true());
+
+        let compiled_pattern = re_compile(&[Value::from(".*".to_string())]).unwrap();
+        let result = re_search(&[compiled_pattern, Value::from("xyz".to_string())]).unwrap();
+        assert!(result.is_true());
     }
 }

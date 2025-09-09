@@ -1,5 +1,6 @@
 use crate::schemas::common::DocsConfig;
 use crate::schemas::common::Versions;
+use crate::schemas::manifest::common::DbtOwner;
 use crate::schemas::serde::{FloatOrString, bool_or_string_bool, string_or_array};
 use dbt_serde_yaml::JsonSchema;
 use dbt_serde_yaml::Spanned;
@@ -18,7 +19,6 @@ use super::MetricsProperties;
 use super::ModelProperties;
 use super::SavedQueriesProperties;
 use super::SeedProperties;
-use super::SemanticModelsProperties;
 use super::SnapshotProperties;
 use super::SourceProperties;
 use super::unit_test_properties::UnitTestProperties;
@@ -34,6 +34,8 @@ pub struct DbtPropertiesFileValues {
     pub models: Option<Vec<dbt_serde_yaml::Value>>,
     pub saved_queries: Option<Vec<dbt_serde_yaml::Value>>,
     pub seeds: Option<Vec<dbt_serde_yaml::Value>>,
+    // semantic_models cannot be removed for backward compatibility
+    // removal would result in many regression tests failing
     pub semantic_models: Option<Vec<dbt_serde_yaml::Value>>,
     pub snapshots: Option<Vec<dbt_serde_yaml::Value>>,
     pub sources: Option<Vec<dbt_serde_yaml::Value>>,
@@ -74,10 +76,12 @@ pub struct DbtPropertiesFile {
     pub data_tests: Option<Vec<DataTestProperties>>,
     pub analyses: Option<Vec<AnalysesProperties>>,
     pub exposures: Option<Vec<ExposureProperties>>,
-    pub groups: Option<Vec<GroupsProperties>>,
+    pub groups: Option<Vec<GroupProperties>>,
     pub macros: Option<Vec<MacrosProperties>>,
     pub metrics: Option<Vec<MetricsProperties>>,
-    pub semantic_models: Option<Vec<SemanticModelsProperties>>,
+    // semantic_models cannot be removed for backward compatibility
+    // removal would result in many regression tests failing
+    pub semantic_models: Option<Vec<dbt_serde_yaml::Value>>,
     pub version: Option<FloatOrString>,
     pub anchors: Verbatim<Option<Vec<dbt_serde_yaml::Value>>>,
 }
@@ -115,24 +119,17 @@ pub struct AnalysesConfig {
 
 #[skip_serializing_none]
 #[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
-pub struct GroupsProperties {
+pub struct GroupProperties {
     pub name: String,
-    pub owner: GroupsOwner,
+    pub owner: DbtOwner,
     pub description: Option<String>,
-    pub config: Option<GroupsConfig>,
+    pub config: Option<GroupConfig>,
 }
 
 #[skip_serializing_none]
-#[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
-pub struct GroupsOwner {
-    pub email: Option<String>,
-    pub name: Option<String>,
-}
-
-#[skip_serializing_none]
-#[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
-pub struct GroupsConfig {
-    pub meta: Option<YmlValue>,
+#[derive(Deserialize, Default, Serialize, Debug, Clone, JsonSchema)]
+pub struct GroupConfig {
+    pub meta: Option<BTreeMap<String, YmlValue>>,
 }
 
 #[skip_serializing_none]

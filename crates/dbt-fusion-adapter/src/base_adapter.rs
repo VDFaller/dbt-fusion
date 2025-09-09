@@ -13,7 +13,7 @@ use minijinja::arg_utils::ArgParser;
 use minijinja::dispatch_object::DispatchObject;
 use minijinja::{Error as MinijinjaError, ErrorKind as MinijinjaErrorKind, State, Value};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::Arc;
 
@@ -30,7 +30,6 @@ pub fn backend_of(adapter_type: AdapterType) -> Backend {
         AdapterType::Databricks => Backend::Databricks,
         AdapterType::Redshift => Backend::Redshift,
         AdapterType::Salesforce => Backend::Salesforce,
-        AdapterType::Parse => Backend::Postgres, // Parse is not a real adapter
     }
 }
 
@@ -55,7 +54,12 @@ pub trait AdapterTyping {
     fn quoting(&self) -> ResolvedQuoting;
 
     /// Quote a component of a relation
-    fn quote_component(&self, identifier: &str, component: ComponentName) -> String {
+    fn quote_component(
+        &self,
+        state: &State,
+        identifier: &str,
+        component: ComponentName,
+    ) -> AdapterResult<String> {
         let quoted = match component {
             ComponentName::Database => self.quoting().database,
             ComponentName::Schema => self.quoting().schema,
@@ -63,9 +67,9 @@ pub trait AdapterTyping {
         };
         if quoted {
             let adapter = self.as_typed_base_adapter();
-            adapter.quote(identifier)
+            adapter.quote(state, identifier)
         } else {
-            identifier.to_string()
+            Ok(identifier.to_string())
         }
     }
 
@@ -176,6 +180,7 @@ pub trait BaseAdapter: fmt::Display + fmt::Debug + AdapterTyping + Send + Sync {
     ///     auto_begin: bool = False,
     ///     fetch: bool = False,
     ///     limit: Optional[int] = None,
+    ///     options: Optional[Dict[str, str]],
     /// ) -> Tuple[AdapterResponse, "agate.Table"]:
     ///     """
     ///     :param str sql: The sql to execute.
@@ -183,6 +188,7 @@ pub trait BaseAdapter: fmt::Display + fmt::Debug + AdapterTyping + Send + Sync {
     ///                             automatically begin one.
     ///     :param bool fetch: If set, fetch results.
     ///     :param Optional[int] limit: If set, only fetch n number of rows
+    ///     :param Optional[Dict[str, str]] options: If set, pass ADBC options to the execute call
     ///     :return: A tuple of the query status and results (empty if fetch=False).
     ///     :rtype: Tuple[AdapterResponse, "agate.Table"]
     ///     """
@@ -194,6 +200,7 @@ pub trait BaseAdapter: fmt::Display + fmt::Debug + AdapterTyping + Send + Sync {
         auto_begin: bool,
         fetch: bool,
         limit: Option<i64>,
+        options: Option<HashMap<String, String>>,
     ) -> AdapterResult<(AdapterResponse, AgateTable)>;
 
     /// Execute a statement, expect no results.
@@ -206,6 +213,7 @@ pub trait BaseAdapter: fmt::Display + fmt::Debug + AdapterTyping + Send + Sync {
         let (response, _) = self.execute(
             state, sql, auto_begin, false, // fetch
             None,  // limit
+            None,  // options
         )?;
         Ok(response)
     }
@@ -217,7 +225,7 @@ pub trait BaseAdapter: fmt::Display + fmt::Debug + AdapterTyping + Send + Sync {
         sql: &str,
         limit: Option<i64>,
     ) -> AdapterResult<(AdapterResponse, AgateTable)> {
-        self.execute(state, sql, false, true, limit)
+        self.execute(state, sql, false, true, limit, None)
     }
 
     /// Add Query

@@ -18,16 +18,15 @@ use dbt_schemas::schemas::macros::build_macro_units;
 use dbt_schemas::schemas::{InternalDbtNode, Nodes};
 
 use dbt_jinja_utils::jinja_environment::JinjaEnv;
-use dbt_schemas::state::RenderResults;
-use dbt_schemas::state::{DbtPackage, GenericTestAsset, Macros};
+use dbt_schemas::state::{DbtPackage, GenericTestAsset, Macros, RenderResults};
 use dbt_schemas::state::{DbtRuntimeConfig, Operations};
 
 use crate::args::ResolveArgs;
 use crate::dbt_project_config::{RootProjectConfigs, build_root_project_configs};
+use crate::resolve::resolve_groups::resolve_groups;
 use crate::resolve::resolve_operations::resolve_operations;
 use crate::utils::{self, clear_package_diagnostics};
 use dbt_schemas::schemas::telemetry::BuildPhaseInfo;
-use dbt_schemas::schemas::telemetry::SharedPhaseInfo;
 use dbt_schemas::schemas::telemetry::TelemetryAttributes;
 use dbt_schemas::state::DbtState;
 use dbt_schemas::state::ResolverState;
@@ -41,6 +40,7 @@ use crate::resolve::resolve_macros::resolve_macros;
 use crate::resolve::resolve_metrics::resolve_metrics;
 use crate::resolve::resolve_models::resolve_models;
 use crate::resolve::resolve_properties::resolve_minimal_properties;
+use crate::resolve::resolve_saved_queries::resolve_saved_queries;
 use crate::resolve::resolve_seeds::resolve_seeds;
 use crate::resolve::resolve_semantic_models::resolve_semantic_models;
 use crate::resolve::resolve_snapshots::resolve_snapshots;
@@ -60,11 +60,7 @@ use crate::resolve::resolve_selectors::resolve_final_selectors;
 #[tracing::instrument(
     skip_all,
     fields(
-        __event = TelemetryAttributes::Phase(BuildPhaseInfo::Parsing {
-            shared: SharedPhaseInfo {
-                invocation_id: invocation_args.invocation_id.to_string(),
-            }
-        }).to_tracing_value(),
+        __event = TelemetryAttributes::Phase(BuildPhaseInfo::Parsing { }).to_tracing_value(),
     )
 )]
 pub async fn resolve(
@@ -188,7 +184,6 @@ pub async fn resolve(
                 token,
             )
             .await?;
-
         nodes.extend(resolved_nodes);
         disabled_nodes.extend(resolved_disabled_nodes);
         collector
@@ -211,7 +206,6 @@ pub async fn resolve(
                 token,
             )
             .await?;
-
         nodes.extend(resolved_nodes);
         disabled_nodes.extend(resolved_disabled_nodes);
         collector
@@ -221,16 +215,6 @@ pub async fn resolve(
     // Ensure that there are no duplicate relations
     check_relation_uniqueness(&nodes)?;
 
-    match nodes.warn_on_custom_materializations() {
-        Ok(_) => {}
-        Err(e) => {
-            if arg.command == "parse" {
-                show_warning!(arg.io, e);
-            } else {
-                show_error!(arg.io, e);
-            }
-        }
-    }
     match nodes.warn_on_microbatch() {
         Ok(_) => {}
         Err(e) => {
@@ -254,7 +238,6 @@ pub async fn resolve(
 
     // Check access
     check_access(arg, &nodes, &all_runtime_configs);
-
 
     Ok((
         ResolverState {
@@ -546,6 +529,22 @@ pub async fn resolve_inner(
     nodes.metrics.extend(metrics);
     disabled_nodes.metrics.extend(disabled_metrics);
 
+    let (saved_queries, disabled_saved_queries) = resolve_saved_queries(
+        arg,
+        package,
+        root_package_name,
+        root_project_configs,
+        &mut min_properties.saved_queries,
+        database,
+        schema,
+        package_name,
+        jinja_env.clone(),
+        &base_ctx,
+    )
+    .await?;
+    nodes.saved_queries.extend(saved_queries);
+    disabled_nodes.saved_queries.extend(disabled_saved_queries);
+
     let (data_tests, disabled_tests) = resolve_data_tests(
         arg,
         package,
@@ -581,8 +580,21 @@ pub async fn resolve_inner(
         runtime_config,
         &nodes.models,
     )?;
+
     nodes.unit_tests.extend(unit_tests);
     disabled_nodes.unit_tests.extend(disabled_unit_tests);
+
+    let (groups, disabled_groups) = resolve_groups(
+        arg,
+        &mut min_properties.groups,
+        package_name,
+        &jinja_env,
+        &base_ctx,
+    )
+    .await?;
+
+    nodes.groups.extend(groups);
+    disabled_nodes.groups.extend(disabled_groups);
 
     let collector = RenderResults {
         rendering_results: rendering_results

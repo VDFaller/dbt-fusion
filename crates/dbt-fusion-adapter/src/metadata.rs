@@ -16,6 +16,7 @@ use dbt_schemas::schemas::{
 use dbt_schemas::state::ResolverState;
 use dbt_schemas::stats::Stats;
 use dbt_xdbc::{Connection, MapReduce, QueryCtx};
+use minijinja::{Environment, State};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -200,14 +201,26 @@ pub trait MetadataAdapter: TypedBaseAdapter + Send + Sync {
         &self,
         resolved_state: &ResolverState,
         run_stats: &Stats,
+        parent_map: &BTreeMap<String, Vec<String>>,
     ) -> Vec<Arc<dyn BaseRelation>> {
         let adapter_type = resolved_state.adapter_type;
         let mut relations: Vec<Arc<dyn BaseRelation>> = Vec::new();
-        let executed_unique_ids = run_stats
+        let mut executed_unique_ids = run_stats
             .stats
             .iter()
             .map(|stat| stat.unique_id.clone())
             .collect::<Vec<String>>();
+        let mut nodes_to_add = Vec::new();
+        nodes_to_add.extend(executed_unique_ids.clone());
+        // Add all nodes that are dependencies of the executed nodes
+        while let Some(unique_id) = nodes_to_add.pop() {
+            if !executed_unique_ids.contains(&unique_id) {
+                executed_unique_ids.push(unique_id.clone());
+            }
+            if let Some(parents) = parent_map.get(&unique_id) {
+                nodes_to_add.extend(parents.clone());
+            }
+        }
         let nodes = match run_stats.nodes.as_ref() {
             Some(nodes) => nodes,
             None => return relations,
@@ -307,7 +320,9 @@ pub fn create_schemas_if_not_exists(
     let map_f = move |conn: &'_ mut dyn Connection,
                       (catalog, schema): &(String, String)|
           -> AdapterResult<AdapterResult<()>> {
-        let sql = create_schema_sql(&adapter, catalog, schema);
+        let env = Environment::new();
+        let state = State::new_for_env(&env); // TODO: Only when DbtReplayAdapter is the adapter we need the state, so we set an empty state and let DbtReplayAdapter panic
+        let sql = create_schema_sql(&state, &adapter, catalog, schema)?;
         let query_ctx = QueryCtx::new(adapter.adapter_type().to_string())
             .with_sql(sql)
             .with_desc("Ensure catalogs and schemas exist");
@@ -361,16 +376,21 @@ pub fn flatten_catalog_schemas(
 ///
 /// catalog here refers to database entity - that'll be dataset for BigQuery, schema for Databricks, database for Snowflake etc
 /// TODO: revisit this to reuse an existing macro
-fn create_schema_sql(adapter: &Arc<dyn MetadataAdapter>, catalog: &str, schema: &str) -> String {
-    let catalog = adapter.quote_component(catalog, ComponentName::Database);
-    let schema = adapter.quote_component(schema, ComponentName::Schema);
+fn create_schema_sql(
+    state: &State,
+    adapter: &Arc<dyn MetadataAdapter>,
+    catalog: &str,
+    schema: &str,
+) -> AdapterResult<String> {
+    let catalog = adapter.quote_component(state, catalog, ComponentName::Database)?;
+    let schema = adapter.quote_component(state, schema, ComponentName::Schema)?;
     let adapter_type = adapter.adapter_type();
     match adapter_type {
         AdapterType::Snowflake | AdapterType::Databricks => {
-            format!("CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}")
+            Ok(format!("CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}"))
         }
         // Redshift connetions are always to a specific database
-        AdapterType::Redshift => format!("CREATE SCHEMA IF NOT EXISTS {schema}"),
+        AdapterType::Redshift => Ok(format!("CREATE SCHEMA IF NOT EXISTS {schema}")),
         _ => unimplemented!("create_schema_sql for adapter type: {}", adapter_type),
     }
 }

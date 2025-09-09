@@ -5,9 +5,9 @@ use crate::errors::AdapterResult;
 use crate::errors::{AdapterError, AdapterErrorKind};
 use crate::formatter::SqlLiteralFormatter;
 use crate::response::ResultObject;
-use dbt_agate::AgateTable;
 
 use arrow::array::RecordBatch;
+use dbt_agate::AgateTable;
 use minijinja::arg_utils::ArgsIter;
 use minijinja::listener::RenderingEventListener;
 use minijinja::value::ValueKind;
@@ -15,8 +15,9 @@ use minijinja::value::mutable_vec::MutableVec;
 use minijinja::{Error as MinijinjaError, ErrorKind as MinijinjaErrorKind, State, Value};
 use minijinja_contrib::modules::py_datetime::date::PyDate;
 use minijinja_contrib::modules::py_datetime::datetime::PyDateTime;
+use serde::Deserialize;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -39,7 +40,17 @@ pub fn dispatch_adapter_calls(
                 .unwrap_or(false);
             let fetch = iter.next_kwarg::<Option<bool>>("fetch")?.unwrap_or(false);
             let limit = iter.next_kwarg::<Option<i64>>("limit")?;
-            let (response, table) = adapter.execute(state, sql, auto_begin, fetch, limit)?;
+            let options = if let Some(value) = iter.next_kwarg::<Option<Value>>("options")? {
+                Some(HashMap::<String, String>::deserialize(value).map_err(|e| {
+                    MinijinjaError::new(MinijinjaErrorKind::SerdeDeserializeError, e.to_string())
+                })?)
+            } else {
+                None
+            };
+            // TODO(harry): add iter.finish() and fix the tests
+
+            let (response, table) =
+                adapter.execute(state, sql, auto_begin, fetch, limit, options)?;
             Ok(Value::from_iter([
                 Value::from_object(response),
                 Value::from_object(table),
@@ -239,7 +250,7 @@ pub fn convert_macro_result_to_record_batch(
         ));
     };
 
-    let record_batch = table.to_record_batch();
+    let record_batch = table.original_record_batch();
     Ok(record_batch)
 }
 
@@ -289,10 +300,11 @@ pub fn empty_map_value() -> Value {
 
 // Helper function to format SQL with bindings
 pub fn format_sql_with_bindings(
+    adapter_type: AdapterType,
     sql: &str,
     bindings: &Value,
-    formatter: Box<dyn SqlLiteralFormatter>,
 ) -> AdapterResult<String> {
+    let formatter = SqlLiteralFormatter::new(adapter_type);
     let mut result = String::with_capacity(sql.len());
     // this placeholder char is seen from `get_binding_char` macro
     let mut parts = sql.split("%s");
@@ -314,6 +326,7 @@ pub fn format_sql_with_bindings(
                     }
                     ValueKind::Bytes => result.push_str(&formatter.format_bytes(&value)),
                     ValueKind::None => result.push_str(&formatter.none_value()),
+                    ValueKind::Bool => result.push_str(&formatter.format_bool(value.is_true())),
                     _ => {
                         // TODO: handle the SQL escaping of more data types
                         if let Some(date) = value.downcast_object::<PyDate>() {
