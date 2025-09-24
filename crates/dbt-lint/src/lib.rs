@@ -30,6 +30,7 @@ pub struct Failures<'a> {
 }
 
 pub fn get_manifest(manifest_path: &Path) -> DbtManifestV12 {
+    // currently doesn't work with fusion run manifest V20
     println!("Reading manifest from: {}", manifest_path.display());
     let manifest_str = fs::read_to_string(manifest_path)
         .expect("Failed to read manifest.json");
