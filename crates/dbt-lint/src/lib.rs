@@ -4,6 +4,7 @@ use dbt_schemas::schemas::{
     }
 };
 use std::{fs, path::Path};
+pub mod osmosis;
 
 #[derive(Default, Debug)]
 pub struct ModelFailures<'a> {
