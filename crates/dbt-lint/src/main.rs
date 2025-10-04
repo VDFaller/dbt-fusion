@@ -43,13 +43,18 @@ async fn main() -> FsResult<()> {
         &token,
     )
     .await?;
-
+    
     let mut dbt_manifest = build_manifest(&invocation_id, &resolved_state);
-
+    
     let failures = check_all(&mut dbt_manifest);
-
+    // writing the yamls back to disk I figure will work like this
+    // Step 1: Go through manifest in DAG order and create some type of "These columns got changed from None to Some(description)"
+    // Step 2: Use the path information to read the yamls back in, update them, and write them back out
+    //   The big problem with this is that serde_yaml doesn't preserve comments or formatting, so the output files would be very different from the input files.
+    //   Could possibly do something cute with regex to just replace the description lines in the original files, but that seems fragile.
+    //   The manifest isn't made to serialize to yaml directly anyway, so we need some transitional layer. 
     println!(
-        "Nodes without description before fix: {:?}",
+        "Nodes without description: {:?}",
         failures.model_failures.no_descriptions.len()
     );
     println!(
