@@ -5,7 +5,7 @@ version = 3
 [[package]]
 name = "adbc_core"
 version = "0.20.0"
-source = "git+https://github.com/dbt-labs/arrow-adbc?rev=34c0a6f7cd039334683bc0b05b9bc3430e0b7e86#34c0a6f7cd039334683bc0b05b9bc3430e0b7e86"
+source = "git+https://github.com/dbt-labs/arrow-adbc?rev=6aa8ce231ad9145733c8b6a844223ffff57bf1ea#6aa8ce231ad9145733c8b6a844223ffff57bf1ea"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -15,7 +15,7 @@ dependencies = [
 [[package]]
 name = "adbc_driver_manager"
 version = "0.20.0"
-source = "git+https://github.com/dbt-labs/arrow-adbc?rev=34c0a6f7cd039334683bc0b05b9bc3430e0b7e86#34c0a6f7cd039334683bc0b05b9bc3430e0b7e86"
+source = "git+https://github.com/dbt-labs/arrow-adbc?rev=6aa8ce231ad9145733c8b6a844223ffff57bf1ea#6aa8ce231ad9145733c8b6a844223ffff57bf1ea"
 dependencies = [
  "adbc_core",
  "arrow-array",
@@ -40,6 +40,17 @@ name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
+
+[[package]]
+name = "aes"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
+dependencies = [
+ "cfg-if",
+ "cipher",
+ "cpufeatures",
+]
 
 [[package]]
 name = "ahash"
@@ -186,7 +197,7 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 [[package]]
 name = "arrow"
 version = "55.1.0"
-source = "git+https://github.com/sdf-labs/arrow-rs?rev=253647cf5fe650d0cdc50557e0fb73957d3de616#253647cf5fe650d0cdc50557e0fb73957d3de616"
+source = "git+https://github.com/sdf-labs/arrow-rs?rev=63a95c7060cb22b620ea60caadf5251f4ddcd6e0#63a95c7060cb22b620ea60caadf5251f4ddcd6e0"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -206,7 +217,7 @@ dependencies = [
 [[package]]
 name = "arrow-arith"
 version = "55.1.0"
-source = "git+https://github.com/sdf-labs/arrow-rs?rev=253647cf5fe650d0cdc50557e0fb73957d3de616#253647cf5fe650d0cdc50557e0fb73957d3de616"
+source = "git+https://github.com/sdf-labs/arrow-rs?rev=63a95c7060cb22b620ea60caadf5251f4ddcd6e0#63a95c7060cb22b620ea60caadf5251f4ddcd6e0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -219,7 +230,7 @@ dependencies = [
 [[package]]
 name = "arrow-array"
 version = "55.1.0"
-source = "git+https://github.com/sdf-labs/arrow-rs?rev=253647cf5fe650d0cdc50557e0fb73957d3de616#253647cf5fe650d0cdc50557e0fb73957d3de616"
+source = "git+https://github.com/sdf-labs/arrow-rs?rev=63a95c7060cb22b620ea60caadf5251f4ddcd6e0#63a95c7060cb22b620ea60caadf5251f4ddcd6e0"
 dependencies = [
  "ahash",
  "arrow-buffer",
@@ -235,7 +246,7 @@ dependencies = [
 [[package]]
 name = "arrow-buffer"
 version = "55.1.0"
-source = "git+https://github.com/sdf-labs/arrow-rs?rev=253647cf5fe650d0cdc50557e0fb73957d3de616#253647cf5fe650d0cdc50557e0fb73957d3de616"
+source = "git+https://github.com/sdf-labs/arrow-rs?rev=63a95c7060cb22b620ea60caadf5251f4ddcd6e0#63a95c7060cb22b620ea60caadf5251f4ddcd6e0"
 dependencies = [
  "bytes",
  "half",
@@ -245,7 +256,7 @@ dependencies = [
 [[package]]
 name = "arrow-cast"
 version = "55.1.0"
-source = "git+https://github.com/sdf-labs/arrow-rs?rev=253647cf5fe650d0cdc50557e0fb73957d3de616#253647cf5fe650d0cdc50557e0fb73957d3de616"
+source = "git+https://github.com/sdf-labs/arrow-rs?rev=63a95c7060cb22b620ea60caadf5251f4ddcd6e0#63a95c7060cb22b620ea60caadf5251f4ddcd6e0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -265,7 +276,7 @@ dependencies = [
 [[package]]
 name = "arrow-csv"
 version = "55.1.0"
-source = "git+https://github.com/sdf-labs/arrow-rs?rev=253647cf5fe650d0cdc50557e0fb73957d3de616#253647cf5fe650d0cdc50557e0fb73957d3de616"
+source = "git+https://github.com/sdf-labs/arrow-rs?rev=63a95c7060cb22b620ea60caadf5251f4ddcd6e0#63a95c7060cb22b620ea60caadf5251f4ddcd6e0"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -280,7 +291,7 @@ dependencies = [
 [[package]]
 name = "arrow-data"
 version = "55.1.0"
-source = "git+https://github.com/sdf-labs/arrow-rs?rev=253647cf5fe650d0cdc50557e0fb73957d3de616#253647cf5fe650d0cdc50557e0fb73957d3de616"
+source = "git+https://github.com/sdf-labs/arrow-rs?rev=63a95c7060cb22b620ea60caadf5251f4ddcd6e0#63a95c7060cb22b620ea60caadf5251f4ddcd6e0"
 dependencies = [
  "arrow-buffer",
  "arrow-schema",
@@ -291,7 +302,7 @@ dependencies = [
 [[package]]
 name = "arrow-ipc"
 version = "55.1.0"
-source = "git+https://github.com/sdf-labs/arrow-rs?rev=253647cf5fe650d0cdc50557e0fb73957d3de616#253647cf5fe650d0cdc50557e0fb73957d3de616"
+source = "git+https://github.com/sdf-labs/arrow-rs?rev=63a95c7060cb22b620ea60caadf5251f4ddcd6e0#63a95c7060cb22b620ea60caadf5251f4ddcd6e0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -304,7 +315,7 @@ dependencies = [
 [[package]]
 name = "arrow-json"
 version = "55.1.0"
-source = "git+https://github.com/sdf-labs/arrow-rs?rev=253647cf5fe650d0cdc50557e0fb73957d3de616#253647cf5fe650d0cdc50557e0fb73957d3de616"
+source = "git+https://github.com/sdf-labs/arrow-rs?rev=63a95c7060cb22b620ea60caadf5251f4ddcd6e0#63a95c7060cb22b620ea60caadf5251f4ddcd6e0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -325,7 +336,7 @@ dependencies = [
 [[package]]
 name = "arrow-ord"
 version = "55.1.0"
-source = "git+https://github.com/sdf-labs/arrow-rs?rev=253647cf5fe650d0cdc50557e0fb73957d3de616#253647cf5fe650d0cdc50557e0fb73957d3de616"
+source = "git+https://github.com/sdf-labs/arrow-rs?rev=63a95c7060cb22b620ea60caadf5251f4ddcd6e0#63a95c7060cb22b620ea60caadf5251f4ddcd6e0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -337,7 +348,7 @@ dependencies = [
 [[package]]
 name = "arrow-row"
 version = "55.1.0"
-source = "git+https://github.com/sdf-labs/arrow-rs?rev=253647cf5fe650d0cdc50557e0fb73957d3de616#253647cf5fe650d0cdc50557e0fb73957d3de616"
+source = "git+https://github.com/sdf-labs/arrow-rs?rev=63a95c7060cb22b620ea60caadf5251f4ddcd6e0#63a95c7060cb22b620ea60caadf5251f4ddcd6e0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -349,16 +360,17 @@ dependencies = [
 [[package]]
 name = "arrow-schema"
 version = "55.1.0"
-source = "git+https://github.com/sdf-labs/arrow-rs?rev=253647cf5fe650d0cdc50557e0fb73957d3de616#253647cf5fe650d0cdc50557e0fb73957d3de616"
+source = "git+https://github.com/sdf-labs/arrow-rs?rev=63a95c7060cb22b620ea60caadf5251f4ddcd6e0#63a95c7060cb22b620ea60caadf5251f4ddcd6e0"
 dependencies = [
- "bitflags 2.9.1",
+ "bitflags 2.9.4",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
 name = "arrow-select"
 version = "55.1.0"
-source = "git+https://github.com/sdf-labs/arrow-rs?rev=253647cf5fe650d0cdc50557e0fb73957d3de616#253647cf5fe650d0cdc50557e0fb73957d3de616"
+source = "git+https://github.com/sdf-labs/arrow-rs?rev=63a95c7060cb22b620ea60caadf5251f4ddcd6e0#63a95c7060cb22b620ea60caadf5251f4ddcd6e0"
 dependencies = [
  "ahash",
  "arrow-array",
@@ -371,7 +383,7 @@ dependencies = [
 [[package]]
 name = "arrow-string"
 version = "55.1.0"
-source = "git+https://github.com/sdf-labs/arrow-rs?rev=253647cf5fe650d0cdc50557e0fb73957d3de616#253647cf5fe650d0cdc50557e0fb73957d3de616"
+source = "git+https://github.com/sdf-labs/arrow-rs?rev=63a95c7060cb22b620ea60caadf5251f4ddcd6e0#63a95c7060cb22b620ea60caadf5251f4ddcd6e0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -381,7 +393,7 @@ dependencies = [
  "memchr",
  "num",
  "regex",
- "regex-syntax 0.8.5",
+ "regex-syntax",
 ]
 
 [[package]]
@@ -519,9 +531,9 @@ checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
 
 [[package]]
 name = "bitflags"
-version = "2.9.1"
+version = "2.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b8e56985ec62d17e9c1001dc89c88ecd7dc08e47eba5ec7c29c7b5eeecde967"
+checksum = "2261d10cca569e4643e526d8dc2e62e433cc8aba21ab764233731f8d369bf394"
 
 [[package]]
 name = "blake3"
@@ -541,6 +553,15 @@ name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
+dependencies = [
+ "generic-array",
+]
+
+[[package]]
+name = "block-padding"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a8894febbff9f758034a5b8e12d87918f56dfc64a8e1fe757d65e29041538d93"
 dependencies = [
  "generic-array",
 ]
@@ -617,7 +638,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "234113d19d0d7d613b40e86fb654acf958910802bcceab913a4f9e7cda03b1a4"
 dependencies = [
  "memchr",
- "regex-automata 0.4.9",
+ "regex-automata",
  "serde",
 ]
 
@@ -658,6 +679,15 @@ name = "bytes"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d71b6127be86fdcfddb610f7182ac57211d4b18a3e9c82eb2d17662f2227ad6a"
+
+[[package]]
+name = "cbc"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "26b52a9543ae338f279b96b0b9fed9c8093744685043739079ce85cd58f289a6"
+dependencies = [
+ "cipher",
+]
 
 [[package]]
 name = "cc"
@@ -710,6 +740,16 @@ checksum = "a6139a8597ed92cf816dfb33f5dd6cf0bb93a6adc938f11039f371bc5bcd26c3"
 dependencies = [
  "chrono",
  "phf 0.12.1",
+]
+
+[[package]]
+name = "cipher"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
+dependencies = [
+ "crypto-common",
+ "inout",
 ]
 
 [[package]]
@@ -953,7 +993,7 @@ version = "0.28.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "829d955a0bb380ef178a640b91779e3987da38c9aea133b20614cfed8cdea9c6"
 dependencies = [
- "bitflags 2.9.1",
+ "bitflags 2.9.4",
  "crossterm_winapi",
  "parking_lot 0.12.4",
  "rustix 0.38.44",
@@ -1148,22 +1188,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "dbt-adapter-proc-macros"
-version = "2.10.2"
-dependencies = [
- "dbt-fusion-workspace-hack",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "dbt-agate"
-version = "2.0.0-preview.9"
+version = "2.0.0-preview.36"
 dependencies = [
  "arrow",
  "arrow-array",
  "arrow-buffer",
- "arrow-csv",
  "arrow-data",
  "arrow-schema",
  "chrono",
@@ -1175,53 +1205,49 @@ dependencies = [
 
 [[package]]
 name = "dbt-auth"
-version = "2.0.0-preview.9"
+version = "2.0.0-preview.36"
 dependencies = [
  "adbc_core",
- "arrow-schema",
  "base64",
- "dbt-common",
  "dbt-fusion-workspace-hack",
  "dbt-serde_yaml",
+ "dbt-test-primitives",
  "dbt-xdbc",
- "minijinja",
- "parquet",
  "percent-encoding",
  "pkcs8",
  "rsa",
  "serde",
  "serde_json",
  "shellexpand",
- "tokio",
 ]
 
 [[package]]
 name = "dbt-cancel"
-version = "2.0.0-preview.9"
+version = "2.0.0-preview.36"
 dependencies = [
  "dbt-fusion-workspace-hack",
 ]
 
 [[package]]
 name = "dbt-cloud-api"
-version = "2.0.0-preview.9"
+version = "2.0.0-preview.36"
 dependencies = [
  "dbt-fusion-workspace-hack",
  "reqwest",
  "serde",
  "serde_json",
  "serde_repr",
- "serde_with",
  "url",
 ]
 
 [[package]]
 name = "dbt-common"
-version = "2.0.0-preview.9"
+version = "2.0.0-preview.36"
 dependencies = [
  "arc-swap",
  "arrow",
  "arrow-schema",
+ "blake3",
  "bytes",
  "chrono",
  "clap",
@@ -1233,15 +1259,14 @@ dependencies = [
  "dbt-error",
  "dbt-frontend-common",
  "dbt-fusion-workspace-hack",
- "dbt-proc-macros",
  "dbt-serde_yaml",
  "dbt-telemetry",
- "dialoguer",
+ "dbt-test-primitives",
  "dunce",
+ "hex",
  "humantime",
  "indicatif",
  "indoc",
- "int-enum",
  "itertools 0.13.0",
  "log",
  "md5",
@@ -1253,10 +1278,11 @@ dependencies = [
  "parquet",
  "pathdiff",
  "powershell_script",
- "prost 0.14.1",
+ "proto-rust",
  "rand 0.9.2",
  "regex",
  "rust-embed",
+ "scc",
  "schemars 0.8.22",
  "serde",
  "serde_json",
@@ -1265,7 +1291,6 @@ dependencies = [
  "term_size",
  "tokio",
  "tracing",
- "tracing-log",
  "tracing-subscriber",
  "unicode-segmentation",
  "uuid",
@@ -1273,7 +1298,7 @@ dependencies = [
 
 [[package]]
 name = "dbt-dag"
-version = "2.0.0-preview.9"
+version = "2.0.0-preview.36"
 dependencies = [
  "dbt-common",
  "dbt-fusion-workspace-hack",
@@ -1285,7 +1310,7 @@ dependencies = [
 
 [[package]]
 name = "dbt-deps"
-version = "2.0.0-preview.9"
+version = "2.0.0-preview.36"
 dependencies = [
  "dbt-common",
  "dbt-fusion-workspace-hack",
@@ -1303,22 +1328,20 @@ dependencies = [
  "sha1",
  "tar",
  "tempfile",
- "tokio",
- "tracing",
  "url",
  "vortex-events",
 ]
 
 [[package]]
 name = "dbt-env"
-version = "2.0.0-preview.9"
+version = "2.0.0-preview.36"
 dependencies = [
  "dbt-fusion-workspace-hack",
 ]
 
 [[package]]
 name = "dbt-error"
-version = "2.0.0-preview.9"
+version = "2.0.0-preview.36"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -1343,7 +1366,7 @@ dependencies = [
 
 [[package]]
 name = "dbt-frontend-common"
-version = "2.0.0-preview.9"
+version = "2.0.0-preview.36"
 dependencies = [
  "antlr-rust",
  "arrow",
@@ -1367,12 +1390,13 @@ dependencies = [
 
 [[package]]
 name = "dbt-fusion-adapter"
-version = "2.0.0-preview.9"
+version = "2.0.0-preview.36"
 dependencies = [
  "adbc_core",
  "arrow",
- "arrow-json",
+ "arrow-array",
  "arrow-schema",
+ "chrono",
  "crossbeam-skiplist",
  "dashmap",
  "dbt-agate",
@@ -1382,6 +1406,7 @@ dependencies = [
  "dbt-fusion-workspace-hack",
  "dbt-schemas",
  "dbt-serde_yaml",
+ "dbt-test-primitives",
  "dbt-xdbc",
  "log",
  "minijinja",
@@ -1391,7 +1416,6 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "strum",
  "tokio",
  "tracing",
  "tracy-client",
@@ -1405,7 +1429,7 @@ checksum = "a8430f049d5c7bbc7a95ae1bd10e769c4008cc6df873faab785eedbbae3ad902"
 
 [[package]]
 name = "dbt-ident"
-version = "2.0.0-preview.9"
+version = "2.0.0-preview.36"
 dependencies = [
  "dbt-fusion-workspace-hack",
  "serde",
@@ -1414,46 +1438,31 @@ dependencies = [
 
 [[package]]
 name = "dbt-init"
-version = "2.0.0-preview.9"
+version = "2.0.0-preview.36"
 dependencies = [
- "chrono",
- "clap",
- "console",
- "dbt-cancel",
  "dbt-cloud-api",
  "dbt-common",
  "dbt-error",
- "dbt-frontend-common",
  "dbt-fusion-workspace-hack",
  "dbt-jinja-utils",
  "dbt-loader",
- "dbt-proc-macros",
  "dbt-schemas",
  "dbt-serde_yaml",
- "dbt-telemetry",
  "dialoguer",
  "dirs",
  "log",
  "merge",
- "prost 0.14.1",
- "regex",
  "reqwest",
  "rust-embed",
- "schemars 0.8.22",
  "serde",
  "serde_json",
- "strum",
- "strum_macros",
- "tokio",
- "uuid",
 ]
 
 [[package]]
 name = "dbt-jinja-utils"
-version = "2.0.0-preview.9"
+version = "2.0.0-preview.36"
 dependencies = [
  "arrow",
- "arrow-csv",
  "chrono",
  "chrono-tz",
  "dashmap",
@@ -1464,6 +1473,7 @@ dependencies = [
  "dbt-fusion-workspace-hack",
  "dbt-schemas",
  "dbt-serde_yaml",
+ "dbt-test-primitives",
  "insta",
  "itertools 0.13.0",
  "log",
@@ -1473,14 +1483,13 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "tracing",
  "tracy-client",
  "uuid",
 ]
 
 [[package]]
 name = "dbt-lint"
-version = "2.0.0-preview.9"
+version = "2.0.0-preview.36"
 dependencies = [
  "clap",
  "dbt-common",
@@ -1498,7 +1507,7 @@ dependencies = [
 
 [[package]]
 name = "dbt-loader"
-version = "2.0.0-preview.9"
+version = "2.0.0-preview.36"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -1513,6 +1522,7 @@ dependencies = [
  "ignore",
  "log",
  "minijinja",
+ "once_cell",
  "pathdiff",
  "reqwest",
  "reqwest-middleware",
@@ -1527,7 +1537,7 @@ dependencies = [
 
 [[package]]
 name = "dbt-parser"
-version = "2.0.0-preview.9"
+version = "2.0.0-preview.36"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -1540,6 +1550,7 @@ dependencies = [
  "dbt-schemas",
  "dbt-selector-parser",
  "dbt-serde_yaml",
+ "dbt-test-primitives",
  "itertools 0.13.0",
  "md5",
  "minijinja",
@@ -1551,11 +1562,12 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
 name = "dbt-proc-macros"
-version = "2.0.0-preview.9"
+version = "2.0.0-preview.36"
 dependencies = [
  "dbt-fusion-workspace-hack",
  "quote",
@@ -1564,7 +1576,7 @@ dependencies = [
 
 [[package]]
 name = "dbt-sa-cli"
-version = "2.0.0-preview.9"
+version = "2.0.0-preview.36"
 dependencies = [
  "chrono",
  "clap",
@@ -1582,7 +1594,6 @@ dependencies = [
  "serde",
  "serde_json",
  "strum",
- "tempfile",
  "tokio",
  "tracing",
  "uuid",
@@ -1590,13 +1601,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "dbt-sample"
+version = "0.1.0"
+dependencies = [
+ "dbt-common",
+ "dbt-fusion-workspace-hack",
+ "itertools 0.13.0",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+]
+
+[[package]]
 name = "dbt-schemas"
-version = "2.0.0-preview.9"
+version = "2.0.0-preview.36"
 dependencies = [
  "blake3",
  "chrono",
  "chrono-tz",
- "dbt-adapter-proc-macros",
  "dbt-common",
  "dbt-frontend-common",
  "dbt-fusion-workspace-hack",
@@ -1604,36 +1626,34 @@ dependencies = [
  "dbt-telemetry",
  "hex",
  "humantime",
+ "log",
  "md5",
  "merge",
  "minijinja",
  "minijinja-contrib",
- "regex",
  "schemars 0.8.22",
  "serde",
  "serde_derive",
  "serde_json",
- "serde_repr",
  "serde_with",
  "sha2",
  "strum",
- "strum_macros",
 ]
 
 [[package]]
 name = "dbt-selector-parser"
-version = "2.0.0-preview.9"
+version = "2.0.0-preview.36"
 dependencies = [
  "dbt-common",
  "dbt-fusion-workspace-hack",
  "dbt-schemas",
- "tracing",
+ "dbt-test-primitives",
 ]
 
 [[package]]
 name = "dbt-serde_yaml"
 version = "0.1.0"
-source = "git+https://github.com/sdf-labs/dbt-serde-yaml?rev=02493ca60206081121bc3f09218703af858cb1c4#02493ca60206081121bc3f09218703af858cb1c4"
+source = "git+https://github.com/sdf-labs/dbt-serde-yaml?rev=9ccae3e49f77fcd0a92230a1e41c51d74279409f#9ccae3e49f77fcd0a92230a1e41c51d74279409f"
 dependencies = [
  "dbt-serde_yaml_derive",
  "dbt-serde_yaml_schemars_derive",
@@ -1648,7 +1668,7 @@ dependencies = [
 [[package]]
 name = "dbt-serde_yaml_derive"
 version = "0.1.0"
-source = "git+https://github.com/sdf-labs/dbt-serde-yaml?rev=02493ca60206081121bc3f09218703af858cb1c4#02493ca60206081121bc3f09218703af858cb1c4"
+source = "git+https://github.com/sdf-labs/dbt-serde-yaml?rev=9ccae3e49f77fcd0a92230a1e41c51d74279409f#9ccae3e49f77fcd0a92230a1e41c51d74279409f"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -1659,7 +1679,7 @@ dependencies = [
 [[package]]
 name = "dbt-serde_yaml_schemars_derive"
 version = "0.1.0"
-source = "git+https://github.com/sdf-labs/dbt-serde-yaml?rev=02493ca60206081121bc3f09218703af858cb1c4#02493ca60206081121bc3f09218703af858cb1c4"
+source = "git+https://github.com/sdf-labs/dbt-serde-yaml?rev=9ccae3e49f77fcd0a92230a1e41c51d74279409f#9ccae3e49f77fcd0a92230a1e41c51d74279409f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1669,16 +1689,24 @@ dependencies = [
 
 [[package]]
 name = "dbt-telemetry"
-version = "2.0.0-preview.9"
+version = "2.0.0-preview.36"
 dependencies = [
  "arrow",
+ "arrow-schema",
+ "bitflags 2.9.4",
+ "bytes",
  "dbt-fusion-workspace-hack",
  "dbt-serde_yaml",
  "fake",
+ "opentelemetry",
+ "opentelemetry-semantic-conventions",
+ "opentelemetry_sdk",
+ "parquet",
+ "prost 0.14.1",
+ "proto-rust",
  "schemars 0.8.22",
  "serde",
  "serde_arrow",
- "serde_derive",
  "serde_json",
  "serde_repr",
  "serde_with",
@@ -1689,7 +1717,7 @@ dependencies = [
 
 [[package]]
 name = "dbt-test-containers"
-version = "2.0.0-preview.9"
+version = "2.0.0-preview.36"
 dependencies = [
  "bollard",
  "clap",
@@ -1702,24 +1730,24 @@ dependencies = [
  "tar",
  "thiserror 2.0.12",
  "tokio",
- "users",
+ "uzers",
  "walkdir",
 ]
 
 [[package]]
 name = "dbt-test-primitives"
-version = "2.0.0-preview.9"
+version = "2.0.0-preview.36"
 dependencies = [
  "dbt-fusion-workspace-hack",
 ]
 
 [[package]]
 name = "dbt-test-utils"
-version = "2.0.0-preview.9"
+version = "2.0.0-preview.36"
 dependencies = [
  "arrow",
  "async-trait",
- "chrono-tz",
+ "bytes",
  "clap",
  "dbt-common",
  "dbt-fusion-workspace-hack",
@@ -1727,6 +1755,7 @@ dependencies = [
  "dbt-loader",
  "dbt-schemas",
  "dbt-serde_yaml",
+ "dbt-telemetry",
  "dbt-test-containers",
  "dbt-test-primitives",
  "diffy",
@@ -1737,22 +1766,27 @@ dependencies = [
  "itertools 0.13.0",
  "libc",
  "merge",
- "minijinja",
  "once_cell",
  "parquet",
+ "pbjson-types",
  "pretty_assertions",
+ "proto-rust",
+ "rand 0.9.2",
  "regex",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
  "vortex-events",
  "winapi",
 ]
 
 [[package]]
 name = "dbt-xdbc"
-version = "2.0.0-preview.9"
+version = "2.0.0-preview.36"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -1765,6 +1799,7 @@ dependencies = [
  "dbt-cancel",
  "dbt-common",
  "dbt-fusion-workspace-hack",
+ "dbt-test-primitives",
  "dialoguer",
  "dirs",
  "futures",
@@ -1810,6 +1845,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "des"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ffdd80ce8ce993de27e9f063a444a4d53ce8e8db4c1f00cc03af5ad5a9867a1e"
+dependencies = [
+ "cipher",
+]
+
+[[package]]
 name = "deunicode"
 version = "1.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1840,7 +1884,7 @@ version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b545b8c50194bdd008283985ab0b31dba153cfd5b3066a92770634fbc0d7d291"
 dependencies = [
- "nu-ansi-term 0.50.1",
+ "nu-ansi-term",
 ]
 
 [[package]]
@@ -1852,6 +1896,7 @@ dependencies = [
  "block-buffer",
  "const-oid",
  "crypto-common",
+ "subtle",
 ]
 
 [[package]]
@@ -2013,8 +2058,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e24cb5a94bcae1e5408b0effca5cd7172ea3c5755049c5f3af4cd283a165298"
 dependencies = [
  "bit-set 0.8.0",
- "regex-automata 0.4.9",
- "regex-syntax 0.8.5",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]
@@ -2047,7 +2092,7 @@ version = "25.9.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09b6620799e7340ebd9968d2e0708eb82cf1971e9a16821e2091b6d6e475eed5"
 dependencies = [
- "bitflags 2.9.1",
+ "bitflags 2.9.4",
  "rustc_version",
 ]
 
@@ -2252,8 +2297,8 @@ dependencies = [
  "aho-corasick",
  "bstr",
  "log",
- "regex-automata 0.4.9",
- "regex-syntax 0.8.5",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]
@@ -2326,6 +2371,15 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest",
+]
 
 [[package]]
 name = "http"
@@ -2620,7 +2674,7 @@ dependencies = [
  "globset",
  "log",
  "memchr",
- "regex-automata 0.4.9",
+ "regex-automata",
  "same-file",
  "walkdir",
  "winapi-util",
@@ -2677,6 +2731,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "inout"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
+dependencies = [
+ "block-padding",
+ "generic-array",
+]
+
+[[package]]
 name = "insta"
 version = "1.43.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2726,7 +2790,7 @@ version = "0.7.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d93587f37623a1a17d94ef2bc9ada592f5465fe7732084ab7beefabe5c77c0c4"
 dependencies = [
- "bitflags 2.9.1",
+ "bitflags 2.9.4",
  "cfg-if",
  "libc",
 ]
@@ -2920,7 +2984,7 @@ version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "391290121bad3d37fbddad76d8f5d1c1c314cfc646d143d7e07a3086ddff0ce3"
 dependencies = [
- "bitflags 2.9.1",
+ "bitflags 2.9.4",
  "libc",
  "redox_syscall 0.5.17",
 ]
@@ -3032,11 +3096,11 @@ dependencies = [
 
 [[package]]
 name = "matchers"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8263075bb86c5a1b1427b5ae862e8889656f126e9f77c484496e8b47cf5c5558"
+checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
 dependencies = [
- "regex-automata 0.1.10",
+ "regex-automata",
 ]
 
 [[package]]
@@ -3108,7 +3172,6 @@ dependencies = [
  "minijinja-contrib",
  "minijinja-typecheck-builtins",
  "percent-encoding",
- "regex",
  "self_cell",
  "serde",
  "serde_json",
@@ -3184,16 +3247,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a198f9589efc03f544388dfc4a19fe8af4323662b62f598b8dcfdac62c14771c"
 dependencies = [
  "byteorder",
-]
-
-[[package]]
-name = "nu-ansi-term"
-version = "0.46.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77a8165726e8236064dbb45459242600304b42a5ea24ee2948e18e023bf7ba84"
-dependencies = [
- "overload",
- "winapi",
 ]
 
 [[package]]
@@ -3468,12 +3521,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "overload"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b15813163c1d831bf4a13c3610c05c0d03b39feb07f7e09fa234dac9b15aaf39"
-
-[[package]]
 name = "parking_lot"
 version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3597,7 +3644,7 @@ dependencies = [
  "heck",
  "itertools 0.14.0",
  "prost 0.14.1",
- "prost-types 0.14.1",
+ "prost-types",
 ]
 
 [[package]]
@@ -3613,6 +3660,16 @@ dependencies = [
  "prost 0.14.1",
  "prost-build",
  "serde",
+]
+
+[[package]]
+name = "pbkdf2"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
+dependencies = [
+ "digest",
+ "hmac",
 ]
 
 [[package]]
@@ -3745,7 +3802,13 @@ version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e847e2c91a18bfa887dd028ec33f2fe6f25db77db3619024764914affe8b69a6"
 dependencies = [
+ "aes",
+ "cbc",
  "der",
+ "des",
+ "pbkdf2",
+ "scrypt",
+ "sha2",
  "spki",
 ]
 
@@ -3757,6 +3820,7 @@ checksum = "f950b2377845cebe5cf8b5165cb3cc1a5e0fa5cfa3e1f7f55707d8fd82e0a7b7"
 dependencies = [
  "der",
  "pkcs5",
+ "rand_core 0.6.4",
  "spki",
 ]
 
@@ -3899,7 +3963,7 @@ dependencies = [
  "petgraph",
  "prettyplease",
  "prost 0.14.1",
- "prost-types 0.14.1",
+ "prost-types",
  "regex",
  "syn",
  "tempfile",
@@ -3932,26 +3996,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "prost-reflect"
-version = "0.14.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b5edd582b62f5cde844716e66d92565d7faf7ab1445c8cebce6e00fba83ddb2"
-dependencies = [
- "once_cell",
- "prost 0.13.5",
- "prost-types 0.13.5",
-]
-
-[[package]]
-name = "prost-types"
-version = "0.13.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52c2c1bf36ddb1a1c396b3601a3cec27c2462e45f07c386894ec3ccf5332bd16"
-dependencies = [
- "prost 0.13.5",
-]
-
-[[package]]
 name = "prost-types"
 version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3962,16 +4006,28 @@ dependencies = [
 
 [[package]]
 name = "proto-rust"
-version = "0.1.0"
+version = "2.0.0-preview.36"
 dependencies = [
  "bytes",
  "dbt-fusion-workspace-hack",
- "pbjson",
+ "fake",
  "pbjson-types",
  "prost 0.14.1",
- "prost-reflect",
- "prost-types 0.14.1",
+ "prost-types",
+ "proto-rust-macros",
  "serde",
+ "serde_repr",
+ "serde_with",
+]
+
+[[package]]
+name = "proto-rust-macros"
+version = "2.0.0-preview.36"
+dependencies = [
+ "dbt-fusion-workspace-hack",
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -4147,7 +4203,7 @@ version = "0.5.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5407465600fb0548f1442edf71dd20683c6ed326200ace4b1ef0763521bb3b77"
 dependencies = [
- "bitflags 2.9.1",
+ "bitflags 2.9.4",
 ]
 
 [[package]]
@@ -4189,17 +4245,8 @@ checksum = "b544ef1b4eac5dc2db33ea63606ae9ffcfac26c1416a2806ae0bf5f56b201191"
 dependencies = [
  "aho-corasick",
  "memchr",
- "regex-automata 0.4.9",
- "regex-syntax 0.8.5",
-]
-
-[[package]]
-name = "regex-automata"
-version = "0.1.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c230d73fb8d8c1b9c0b3135c5142a8acee3a0558fb8db5cf1cb65f8d7862132"
-dependencies = [
- "regex-syntax 0.6.29",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]
@@ -4210,14 +4257,8 @@ checksum = "809e8dc61f6de73b46c85f4c96486310fe304c434cfa43669d7b40f711150908"
 dependencies = [
  "aho-corasick",
  "memchr",
- "regex-syntax 0.8.5",
+ "regex-syntax",
 ]
-
-[[package]]
-name = "regex-syntax"
-version = "0.6.29"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f162c6dd7b008981e4d40210aca20b4bd0f9b60ca9271061b07f78537722f2e1"
 
 [[package]]
 name = "regex-syntax"
@@ -4411,7 +4452,7 @@ version = "0.38.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fdb5bc1ae2baa591800df16c9ca78619bf65c0488b41b96ccec5d11220d8c154"
 dependencies = [
- "bitflags 2.9.1",
+ "bitflags 2.9.4",
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
@@ -4424,7 +4465,7 @@ version = "1.0.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "11181fbabf243db407ef8df94a6ce0b2f9a733bd8be4ad02b4eda9602296cac8"
 dependencies = [
- "bitflags 2.9.1",
+ "bitflags 2.9.4",
  "errno",
  "libc",
  "linux-raw-sys 0.9.4",
@@ -4528,12 +4569,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
 
 [[package]]
+name = "saa"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c2d7c5178d64caf296b798b8e96d8dcc4b6427bab402eeae2f65f4d76a08a4c"
+
+[[package]]
+name = "salsa20"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97a22f5af31f73a954c10289c93e8a50cc23d971e80ee446f1f6f7137a088213"
+dependencies = [
+ "cipher",
+]
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "scc"
+version = "3.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fbae40e60d0f04da01e8c69e76c2dc2c762195097328c45f2aa72f767a3bb3f2"
+dependencies = [
+ "saa",
+ "sdd",
 ]
 
 [[package]]
@@ -4606,12 +4672,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "scrypt"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0516a385866c09368f0b5bcd1caff3366aace790fcd46e2bb032697bb172fd1f"
+dependencies = [
+ "pbkdf2",
+ "salsa20",
+ "sha2",
+]
+
+[[package]]
+name = "sdd"
+version = "4.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e232156d14cacaf98e2c2affe9c168e306123915143e179b0aa47503137023c"
+
+[[package]]
 name = "security-framework"
 version = "3.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "271720403f46ca04f7ba6f55d438f8bd878d6b8ca0a1046e8228c4145bcbb316"
 dependencies = [
- "bitflags 2.9.1",
+ "bitflags 2.9.4",
  "core-foundation 0.10.1",
  "core-foundation-sys",
  "libc",
@@ -4797,6 +4880,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "serde_yaml"
+version = "0.9.34+deprecated"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
+dependencies = [
+ "indexmap 2.10.0",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
 ]
 
 [[package]]
@@ -5178,7 +5274,7 @@ version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3c879d448e9d986b661742763247d3693ed13609438cf3d006f51f5368a5ba6b"
 dependencies = [
- "bitflags 2.9.1",
+ "bitflags 2.9.4",
  "core-foundation 0.9.4",
  "system-configuration-sys",
 ]
@@ -5537,7 +5633,7 @@ version = "0.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "adc82fd73de2a9722ac5da747f12383d2bfdb93591ee6c58486e0097890f05f2"
 dependencies = [
- "bitflags 2.9.1",
+ "bitflags 2.9.4",
  "bytes",
  "futures-util",
  "http",
@@ -5616,14 +5712,14 @@ dependencies = [
 
 [[package]]
 name = "tracing-subscriber"
-version = "0.3.19"
+version = "0.3.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8189decb5ac0fa7bc8b96b7cb9b2701d60d48805aca84a238004d665fcc4008"
+checksum = "2054a14f5307d601f88daf0553e1cbf472acc4f2c51afab632431cdcd72124d5"
 dependencies = [
  "matchers",
- "nu-ansi-term 0.46.0",
+ "nu-ansi-term",
  "once_cell",
- "regex",
+ "regex-automata",
  "serde",
  "serde_json",
  "sharded-slab",
@@ -5780,16 +5876,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "users"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "24cc0f6d6f267b73e5a2cadf007ba8f9bc39c6a6f9666f8cf25ea809a153b032"
-dependencies = [
- "libc",
- "log",
-]
-
-[[package]]
 name = "ustr"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5830,6 +5916,7 @@ dependencies = [
  "js-sys",
  "md-5",
  "rand 0.9.2",
+ "serde",
  "sha1_smol",
  "uuid-macro-internal",
  "wasm-bindgen",
@@ -5844,6 +5931,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "uzers"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4df81ff504e7d82ad53e95ed1ad5b72103c11253f39238bcc0235b90768a97dd"
+dependencies = [
+ "libc",
+ "log",
 ]
 
 [[package]]
@@ -5902,7 +5999,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vortex-client"
-version = "2.0.0-preview.9"
+version = "2.0.0-preview.36"
 dependencies = [
  "dbt-env",
  "dbt-fusion-workspace-hack",
@@ -5920,7 +6017,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-events"
-version = "2.0.0-preview.9"
+version = "2.0.0-preview.36"
 dependencies = [
  "dashmap",
  "dbt-common",
@@ -5931,6 +6028,7 @@ dependencies = [
  "dbt-serde_yaml",
  "md5",
  "proto-rust",
+ "serde",
  "uuid",
  "vortex-client",
 ]
@@ -6585,7 +6683,7 @@ version = "0.39.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6f42320e61fe2cfd34354ecb597f86f413484a798ba44a8ca1165c58d42da6c1"
 dependencies = [
- "bitflags 2.9.1",
+ "bitflags 2.9.4",
 ]
 
 [[package]]

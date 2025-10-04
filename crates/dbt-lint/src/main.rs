@@ -1,6 +1,5 @@
 use clap::Parser;
 use dbt_lint::check_all;
-use std::sync::Arc;
 
 use dbt_common::{FsResult, cancellation::CancellationTokenSource};
 use dbt_jinja_utils::invocation_args::InvocationArgs;
@@ -37,7 +36,7 @@ async fn main() -> FsResult<()> {
     let (resolved_state, _jinja_env) = resolve(
         &resolve_args,
         &invocation_args,
-        Arc::new(dbt_state),
+        dbt_state,
         Macros::default(),
         Nodes::default(),
         None, // omit the optional event listener for the simplest case
