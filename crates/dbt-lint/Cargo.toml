@@ -11,6 +11,7 @@ version.workspace = true
 
 [dependencies]
 dbt-schemas = { workspace = true }
+dbt-dag = { workspace = true }
 dbt-common = { workspace = true }
 dbt-jinja-utils = { workspace = true }
 dbt-loader = { workspace = true }

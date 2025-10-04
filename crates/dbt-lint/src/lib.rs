@@ -1,6 +1,7 @@
 use crate::osmosis::inherit_column_descriptions;
+use dbt_dag::deps_mgmt::topological_sort;
 use dbt_schemas::schemas::manifest::{DbtManifestV12, DbtNode, ManifestSource};
-use std::{fs, path::Path};
+use std::collections::{BTreeMap, BTreeSet};
 pub mod osmosis;
 
 #[derive(Default, Debug)]
@@ -27,27 +28,35 @@ pub struct Failures {
     pub source_failures: SourceFailures,
 }
 
-pub fn get_manifest(manifest_path: &Path) -> DbtManifestV12 {
-    // currently doesn't work with fusion run manifest V20
-    println!("Reading manifest from: {}", manifest_path.display());
-    let manifest_str = fs::read_to_string(manifest_path).expect("Failed to read manifest.json");
+fn models_in_dag_order(manifest: &DbtManifestV12) -> Vec<String> {
+    let mut deps: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
-    let manifest: DbtManifestV12 =
-        serde_json::from_str(&manifest_str).expect("Failed to parse manifest.json");
+    for (node_id, node) in &manifest.nodes {
+        if let DbtNode::Model(model) = node {
+            let upstream_models = model
+                .__base_attr__
+                .depends_on
+                .nodes
+                .iter()
+                .filter(|upstream_id| {
+                    matches!(manifest.nodes.get(*upstream_id), Some(DbtNode::Model(_)))
+                })
+                .cloned()
+                .collect::<BTreeSet<_>>();
 
-    return manifest;
+            deps.insert(node_id.clone(), upstream_models);
+        }
+    }
+
+    topological_sort(&deps)
 }
 
 pub fn check_all(manifest: &mut DbtManifestV12) -> Failures {
     let mut failures = Failures::default();
+    let sorted_nodes = models_in_dag_order(manifest);
+    println!("Model processing order: {:?}", sorted_nodes);
 
-    let model_ids: Vec<String> = manifest
-        .nodes
-        .iter()
-        .filter_map(|(id, node)| matches!(node, DbtNode::Model(_)).then(|| id.clone()))
-        .collect();
-
-    for model_id in model_ids {
+    for model_id in sorted_nodes {
         check_model(manifest, &model_id, &mut failures.model_failures);
     }
 
