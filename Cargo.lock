@@ -1484,6 +1484,7 @@ version = "2.0.0-preview.9"
 dependencies = [
  "clap",
  "dbt-common",
+ "dbt-dag",
  "dbt-jinja-utils",
  "dbt-loader",
  "dbt-parser",
