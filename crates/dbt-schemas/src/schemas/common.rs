@@ -7,6 +7,7 @@ use dbt_common::adapter::AdapterType;
 use dbt_common::{CodeLocation, ErrorCode, FsError, FsResult, err, fs_err};
 use dbt_frontend_common::Dialect;
 use dbt_serde_yaml::{JsonSchema, Spanned, UntaggedEnumDeserialize, Verbatim};
+use dbt_telemetry::NodeMaterialization;
 use hex;
 use serde::{Deserialize, Deserializer, Serialize};
 // Type alias for clarity
@@ -16,6 +17,7 @@ use sha2::{Digest, Sha256};
 use strum::{Display, EnumIter, EnumString};
 
 use crate::dbt_types::RelationType;
+use crate::schemas::dbt_column::{ColumnPropertiesDimensionType, Granularity};
 use crate::schemas::manifest::common::SourceFileMetadata;
 use crate::schemas::semantic_layer::semantic_manifest::SemanticLayerElementConfig;
 
@@ -211,6 +213,8 @@ pub enum DbtMaterialization {
     StreamingTable,
     /// only for snowflake
     DynamicTable,
+    /// for inline SQL compilation
+    Inline,
     #[serde(untagged)]
     Unknown(String),
 }
@@ -230,6 +234,7 @@ impl FromStr for DbtMaterialization {
             "analysis" => Ok(DbtMaterialization::Analysis),
             "streaming_table" => Ok(DbtMaterialization::StreamingTable),
             "dynamic_table" => Ok(DbtMaterialization::DynamicTable),
+            "inline" => Ok(DbtMaterialization::Inline),
             other => Ok(DbtMaterialization::Unknown(other.to_string())),
         }
     }
@@ -254,6 +259,7 @@ impl std::fmt::Display for DbtMaterialization {
             DbtMaterialization::StreamingTable => "streaming_table",
             DbtMaterialization::DynamicTable => "dynamic_table",
             DbtMaterialization::Analysis => "analysis",
+            DbtMaterialization::Inline => "inline",
             DbtMaterialization::Unknown(s) => s.as_str(),
             DbtMaterialization::Snapshot => "snapshot",
             DbtMaterialization::Seed => "seed",
@@ -277,9 +283,32 @@ impl From<DbtMaterialization> for RelationType {
             DbtMaterialization::StreamingTable => RelationType::StreamingTable,
             DbtMaterialization::DynamicTable => RelationType::DynamicTable,
             DbtMaterialization::Analysis => RelationType::External, // TODO Validate this
+            DbtMaterialization::Inline => RelationType::Ephemeral, // Inline models don't materialize in DB
             DbtMaterialization::Unknown(_) => RelationType::External, // TODO Validate this
-            DbtMaterialization::Snapshot => RelationType::Table,    // TODO Validate this
-            DbtMaterialization::Seed => RelationType::Table,        // TODO Validate this
+            DbtMaterialization::Snapshot => RelationType::Table,   // TODO Validate this
+            DbtMaterialization::Seed => RelationType::Table,       // TODO Validate this
+        }
+    }
+}
+
+impl From<&DbtMaterialization> for NodeMaterialization {
+    fn from(value: &DbtMaterialization) -> Self {
+        match value {
+            DbtMaterialization::Table => Self::Table,
+            DbtMaterialization::View => Self::View,
+            DbtMaterialization::MaterializedView => Self::MaterializedView,
+            DbtMaterialization::Ephemeral => Self::Ephemeral,
+            DbtMaterialization::External => Self::External,
+            DbtMaterialization::Test => Self::Test,
+            DbtMaterialization::Incremental => Self::Incremental,
+            DbtMaterialization::Unit => Self::Unit,
+            DbtMaterialization::StreamingTable => Self::StreamingTable,
+            DbtMaterialization::DynamicTable => Self::DynamicTable,
+            DbtMaterialization::Analysis => Self::Analysis,
+            DbtMaterialization::Inline => Self::Ephemeral, // Inline is similar to ephemeral
+            DbtMaterialization::Unknown(_) => Self::Custom,
+            DbtMaterialization::Snapshot => Self::Snapshot,
+            DbtMaterialization::Seed => Self::Seed,
         }
     }
 }
@@ -358,15 +387,15 @@ impl TryFrom<DbtQuoting> for ResolvedQuoting {
 
     fn try_from(value: DbtQuoting) -> FsResult<Self> {
         Ok(ResolvedQuoting {
-            database: value.database.ok_or(fs_err!(
+            database: value.database.ok_or_else(|| fs_err!(
                 ErrorCode::InvalidArgument,
                 "Missing database in dbt quoting config. Failed to convert to ResolvedQuoting."
             ))?,
-            identifier: value.identifier.ok_or(fs_err!(
+            identifier: value.identifier.ok_or_else(|| fs_err!(
                 ErrorCode::InvalidArgument,
                 "Missing identifier in dbt quoting config. Failed to convert to ResolvedQuoting."
             ))?,
-            schema: value.schema.ok_or(fs_err!(
+            schema: value.schema.ok_or_else(|| fs_err!(
                 ErrorCode::InvalidArgument,
                 "Missing schema in dbt quoting config. Failed to convert to ResolvedQuoting."
             ))?,
@@ -475,7 +504,7 @@ pub enum DbtBatchSize {
     Year,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct DbtContract {
     #[serde(default = "default_alias_types")]
     pub alias_types: bool,
@@ -487,6 +516,17 @@ pub struct DbtContract {
 
 fn default_alias_types() -> bool {
     true
+}
+
+// DO NOT REMOVE. Somehow, `#[derive(Default)]` does not respect `#[serde(default = "default_alias_types")]`, so we need to implement it manually.
+impl Default for DbtContract {
+    fn default() -> Self {
+        Self {
+            alias_types: default_alias_types(),
+            enforced: false,
+            checksum: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, EnumString, Display, JsonSchema)]
@@ -503,8 +543,9 @@ pub enum DbtIncrementalStrategy {
     /// replace_where (Databricks only)
     /// see https://docs.getdbt.com/reference/resource-configs/databricks-configs
     ReplaceWhere,
-    #[serde(other)]
-    Unknown,
+    #[strum(default)]
+    #[serde(untagged)]
+    Custom(String),
 }
 
 #[derive(Debug, Clone, Serialize, UntaggedEnumDeserialize, PartialEq, Eq, JsonSchema)]
@@ -645,6 +686,28 @@ impl DbtChecksum {
             checksum: hex::encode(checksum),
         })
     }
+    pub fn seed_file_hash(s: &[u8], path: &str) -> Self {
+        const MAXIMUM_SEED_SIZE: usize = 1024 * 1024; // 1MB
+
+        if s.len() > MAXIMUM_SEED_SIZE {
+            // For large seeds, use path-based checksum like dbt-core
+            Self::Object(DbtChecksumObject {
+                name: "path".to_string(),
+                checksum: path.to_string(),
+            })
+        } else {
+            // For normal seeds, hash the content
+            let mut hasher = Sha256::new();
+            let utf8_string = String::from_utf8_lossy(s);
+            let trimmed_string = utf8_string.trim();
+            hasher.update(trimmed_string.as_bytes());
+            let checksum = hasher.finalize();
+            Self::Object(DbtChecksumObject {
+                name: "SHA256".to_string(),
+                checksum: hex::encode(checksum),
+            })
+        }
+    }
 }
 
 #[skip_serializing_none]
@@ -733,12 +796,14 @@ impl Hooks {
                 new_hooks.push(HookConfig {
                     sql: Some(s.clone()),
                     transaction: Some(true),
+                    index: None,
                 });
             }
             Hooks::ArrayOfStrings(v) => {
                 new_hooks.extend(v.iter().map(|s| HookConfig {
                     sql: Some(s.clone()),
                     transaction: Some(true),
+                    index: None,
                 }));
             }
             Hooks::HookConfig(hook_config) => {
@@ -753,12 +818,14 @@ impl Hooks {
                 new_hooks.push(HookConfig {
                     sql: Some(s.clone()),
                     transaction: Some(true),
+                    index: None,
                 });
             }
             Hooks::ArrayOfStrings(v) => {
                 new_hooks.extend(v.iter().map(|s| HookConfig {
                     sql: Some(s.clone()),
                     transaction: Some(true),
+                    index: None,
                 }));
             }
             Hooks::HookConfig(hook_config) => {
@@ -770,6 +837,77 @@ impl Hooks {
         }
         *self = Hooks::HookConfigArray(new_hooks);
     }
+
+    /// Compare hooks where different variants can be equal if they contain the same SQL
+    /// These checks are needed so that we can conform to dbt-core/dbt-mantle
+    /// when comparing hooks.
+    pub fn hooks_equal(&self, other: &Self) -> bool {
+        // Helper to check if a Hooks value is effectively empty
+        let is_empty_hooks = |hooks: &Hooks| -> bool {
+            match hooks {
+                Hooks::ArrayOfStrings(vec) => vec.is_empty(),
+                _ => false,
+            }
+        };
+
+        // If both are the same variant and equal, return true
+        if self == other {
+            return true;
+        }
+
+        // Check if one is empty array and the other is something that should be considered equal
+        if is_empty_hooks(self) && is_empty_hooks(other) {
+            return true;
+        }
+
+        // Compare different variants by their SQL content
+        match (self, other) {
+            // String vs HookConfig: compare the string with the SQL field
+            (Hooks::String(s), Hooks::HookConfig(config))
+            | (Hooks::HookConfig(config), Hooks::String(s)) => config.sql.as_ref() == Some(s),
+
+            // ArrayOfStrings vs HookConfigArray: compare each string with corresponding SQL field
+            (Hooks::ArrayOfStrings(strings), Hooks::HookConfigArray(configs))
+            | (Hooks::HookConfigArray(configs), Hooks::ArrayOfStrings(strings)) => {
+                // Both must have the same length
+                if strings.len() != configs.len() {
+                    return false;
+                }
+
+                // Each string must match the corresponding config's SQL
+                strings
+                    .iter()
+                    .zip(configs.iter())
+                    .all(|(s, config)| config.sql.as_ref() == Some(s))
+            }
+
+            // String vs ArrayOfStrings with single element
+            (Hooks::String(s), Hooks::ArrayOfStrings(vec))
+            | (Hooks::ArrayOfStrings(vec), Hooks::String(s)) => {
+                vec.len() == 1 && vec.first() == Some(s)
+            }
+
+            // HookConfig vs HookConfigArray with single element
+            (Hooks::HookConfig(config), Hooks::HookConfigArray(vec))
+            | (Hooks::HookConfigArray(vec), Hooks::HookConfig(config)) => {
+                vec.len() == 1 && vec.first() == Some(config)
+            }
+
+            // String vs HookConfigArray with single element
+            (Hooks::String(s), Hooks::HookConfigArray(configs))
+            | (Hooks::HookConfigArray(configs), Hooks::String(s)) => {
+                configs.len() == 1 && configs.first().and_then(|c| c.sql.as_ref()) == Some(s)
+            }
+
+            // ArrayOfStrings vs HookConfig - only equal if array has one element
+            (Hooks::ArrayOfStrings(strings), Hooks::HookConfig(config))
+            | (Hooks::HookConfig(config), Hooks::ArrayOfStrings(strings)) => {
+                strings.len() == 1 && strings.first() == config.sql.as_ref()
+            }
+
+            _ => false,
+        }
+    }
 }
 
 #[skip_serializing_none]
@@ -777,13 +915,14 @@ impl Hooks {
 pub struct HookConfig {
     pub sql: Option<String>,
     pub transaction: Option<bool>,
+    pub index: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct Dimension {
     pub name: String,
     #[serde(rename = "type")]
-    pub dimension_type: DimensionType,
+    pub dimension_type: ColumnPropertiesDimensionType,
     pub description: Option<String>,
     pub label: Option<String>,
     #[serde(default = "default_false")]
@@ -792,21 +931,18 @@ pub struct Dimension {
     pub expr: Option<String>,
     pub metadata: Option<SourceFileMetadata>,
     pub config: Option<SemanticLayerElementConfig>,
+    // for internal use only, n/a for derived dimensions
+    #[serde(skip_serializing)]
+    pub column_name: Option<String>,
 }
+
 fn default_false() -> bool {
     false
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum DimensionType {
-    Categorical,
-    Time,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 pub struct DimensionTypeParams {
-    pub time_granularity: Option<TimeGranularity>,
+    pub time_granularity: Option<Granularity>,
     pub validity_params: Option<DimensionValidityParams>,
 }
 
@@ -822,22 +958,6 @@ pub struct DimensionValidityParams {
 pub struct SemanticModelDependsOn {
     pub macros: Vec<String>,
     pub nodes: Vec<String>,
-}
-
-#[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum TimeGranularity {
-    Nanosecond,
-    Microsecond,
-    Millisecond,
-    Second,
-    Minute,
-    Hour,
-    Day,
-    Week,
-    Month,
-    Quarter,
-    Year,
 }
 
 #[derive(Default, Deserialize, Serialize, Debug, Clone, JsonSchema, PartialEq, Eq)]
@@ -984,6 +1104,39 @@ pub fn merge_tags(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_hooks_equal_array_of_strings_vs_hook_config_array() {
+        let array_of_strings = Hooks::ArrayOfStrings(vec![
+            "{{ dbt_snow_mask.apply_masking_policy('snapshots') }}".to_string(),
+        ]);
+
+        let hook_config_array = Hooks::HookConfigArray(vec![HookConfig {
+            sql: Some("{{ dbt_snow_mask.apply_masking_policy('snapshots') }}".to_string()),
+            transaction: Some(true),
+            index: None,
+        }]);
+
+        // Test that they are equal
+        assert!(array_of_strings.hooks_equal(&hook_config_array));
+        assert!(hook_config_array.hooks_equal(&array_of_strings));
+    }
+
+    #[test]
+    fn test_hooks_equal_string_vs_hook_config() {
+        let hook_string =
+            Hooks::String("{{ dbt_snow_mask.apply_masking_policy('snapshots') }}".to_string());
+
+        let hook_config = Hooks::HookConfig(HookConfig {
+            sql: Some("{{ dbt_snow_mask.apply_masking_policy('snapshots') }}".to_string()),
+            transaction: Some(true),
+            index: None,
+        });
+
+        // Test that they are equal
+        assert!(hook_string.hooks_equal(&hook_config));
+        assert!(hook_config.hooks_equal(&hook_string));
+    }
 
     #[test]
     fn test_get_semantic_name_snowflake_simple() {

@@ -89,6 +89,7 @@ pub enum ErrorCode {
     FailedToRegisterSeedTable = 1052,
     FailedToRegisterExistingTable = 1053,
     FailedToWriteTable = 1054,
+
     FailedToLookupExistingTable = 1055,
 
     MissingTargetDirectory = 1056,
@@ -107,6 +108,8 @@ pub enum ErrorCode {
     DependencyWarning = 1065,
 
     AccessDenied = 1066,
+
+    GenericExecError = 1067,
     // --------------------------------------------------------------------------------------------
     // Jinja
     MacroUnsupportedValueType = 1500,
@@ -133,7 +136,7 @@ pub enum ErrorCode {
     UnsupportedLocalExecutionDialect = 2001,
 
     // --------------------------------------------------------------------------------------------
-    // Error parsing an .slt file
+    // Error processing an .slt file
     SltParse = 3000,
     SltLimits = 3001,
     SltConfig = 3002,

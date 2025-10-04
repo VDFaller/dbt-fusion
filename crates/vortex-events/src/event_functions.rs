@@ -12,12 +12,19 @@ use dbt_schemas::schemas::{
 use proto_rust::v1::public::events::fusion::{
     AdapterInfo, AdapterInfoV2, Invocation, InvocationEnv, PackageInstall, ResourceCounts, RunModel,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use uuid::Uuid;
 
 use vortex_client::client::{log_proto, log_proto_and_shutdown};
+
+/// Structure for the .user.yml file format: {id: <uuid>}
+#[derive(Debug, Serialize, Deserialize)]
+struct UserFile {
+    id: String,
+}
 
 pub fn noop_event_emitter() -> Box<dyn DiscreteEventEmitter> {
     Box::new(NoopEventEmitter {})
@@ -77,7 +84,7 @@ impl DiscreteEventEmitter for FusionSaEventEmitter {
             //  project_id - MD5 hash of the project name
             project_id,
             //  user_id - UUID generated to identify a unique user (~/.dbt/.user.yml)
-            user_id: profile_path.map(get_user_id).unwrap_or("".to_string()),
+            user_id: profile_path.map(get_user_id).unwrap_or_default(),
             //  command - full string of the command that was run
             command,
             //  result_type - ok/error.
@@ -220,7 +227,7 @@ pub fn run_model_event(
         }
     }
 
-    let resource_type = node.resource_type().to_string();
+    let resource_type = node.resource_type().as_ref().to_string();
 
     let message = RunModel {
         // REQUIRED invocation_id - globally unique identifier
@@ -419,8 +426,8 @@ pub fn get_user_id(profile_path: &Path) -> String {
         let cookie_path = profiles_dir.join(".user.yml");
         if cookie_path.exists() {
             match fs::read_to_string(&cookie_path) {
-                Ok(contents) => match dbt_serde_yaml::from_str::<String>(&contents) {
-                    Ok(user_id) => user_id,
+                Ok(contents) => match dbt_serde_yaml::from_str::<UserFile>(&contents) {
+                    Ok(user_file) => user_file.id,
                     Err(_) => set_user_cookie(profiles_dir, &cookie_path),
                 },
                 Err(_) => set_user_cookie(profiles_dir, &cookie_path),
@@ -438,7 +445,10 @@ fn set_user_cookie(profiles_dir: &Path, cookie_path: &Path) -> String {
     let profiles_file = profiles_dir.join("profiles.yml");
     // Check if profiles_dir is empty (current directory) or exists
     if (profiles_dir.as_os_str().is_empty() || profiles_dir.exists()) && profiles_file.exists() {
-        if let Ok(yaml) = dbt_serde_yaml::to_string(&user_id) {
+        let user_file = UserFile {
+            id: user_id.clone(),
+        };
+        if let Ok(yaml) = dbt_serde_yaml::to_string(&user_file) {
             let _ = fs::write(cookie_path, yaml);
         }
     }

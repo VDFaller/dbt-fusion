@@ -1,8 +1,10 @@
+use std::sync::Arc;
+
 use crate::AdapterResult;
 use crate::errors::{AdapterError, AdapterErrorKind};
 
 use arrow::array::{
-    Decimal128Array, Int8Array, Int16Array, Int32Array, Int64Array, UInt8Array, UInt16Array,
+    Array, Decimal128Array, Int8Array, Int16Array, Int32Array, Int64Array, UInt8Array, UInt16Array,
     UInt32Array, UInt64Array,
 };
 use arrow::datatypes::DataType;
@@ -52,20 +54,22 @@ pub fn extract_first_value_as_i64(batch: &RecordBatch) -> Option<i64> {
     }
 }
 
+pub fn column_by_name<'a>(batch: &'a RecordBatch, name: &str) -> AdapterResult<&'a Arc<dyn Array>> {
+    batch.column_by_name(name).ok_or_else(|| {
+        let schema = batch.schema();
+        let columns = schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>();
+        AdapterError::new(
+            AdapterErrorKind::Internal,
+            format!("expected column {name} not found, available are: {columns:?}"),
+        )
+    })
+}
+
 pub fn get_column_values<T>(record_batch: &RecordBatch, column_name: &str) -> AdapterResult<T>
 where
     T: std::any::Any + Clone,
 {
-    Ok(record_batch
-        .column_by_name(column_name)
-        .ok_or_else(|| {
-            let schema = record_batch.schema();
-            let columns = schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>();
-            AdapterError::new(
-                AdapterErrorKind::Internal,
-                format!("expected column {column_name} not found, available are: {columns:?}"),
-            )
-        })?
+    Ok(column_by_name(record_batch, column_name)?
         .as_any()
         .downcast_ref::<T>()
         .ok_or_else(|| {
@@ -87,6 +91,7 @@ mod tests {
     use super::*;
     use arrow::array::{Float64Array, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+    use dbt_test_primitives::assert_contains;
     use std::sync::{Arc, LazyLock};
 
     static TEST_DATA: LazyLock<RecordBatch> = LazyLock::new(|| {
@@ -118,14 +123,10 @@ mod tests {
         assert!(result.is_err());
         let error = result.unwrap_err();
         assert_eq!(error.kind(), AdapterErrorKind::Internal);
-        assert!(
-            error
-                .message()
-                .contains("expected column nonexistent not found")
-        );
-        assert!(error.message().contains("available are"));
-        assert!(error.message().contains("name"));
-        assert!(error.message().contains("score"));
+        assert_contains!(error.message(), "expected column nonexistent not found");
+        assert_contains!(error.message(), "available are");
+        assert_contains!(error.message(), "name");
+        assert_contains!(error.message(), "score");
     }
 
     #[test]
@@ -136,7 +137,7 @@ mod tests {
         assert!(result.is_err());
         let error = result.unwrap_err();
         assert_eq!(error.kind(), AdapterErrorKind::Internal);
-        assert!(error.message().contains("expected column of type"));
+        assert_contains!(error.message(), "expected column of type");
         assert!(error.message().contains(
             "arrow_array::array::primitive_array::PrimitiveArray<arrow_array::types::Int32Type>"
         ));

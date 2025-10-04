@@ -8,10 +8,16 @@ pub mod state;
 pub mod stats;
 
 pub mod schemas {
-    pub mod columns;
     pub mod common;
     pub mod data_tests;
+    pub mod dbt_catalogs;
     pub mod dbt_column;
+
+    pub use dbt_catalogs::{
+        AdapterPropsView, BuiltInPropsView, CatalogSpecView, CatalogType, DbtCatalogsView,
+        RestPropsView, SerializationPolicy, TableFormat, TargetFileSize, WriteIntegrationView,
+        validate_catalogs,
+    };
     pub mod macros;
     pub mod packages;
     mod prev_state;
@@ -40,6 +46,7 @@ pub mod schemas {
         DbtSeedAttr, DbtSnapshot, DbtSnapshotAttr, DbtSource, DbtSourceAttr, DbtTest, DbtTestAttr,
         DbtUnitTest, DbtUnitTestAttr, InternalDbtNode, InternalDbtNodeAttributes,
         InternalDbtNodeWrapper, IntrospectionKind, NodeBaseAttributes, Nodes, TestMetadata,
+        TimeSpine, TimeSpinePrimaryColumn,
     };
 
     pub use sources::{FreshnessResultsArtifact, FreshnessResultsMetadata, FreshnessResultsNode};
@@ -58,12 +65,12 @@ pub mod schemas {
         #[allow(clippy::module_inception)]
         mod manifest;
         mod manifest_nodes;
-        pub(crate) mod metric;
+        pub mod metric;
         mod operation;
         pub mod postgres;
         pub mod saved_query;
         mod selector;
-        pub(crate) mod semantic_model;
+        pub mod semantic_model;
 
         // Versioned manifest modules
         pub mod v10;
@@ -99,13 +106,14 @@ pub mod schemas {
 
     pub mod semantic_layer {
         pub mod metric;
+        pub mod project_configuration;
         pub mod saved_query;
         pub mod semantic_manifest;
         pub mod semantic_model;
     }
     pub mod project {
         mod dbt_project;
-        mod configs {
+        pub(crate) mod configs {
             pub mod common;
             pub mod data_test_config;
             pub mod exposure_config;
@@ -145,8 +153,8 @@ pub mod schemas {
     pub mod properties {
         mod data_test_properties;
         mod exposure_properties;
-        pub(crate) mod metrics_properties;
-        mod model_properties;
+        pub mod metrics_properties;
+        pub mod model_properties;
         #[allow(clippy::module_inception)]
         mod properties;
         mod saved_queries_properties;

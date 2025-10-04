@@ -15,6 +15,7 @@ mod tests {
     use dbt_schemas::schemas::profiles::PostgresDbConfig;
     use dbt_schemas::schemas::relations::DEFAULT_DBT_QUOTING;
     use dbt_schemas::schemas::serde::StringOrInteger;
+    use dbt_test_primitives::assert_contains;
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -65,7 +66,6 @@ mod tests {
                 "dbt_utils.get_url_host",
                 r#"{% macro get_url_host(url) %}host{% endmacro %}"#,
                 None,
-                &[],
             )
             .unwrap();
 
@@ -74,7 +74,6 @@ mod tests {
                 "dbt.replace",
                 r#"{% macro replace(text, old, new) %}{{ text | replace(old, new) }}{% endmacro %}"#,
                 None,
-                &[],
             )
             .unwrap();
 
@@ -93,8 +92,8 @@ mod tests {
         let macro_calls = listener_factory.drain_macro_calls(&test_path);
 
         // In current implementation, namespaced calls are tracked without namespace prefix
-        assert!(macro_calls.contains("get_url_host"));
-        assert!(macro_calls.contains("replace"));
+        assert_contains!(macro_calls, "get_url_host");
+        assert_contains!(macro_calls, "replace");
         assert_eq!(macro_calls.len(), 2);
     }
 }

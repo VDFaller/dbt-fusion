@@ -11,7 +11,15 @@ use std::fs;
 const APP_NAME: &str = "dbt";
 
 // WARNING: Still needs adjustment on what is considered must-have
-const REQUIRED_PARAMS: [&str; 5] = ["user", "password", "account", "role", "warehouse"];
+const REQUIRED_PARAMS: [&str; 7] = [
+    "user",
+    "password",
+    "account",
+    "role",
+    "warehouse",
+    "database",
+    "schema",
+];
 
 const DEFAULT_CONNECT_TIMEOUT: &str = "10s";
 
@@ -304,9 +312,7 @@ impl SnowflakeAuth {
                     "password" => Ok(builder.with_password(value)),
                     "account" => builder.with_named_option(snowflake::ACCOUNT, value),
                     "database" => builder.with_named_option(snowflake::DATABASE, value),
-                    // TODO: see if setting SCHEMA is necessary, connection cannot be established if schema doesn't exist
-                    // this is a common case if we need to execute statements like `CREATE SCHEMA`
-                    // "schema" => builder.with_named_option(snowflake::SCHEMA, value),
+                    "schema" => builder.with_named_option(snowflake::SCHEMA, value),
                     "role" => builder.with_named_option(snowflake::ROLE, value),
                     "warehouse" => builder.with_named_option(snowflake::WAREHOUSE, value),
                     "host" => builder.with_named_option(snowflake::HOST, value),
@@ -326,6 +332,10 @@ impl SnowflakeAuth {
                 snowflake::S3_STAGE_VPCE_DNS_NAME_PARAM_KEY,
                 s3_stage_vpce_dns_name,
             )?;
+        }
+
+        if let Some(query_tag) = config.get_string(snowflake::QUERY_TAG_PARAM_KEY) {
+            builder.with_named_option(snowflake::QUERY_TAG_PARAM_KEY, query_tag)?;
         }
 
         let connect_timeout_duration = config
@@ -351,6 +361,8 @@ impl SnowflakeAuth {
             "user",
             "password",
             "account",
+            "database",
+            "schema",
             "role",
             "warehouse",
             "private_key_path",
@@ -361,6 +373,7 @@ impl SnowflakeAuth {
             "oauth_client_secret",
             "client_session_keep_alive",
             snowflake::S3_STAGE_VPCE_DNS_NAME_PARAM_KEY,
+            snowflake::QUERY_TAG_PARAM_KEY,
             "host",
             "port",
             "protocol",
@@ -372,10 +385,8 @@ impl SnowflakeAuth {
                     "user" => Ok(builder.with_username(value)),
                     "password" => Ok(builder.with_password(value)),
                     "account" => builder.with_named_option(snowflake::ACCOUNT, value),
-                    // TODO: see if setting SCHEMA is necessary, connection cannot be established if schema doesn't exist
-                    // this is a common case if we need to execute statements like `CREATE SCHEMA` or `CREATE DATABASE`
                     "database" => builder.with_named_option(snowflake::DATABASE, value),
-                    // "schema" => builder.with_named_option(snowflake::SCHEMA, value),
+                    "schema" => builder.with_named_option(snowflake::SCHEMA, value),
                     "role" => builder.with_named_option(snowflake::ROLE, value),
                     "warehouse" => builder.with_named_option(snowflake::WAREHOUSE, value),
                     "private_key_path" => {
@@ -383,10 +394,12 @@ impl SnowflakeAuth {
                             .with_named_option(snowflake::AUTH_TYPE, snowflake::auth_type::JWT)?;
                         // TODO: maybe it's safe to assume from a file we always get header and footer formatted private key
                         // the same for the same logics in `fn build_keypair_parameter_key_value_pairs`
-                        let key_contents = fs::read_to_string(value.to_string())?;
+                        let key_contents = fs::read_to_string(value.to_string()).map_err(|_| {
+                            AuthError::config(format!("Private key file not found: '{}'", value))
+                        })?;
                         builder.with_named_option(
                             snowflake::JWT_PRIVATE_KEY_PKCS8_VALUE,
-                            &key_contents,
+                            key_format::normalize_key(&key_contents)?,
                         )
                     }
                     "private_key" => {
@@ -409,6 +422,9 @@ impl SnowflakeAuth {
                     }
                     snowflake::S3_STAGE_VPCE_DNS_NAME_PARAM_KEY => builder
                         .with_named_option(snowflake::S3_STAGE_VPCE_DNS_NAME_PARAM_KEY, value),
+                    snowflake::QUERY_TAG_PARAM_KEY => {
+                        builder.with_named_option(snowflake::QUERY_TAG_PARAM_KEY, value)
+                    }
                     "host" => builder.with_named_option(snowflake::HOST, value),
                     "port" => builder.with_named_option(snowflake::PORT, value),
                     "protocol" => builder.with_named_option(snowflake::PROTOCOL, value),
@@ -894,6 +910,28 @@ mod tests {
     }
 
     #[test]
+    fn test_invalid_private_key_path() {
+        let mut config = base_config();
+        config.insert("private_key_path".into(), "invalid_path".into());
+
+        let auth = SnowflakeAuth {};
+        let builder = auth.configure(&AdapterConfig::new(config));
+
+        assert!(
+            matches!(builder, Err(ref e) if matches!(e, AuthError::Config(_))),
+            "Expected configuration error, got: {builder:?}"
+        );
+
+        if let Err(e) = builder {
+            let msg = format!("{e:?}");
+            assert!(
+                msg.contains("Private key file not found"),
+                "Unexpected error message: {msg}"
+            );
+        }
+    }
+
+    #[test]
     fn test_oauth_fails_with_missing_required_fields() {
         let mut config = base_config();
         config.insert("method".into(), "snowflake_oauth".into());
@@ -1104,6 +1142,50 @@ mod tests {
                 snowflake::S3_STAGE_VPCE_DNS_NAME_PARAM_KEY,
                 "my-vpce-endpoint.s3.region.vpce.amazonaws.com",
             ),
+            (snowflake::LOG_TRACING, "fatal"),
+            (snowflake::LOGIN_TIMEOUT, DEFAULT_CONNECT_TIMEOUT),
+        ];
+        run_config_test(config, &expected);
+    }
+
+    #[test]
+    fn test_query_tag() {
+        let mut config = base_config();
+        config.insert(
+            snowflake::QUERY_TAG_PARAM_KEY.into(),
+            "custom-query-tag".into(),
+        );
+        let expected = [
+            ("user", "U"),
+            ("password", "P"),
+            (snowflake::ACCOUNT, "A"),
+            (snowflake::ROLE, "role"),
+            (snowflake::WAREHOUSE, "warehouse"),
+            (snowflake::APPLICATION_NAME, "dbt"),
+            (snowflake::QUERY_TAG_PARAM_KEY, "custom-query-tag"),
+            (snowflake::LOG_TRACING, "fatal"),
+            (snowflake::LOGIN_TIMEOUT, DEFAULT_CONNECT_TIMEOUT),
+        ];
+        run_config_test(config, &expected);
+    }
+
+    #[test]
+    fn test_query_tag_with_method() {
+        let mut config = base_config();
+        config.insert("method".into(), "warehouse".into());
+
+        config.insert(
+            snowflake::QUERY_TAG_PARAM_KEY.into(),
+            "custom-query-tag".into(),
+        );
+        let expected = [
+            ("user", "U"),
+            ("password", "P"),
+            (snowflake::ACCOUNT, "A"),
+            (snowflake::ROLE, "role"),
+            (snowflake::WAREHOUSE, "warehouse"),
+            (snowflake::APPLICATION_NAME, "dbt"),
+            (snowflake::QUERY_TAG_PARAM_KEY, "custom-query-tag"),
             (snowflake::LOG_TRACING, "fatal"),
             (snowflake::LOGIN_TIMEOUT, DEFAULT_CONNECT_TIMEOUT),
         ];

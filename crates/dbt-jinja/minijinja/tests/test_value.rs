@@ -461,6 +461,16 @@ fn test_mutable_map_in_set_stmt() {
 }
 
 #[test]
+fn test_tuple_addition() {
+    let tuple = Value::from_object(tuple![1, 2, 3, 4, 5, 6]);
+    let rv = minijinja::render!(
+        "{% set my_tuple = (1,2,3) + (4,5,6) %}{{ my_tuple }}",
+        my_tuple => tuple
+    );
+    assert_snapshot!(rv, @"(1, 2, 3, 4, 5, 6)");
+}
+
+#[test]
 fn test_builtin_seq_objects() {
     let rv = minijinja::render!(
         "{{ val }}",
@@ -555,8 +565,8 @@ fn test_value_cmp() {
 #[test]
 fn test_call_kwargs() {
     let mut env = Environment::new();
-    env.add_template("foo", "", &[]).unwrap();
-    let tmpl = env.get_template("foo", &[]).unwrap();
+    env.add_template("foo", "").unwrap();
+    let tmpl = env.get_template("foo").unwrap();
     let state = tmpl.new_state();
     let val = Value::from_function(|kwargs: Kwargs| kwargs.get::<i32>("foo"));
     let rv = val

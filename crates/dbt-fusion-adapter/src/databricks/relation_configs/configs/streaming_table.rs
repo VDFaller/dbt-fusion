@@ -54,9 +54,11 @@ impl DatabricksRelationConfigBase for StreamingTableConfig {
         self.config.get(key).cloned()
     }
 
+    // Reference: https://github.com/databricks/dbt-databricks/blob/87073fe7f26bede434a3bd783717a6e49d35893f/dbt/adapters/databricks/relation_configs/streaming_table.py#L30
     fn get_changeset(&self, existing: MiniJinjaValue) -> Option<Arc<dyn RelationChangeSet>> {
         let mut changes = BTreeMap::new();
         let mut requires_refresh = false;
+        let mut requires_replace = false;
         let existing = existing.downcast_object::<DatabricksRelationConfigBaseObject>()?;
 
         for component in self.config_components_() {
@@ -64,31 +66,45 @@ impl DatabricksRelationConfigBase for StreamingTableConfig {
             if let (Some(value), Some(existing_value)) =
                 (self.get_config(key), existing.get_component(key))
             {
-                let diff = value
-                    .get_diff(&existing_value)
-                    .or_else(|| Some(Arc::new(value.clone()) as Arc<dyn ComponentConfig>));
+                let diff = value.get_diff(&existing_value);
 
                 // Special handling for partition_by changes
                 if key == "partition_by" && diff.is_some() {
                     requires_refresh = true;
                 }
 
-                // Only add to changes if it's not a RefreshConfig
-                if let Some(diff) = diff {
-                    if !matches!(
+                if diff.is_some_and(|diff| {
+                    !matches!(
                         diff.as_any().downcast_ref::<DatabricksComponentConfig>(),
                         Some(DatabricksComponentConfig::Refresh(_))
-                    ) {
-                        changes.insert(key.to_string(), diff);
-                    }
+                    )
+                }) {
+                    requires_replace = true;
+                }
+
+                let diff = value
+                    .get_diff(&existing_value)
+                    .or_else(|| Some(Arc::new(value.clone()) as Arc<dyn ComponentConfig>));
+
+                // Only add to changes if it's not a RefreshConfig
+                if let Some(diff) = diff
+                    && !matches!(
+                        diff.as_any().downcast_ref::<DatabricksComponentConfig>(),
+                        Some(DatabricksComponentConfig::Refresh(_))
+                    )
+                {
+                    changes.insert(key.to_string(), diff);
                 }
             }
         }
 
-        Some(Arc::new(DatabricksRelationChangeSet::new(
-            changes,
-            requires_refresh,
-        )))
+        if requires_replace {
+            return Some(Arc::new(DatabricksRelationChangeSet::new(
+                changes,
+                requires_refresh,
+            )));
+        }
+        None
     }
 }
 

@@ -1,8 +1,16 @@
+use crate::args::ResolveArgs;
+use crate::dbt_project_config::{
+    RootProjectConfigs, init_project_config, strip_resource_paths_from_ref_path,
+};
+use crate::renderer::{
+    RenderCtx, RenderCtxInner, SqlFileRenderResult, render_unresolved_sql_files,
+};
+use crate::utils::{RelationComponents, get_node_fqn, update_node_relation_components};
 use dbt_common::adapter::AdapterType;
 use dbt_common::cancellation::CancellationToken;
 use dbt_common::constants::DBT_SNAPSHOTS_DIR_NAME;
 use dbt_common::error::AbstractLocation;
-use dbt_common::io_args::StaticAnalysisKind;
+use dbt_common::io_args::{StaticAnalysisKind, StaticAnalysisOffReason};
 use dbt_common::{ErrorCode, FsResult, fs_err, show_error, show_warning, stdfs, unexpected_fs_err};
 use dbt_jinja_utils::jinja_environment::JinjaEnv;
 use dbt_jinja_utils::refs_and_sources::RefsAndSources;
@@ -10,6 +18,7 @@ use dbt_jinja_utils::serde::into_typed_with_jinja;
 use dbt_schemas::schemas::common::{DbtMaterialization, DbtQuoting, NodeDependsOn};
 use dbt_schemas::schemas::dbt_column::process_columns;
 use dbt_schemas::schemas::macros::DbtMacro;
+use dbt_schemas::schemas::nodes::AdapterAttr;
 use dbt_schemas::schemas::project::{DbtProject, SnapshotConfig};
 use dbt_schemas::schemas::properties::SnapshotProperties;
 use dbt_schemas::schemas::ref_and_source::{DbtRef, DbtSourceWrapper};
@@ -22,13 +31,6 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-
-use crate::args::ResolveArgs;
-use crate::dbt_project_config::{RootProjectConfigs, init_project_config};
-use crate::renderer::{
-    RenderCtx, RenderCtxInner, SqlFileRenderResult, render_unresolved_sql_files,
-};
-use crate::utils::{RelationComponents, get_node_fqn, update_node_relation_components};
 
 use super::resolve_properties::MinimalPropertiesEntry;
 
@@ -62,16 +64,21 @@ pub async fn resolve_snapshots(
         None
     };
 
-    let local_project_config = init_project_config(
-        &arg.io,
-        &package.dbt_project.snapshots,
-        SnapshotConfig {
-            enabled: Some(true),
-            quoting: Some(package_quoting),
-            ..Default::default()
-        },
-        dependency_package_name,
-    )?;
+    let local_project_config = if package.dbt_project.name == root_project.name {
+        root_project_configs.snapshots.clone()
+    } else {
+        init_project_config(
+            &arg.io,
+            &package.dbt_project.snapshots,
+            SnapshotConfig {
+                enabled: Some(true),
+                quoting: Some(package_quoting),
+                ..Default::default()
+            },
+            dependency_package_name,
+        )?
+    };
+
     let package_name = package.dbt_project.name.to_owned();
 
     // Create the `snapshots` directory
@@ -91,9 +98,22 @@ pub async fn resolve_snapshots(
                 .strip_prefix("snapshot_")
                 .expect("All snapshot macros should start with 'snapshot_'")
                 .to_string();
-            let target_path =
-                PathBuf::from(DBT_SNAPSHOTS_DIR_NAME).join(format!("{snapshot_name}.sql"));
+            // Preserve file layout for proper fqn generation
+            let default_snapshots_path = vec![DBT_SNAPSHOTS_DIR_NAME.to_string()];
+            let original_relative_path = strip_resource_paths_from_ref_path(
+                &macro_node.path,
+                package
+                    .dbt_project
+                    .snapshot_paths
+                    .as_ref()
+                    .unwrap_or(&default_snapshots_path),
+            );
+            let target_path = PathBuf::from(DBT_SNAPSHOTS_DIR_NAME)
+                .join(original_relative_path.with_file_name(format!("{snapshot_name}.sql")));
             let snapshot_path = arg.io.out_dir.join(&target_path);
+            if let Some(parent) = snapshot_path.parent() {
+                stdfs::create_dir_all(parent)?;
+            }
             stdfs::write(snapshot_path, macro_call)?;
             snapshot_files.push(DbtAsset {
                 path: target_path,
@@ -116,6 +136,7 @@ pub async fn resolve_snapshots(
                 base_ctx,
                 &[],
                 dependency_package_name,
+                true,
             )?;
 
             if let Some(relation) = &snapshot.relation {
@@ -236,6 +257,10 @@ pub async fn resolve_snapshots(
                     .unwrap_or(&vec![]),
             );
 
+            let static_analysis = final_config
+                .static_analysis
+                .unwrap_or(StaticAnalysisKind::On);
+
             // Create initial snapshot with default values
             let mut dbt_snapshot = DbtSnapshot {
                 __common_attr__: CommonAttributes {
@@ -243,7 +268,9 @@ pub async fn resolve_snapshots(
                     package_name: package_name.clone(),
                     path: dbt_asset.path.clone(),
                     name_span: dbt_common::Span::default(),
-                    raw_code: Some("--placeholder--".to_string()), // TODO: This is only so that dbt-evaluator returns truthy
+                    // NOTE: raw_code has to be this value for dbt-evaluator to return truthy
+                    // hydrating it with get_original_file_contents would actually break dbt-evaluator
+                    raw_code: Some("--placeholder--".to_string()),
                     // The path to the YML file, if it is specified
                     original_file_path: dbt_asset.path.clone(),
                     unique_id: unique_id.clone(),
@@ -283,9 +310,9 @@ pub async fn resolve_snapshots(
                         .unwrap_or_default()
                         .snowflake_ignore_case
                         .unwrap_or(false),
-                    static_analysis: final_config
-                        .static_analysis
-                        .unwrap_or(StaticAnalysisKind::On),
+                    static_analysis_off_reason: matches!(static_analysis, StaticAnalysisKind::Off)
+                        .then(|| StaticAnalysisOffReason::ConfiguredOff),
+                    static_analysis,
                     refs: sql_file_info
                         .refs
                         .iter()
@@ -312,6 +339,10 @@ pub async fn resolve_snapshots(
                         .clone()
                         .unwrap_or_default(),
                 },
+                __adapter_attr__: AdapterAttr::from_config_and_dialect(
+                    &final_config.__warehouse_specific_config__,
+                    adapter_type,
+                ),
                 deprecated_config: final_config.clone(),
                 compiled: None,
                 compiled_code: None,
@@ -335,6 +366,15 @@ pub async fn resolve_snapshots(
                 &components,
                 adapter_type,
             )?;
+
+            // For backwards compatibility with target_schema and target_database configs
+            if let Some(target_database) = &final_config.target_database {
+                dbt_snapshot.__base_attr__.database = target_database.clone();
+            }
+            if let Some(target_schema) = &final_config.target_schema {
+                dbt_snapshot.__base_attr__.schema = target_schema.clone();
+            }
+
             match refs_and_sources.insert_ref(&dbt_snapshot, adapter_type, status, false) {
                 Ok(_) => (),
                 Err(e) => {

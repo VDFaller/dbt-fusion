@@ -104,7 +104,8 @@ pub fn format_materialization_suffix(materialization: Option<&str>, desc: Option
     let truncated_mat = match materialization {
         Some("materialized_view") => Some("mat_view"),
         Some("streaming_table") => Some("streaming"),
-        Some("test") | Some("unit_test") | None => None,
+        // Hide materialization label for tests and unit tests
+        Some("test") | Some("unit_test") | Some("unit") | None => None,
         Some(other) => Some(other),
     };
     match (truncated_mat, desc) {
@@ -369,10 +370,16 @@ macro_rules! show_completed {
                 .signed_duration_since($start_time)
                 .to_std()
                 .unwrap_or_default();
-            let resource_type = $task.resource_type();
+            let resource_type_str = $task.resource_type();
             let materialization = $task.base().materialized.to_string();
-            let schema = $task.base().schema.clone();
-            let alias = $task.base().alias.clone();
+            // Default schema/alias
+            let mut schema = $task.base().schema.clone();
+            let mut alias = $task.base().alias.clone();
+            // For unit tests: display test schema + unit test name
+            if resource_type_str == NodeType::UnitTest {
+                schema = format!("{}_dbt_test__audit", schema);
+                alias = $task.common().name.clone();
+            }
 
             let desc = if matches!($node_status, NodeStatus::Succeeded) {
                 $with_cache.then_some("New changes detected".to_string())
@@ -389,7 +396,7 @@ macro_rules! show_completed {
 
             if $io.should_show(ShowOptions::Completed) {
                 let schema_alias = format_schema_alias(&schema, &alias);
-                let resource_type_formatted = format_resource_type_fixed_width(resource_type);
+                let resource_type_formatted = format_resource_type_fixed_width(resource_type_str.as_ref());
                 let materialization_suffix = format_materialization_suffix(Some(&materialization), desc.as_deref());
                 let duration = format_duration_fixed_width(duration);
                 let output = format!(
@@ -787,24 +794,26 @@ macro_rules! show_warning {
         let err = $err;
 
         // New tracing based logic
-        use $crate::tracing::{ToTracingValue, log_level_to_severity};
+        use $crate::tracing::convert::log_level_to_severity;
         use $crate::tracing::emit::_tracing::Level as TracingLevel;
-        use $crate::tracing::metrics::{increment_metric, MetricKey};
-        use $crate::tracing::constants::TRACING_ATTR_FIELD;
-        use $crate::macros::_dbt_telemetry::{LogEventInfo, TelemetryAttributes, RecordCodeLocation};
-        increment_metric(MetricKey::TotalWarnings, 1);
+        use $crate::macros::_dbt_telemetry::LogMessage;
 
         let (original_severity_number, original_severity_text) = log_level_to_severity(&$crate::macros::log_adapter::log::Level::Warn);
 
         $crate::emit_tracing_event!(
             level: TracingLevel::WARN,
-            TelemetryAttributes::Log(LogEventInfo {
+            LogMessage {
                 code: Some(err.code as u16 as u32),
-                dbt_core_code: None,
-                original_severity_number,
+                dbt_core_event_code: None,
+                original_severity_number: original_severity_number as i32,
                 original_severity_text: original_severity_text.to_string(),
-                location: RecordCodeLocation::none(), // Will be auto injected
-            }),
+                // The rest will be auto injected
+                phase: None,
+                unique_id: None,
+                file: None,
+                line: None,
+            }
+            .into(),
             "{}",
             err.pretty().as_str()
         );
@@ -1150,7 +1159,7 @@ macro_rules! show_progress_exit {
         );
         if $arg.io.show.contains(&ShowOptions::Completed) || e_ct > 0 {
             let elapsed = $start_time.elapsed().unwrap().as_secs_f32();
-            let completed_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6f").to_string();
+            let completed_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
             log::info!(elapsed = elapsed, name = "CommandCompleted", data:serde = json!({"completed_at": completed_at, "elapsed": elapsed, "success": e_ct == 0}); "{}", output);
         }
 

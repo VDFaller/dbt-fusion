@@ -113,6 +113,7 @@ pub fn value_from_file(
 ///
 /// `dependency_package_name` is used to determine if the file is part of a dependency package,
 /// which affects how errors are reported.
+#[allow(clippy::too_many_arguments)]
 pub fn into_typed_with_jinja<T, S>(
     io_args: &IoArgs,
     value: Value,
@@ -121,6 +122,7 @@ pub fn into_typed_with_jinja<T, S>(
     ctx: &S,
     listeners: &[Rc<dyn RenderingEventListener>],
     dependency_package_name: Option<&str>,
+    show_errors_or_warnings: bool,
 ) -> FsResult<T>
 where
     T: DeserializeOwned,
@@ -129,15 +131,17 @@ where
     let (res, errors) =
         into_typed_with_jinja_error(value, should_render_secrets, env, ctx, listeners)?;
 
-    for error in errors {
-        if let Some(package_name) = dependency_package_name
-            && !io_args.show_all_deprecations
-        {
-            // If we are parsing a dependency package, we use a special macros
-            // that ensures at most one error is shown per package.
-            show_package_error!(io_args, package_name);
-        } else {
-            show_strict_error!(io_args, error, dependency_package_name);
+    if show_errors_or_warnings {
+        for error in errors {
+            if let Some(package_name) = dependency_package_name
+                && !io_args.show_all_deprecations
+            {
+                // If we are parsing a dependency package, we use a special macros
+                // that ensures at most one error is shown per package.
+                show_package_error!(io_args, package_name);
+            } else {
+                show_strict_error!(io_args, error, dependency_package_name);
+            }
         }
     }
 
@@ -264,10 +268,10 @@ where
 
 fn detect_yaml_indentation(input: &str) -> Option<usize> {
     for line in input.lines() {
-        if let Some((indentation, _)) = line.char_indices().find(|&(_, c)| !c.is_whitespace()) {
-            if indentation == 2 || indentation == 4 {
-                return Some(indentation);
-            }
+        if let Some((indentation, _)) = line.char_indices().find(|&(_, c)| !c.is_whitespace())
+            && (indentation == 2 || indentation == 4)
+        {
+            return Some(indentation);
         }
     }
 
@@ -495,11 +499,11 @@ pub fn yaml_to_fs_error(err: dbt_serde_yaml::Error, filename: Option<&Path>) -> 
         location
     };
 
-    if let Some(err) = err.into_external() {
-        if let Ok(err) = err.downcast::<FsError>() {
-            // These are errors raised from our own callbacks:
-            return err;
-        }
+    if let Some(err) = err.into_external()
+        && let Ok(err) = err.downcast::<FsError>()
+    {
+        // These are errors raised from our own callbacks:
+        return err;
     }
     FsError::new(ErrorCode::SerializationError, format!("YAML error: {msg}"))
         .with_location(location)

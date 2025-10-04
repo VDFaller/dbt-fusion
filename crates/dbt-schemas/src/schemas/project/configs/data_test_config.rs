@@ -18,14 +18,16 @@ use crate::schemas::project::configs::common::{
     WarehouseSpecificNodeConfig, default_meta_and_tags, default_quoting,
 };
 use crate::schemas::project::{DefaultTo, IterChildren};
-use crate::schemas::serde::{StringOrArrayOfStrings, bool_or_string_bool, u64_or_string_u64};
+use crate::schemas::serde::{
+    StringOrArrayOfStrings, bool_or_string_bool, f64_or_string_f64, u64_or_string_u64,
+};
 
 #[skip_serializing_none]
 #[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
 pub struct ProjectDataTestConfig {
     #[serde(rename = "+alias")]
     pub alias: Option<String>,
-    #[serde(rename = "+database", alias = "+project")]
+    #[serde(rename = "+database", alias = "+project", alias = "+data_space")]
     pub database: Option<String>,
     #[serde(default, rename = "+enabled", deserialize_with = "bool_or_string_bool")]
     pub enabled: Option<bool>,
@@ -152,9 +154,9 @@ pub struct ProjectDataTestConfig {
     #[serde(
         default,
         rename = "+refresh_interval_minutes",
-        deserialize_with = "u64_or_string_u64"
+        deserialize_with = "f64_or_string_f64"
     )]
-    pub refresh_interval_minutes: Option<u64>,
+    pub refresh_interval_minutes: Option<f64>,
     #[serde(rename = "+description")]
     pub description: Option<String>,
     #[serde(rename = "+max_staleness")]
@@ -266,7 +268,7 @@ pub struct ProjectDataTestConfig {
 }
 
 impl IterChildren<ProjectDataTestConfig> for ProjectDataTestConfig {
-    fn iter_children(&self) -> Iter<String, ShouldBe<Self>> {
+    fn iter_children(&self) -> Iter<'_, String, ShouldBe<Self>> {
         self.__additional_properties__.iter()
     }
 }
@@ -275,7 +277,10 @@ impl IterChildren<ProjectDataTestConfig> for ProjectDataTestConfig {
 #[derive(Deserialize, Serialize, Debug, Clone, Default, JsonSchema)]
 pub struct DataTestConfig {
     pub alias: Option<String>,
+    #[serde(alias = "project", alias = "data_space")]
     pub database: Option<String>,
+    #[serde(alias = "dataset")]
+    pub schema: Option<String>,
     #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub enabled: Option<bool>,
     pub error_if: Option<String>,
@@ -283,7 +288,6 @@ pub struct DataTestConfig {
     pub group: Option<String>,
     pub limit: Option<i32>,
     pub meta: Option<BTreeMap<String, YmlValue>>,
-    pub schema: Option<String>,
     pub severity: Option<Severity>,
     #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub store_failures: Option<bool>,

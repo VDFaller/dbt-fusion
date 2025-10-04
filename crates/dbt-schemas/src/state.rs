@@ -12,7 +12,7 @@ use crate::schemas::{
     DbtSource, InternalDbtNodeAttributes, Nodes,
     common::{DbtQuoting, ResolvedQuoting},
     macros::{DbtDocsMacro, DbtMacro},
-    manifest::DbtOperation,
+    manifest::{DbtOperation, DbtSelector},
     profiles::DbConfig,
     project::{
         DbtProject, ProjectDataTestConfig, ProjectModelConfig, ProjectSeedConfig,
@@ -35,7 +35,6 @@ use std::fmt;
 #[derive(Debug, Hash, Eq, PartialEq, Clone, Ord, PartialOrd)]
 pub enum ResourcePathKind {
     ProfilePaths,
-    ProjectPaths,
     ModelPaths,
     AnalysisPaths,
     AssetPaths,
@@ -45,6 +44,7 @@ pub enum ResourcePathKind {
     SnapshotPaths,
     TestPaths,
     FixturePaths,
+    SessionPaths,
 }
 
 impl fmt::Display for ResourcePathKind {
@@ -58,9 +58,9 @@ impl fmt::Display for ResourcePathKind {
             ResourcePathKind::SeedPaths => "seed paths",
             ResourcePathKind::SnapshotPaths => "snapshot paths",
             ResourcePathKind::TestPaths => "test paths",
-            ResourcePathKind::ProjectPaths => "project paths",
             ResourcePathKind::ProfilePaths => "profile paths",
             ResourcePathKind::FixturePaths => "fixture paths",
+            ResourcePathKind::SessionPaths => "session paths",
         };
         write!(f, "{kind_str}")
     }
@@ -180,6 +180,7 @@ pub struct DbtPackage {
     pub seed_files: Vec<DbtAsset>,
     pub docs_files: Vec<DbtAsset>,
     pub snapshot_files: Vec<DbtAsset>,
+    pub inline_file: Option<DbtAsset>,
     pub dependencies: BTreeSet<String>,
     pub all_paths: HashMap<ResourcePathKind, Vec<(PathBuf, SystemTime)>>,
 }
@@ -275,13 +276,20 @@ pub trait RefsAndSourcesTracker: fmt::Debug + Send + Sync {
         name: &str,
         version: &Option<String>,
         node_package_name: &Option<String>,
-    ) -> FsResult<(String, MinijinjaValue, ModelStatus)>;
+    ) -> FsResult<(String, MinijinjaValue, ModelStatus, Option<MinijinjaValue>)>;
     fn lookup_source(
         &self,
         package_name: &str,
         source_name: &str,
         table_name: &str,
     ) -> FsResult<(String, MinijinjaValue, ModelStatus)>;
+    fn compile_or_test(&self) -> bool;
+    fn update_ref_with_deferral(
+        &mut self,
+        node: &dyn InternalDbtNodeAttributes,
+        adapter_type: AdapterType,
+        is_frontier: bool,
+    ) -> FsResult<()>;
 }
 
 // test only
@@ -321,7 +329,7 @@ impl RefsAndSourcesTracker for DummyRefsAndSourcesTracker {
         name: &str,
         _version: &Option<String>,
         _node_package_name: &Option<String>,
-    ) -> FsResult<(String, MinijinjaValue, ModelStatus)> {
+    ) -> FsResult<(String, MinijinjaValue, ModelStatus, Option<MinijinjaValue>)> {
         Err(fs_err!(
             ErrorCode::Generic,
             "DummyRefsAndSourcesTracker: lookup_ref not implemented for '{}'",
@@ -342,6 +350,22 @@ impl RefsAndSourcesTracker for DummyRefsAndSourcesTracker {
             table_name
         ))
     }
+
+    fn update_ref_with_deferral(
+        &mut self,
+        _node: &dyn InternalDbtNodeAttributes,
+        _adapter_type: AdapterType,
+        _is_frontier: bool,
+    ) -> FsResult<()> {
+        Err(fs_err!(
+            ErrorCode::Generic,
+            "DummyRefsAndSourcesTracker: update_ref_with_deferral not implemented"
+        ))
+    }
+
+    fn compile_or_test(&self) -> bool {
+        false
+    }
 }
 
 impl Default for DummyRefsAndSourcesTracker {
@@ -361,6 +385,10 @@ pub struct Operations {
     pub on_run_end: Vec<Spanned<DbtOperation>>,
 }
 
+pub type GetRelationCalls = BTreeMap<String, Vec<Arc<dyn BaseRelation>>>;
+pub type GetColumnsInRelationCalls = BTreeMap<String, Vec<Arc<dyn BaseRelation>>>;
+pub type PatternedDanglingSources = BTreeMap<String, Vec<RelationPattern>>;
+
 #[derive(Debug, Clone)]
 pub struct ResolverState {
     pub root_project_name: String,
@@ -372,16 +400,43 @@ pub struct ResolverState {
     pub dbt_profile: DbtProfile,
     pub render_results: RenderResults,
     pub refs_and_sources: Arc<dyn RefsAndSourcesTracker>,
-    pub get_relation_calls: BTreeMap<String, Vec<Arc<dyn BaseRelation>>>,
-    pub get_columns_in_relation_calls: BTreeMap<String, Vec<Arc<dyn BaseRelation>>>,
-    pub patterned_dangling_sources: BTreeMap<String, Vec<RelationPattern>>,
+    pub get_relation_calls: GetRelationCalls,
+    pub get_columns_in_relation_calls: GetColumnsInRelationCalls,
+    pub patterned_dangling_sources: PatternedDanglingSources,
     pub run_started_at: DateTime<Tz>,
     pub runtime_config: Arc<DbtRuntimeConfig>,
+    pub manifest_selectors: BTreeMap<String, DbtSelector>,
     pub resolved_selectors: ResolvedSelector,
     pub root_project_quoting: ResolvedQuoting,
     pub defer_nodes: Option<Nodes>,
     /// Nodes that had resolution errors (e.g., unresolved refs/sources)
     pub nodes_with_resolution_errors: HashSet<String>,
+    pub semantic_layer_spec_is_legacy: bool,
+}
+
+impl ResolverState {
+    // Build reverse dependency map (who depends on whom)
+    pub fn create_reverse_deps(&self) -> BTreeMap<String, BTreeSet<String>> {
+        let mut reverse_deps: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (unique_id, node) in self.nodes.iter() {
+            for (dep, _) in node.base().depends_on.nodes_with_ref_location.iter() {
+                reverse_deps
+                    .entry(dep.clone())
+                    .or_default()
+                    .insert(unique_id.clone());
+            }
+        }
+        reverse_deps
+    }
+
+    pub fn to_resolved_nodes(&self) -> ResolvedNodes {
+        ResolvedNodes {
+            nodes: self.nodes.clone(),
+            disabled_nodes: self.disabled_nodes.clone(),
+            macros: self.macros.clone(),
+            operations: self.operations.clone(),
+        }
+    }
 }
 
 impl fmt::Display for ResolverState {

@@ -47,7 +47,8 @@ pub async fn execute_fs(
     init_logger((&eval_arg.io).into()).expect("Failed to initialize logger");
 
     // Create the Invocation span as a new root
-    let invocation_span = create_root_info_span!(create_invocation_attributes("dbt-sa", &eval_arg));
+    let invocation_span =
+        create_root_info_span!(create_invocation_attributes("dbt-sa", &eval_arg).into());
 
     let result = do_execute_fs(&eval_arg, cli, token)
         .instrument(invocation_span.clone())
@@ -212,11 +213,10 @@ async fn execute_all_phases(
     // Parses (dbt parses) all .sql files with execute == false
     let resolve_args = ResolveArgs::try_from_eval_args(&arg)?;
     let invocation_args = InvocationArgs::from_eval_args(&arg);
-    let arc_dbt_state = Arc::new(dbt_state);
     let (resolved_state, _jinja_env) = resolve(
         &resolve_args,
         &invocation_args,
-        arc_dbt_state,
+        dbt_state,
         Macros::default(),
         Nodes::default(),
         Some(Arc::new(

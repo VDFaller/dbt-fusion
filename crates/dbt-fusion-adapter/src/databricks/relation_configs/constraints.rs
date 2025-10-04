@@ -266,20 +266,16 @@ impl ConstraintsProcessor {
                         .or_else(|_| row.get_attr("property_name")),
                     row.get_attr("value")
                         .or_else(|_| row.get_attr("property_value")),
-                ) {
-                    if let (Some(name_str), Some(value_str)) =
-                        (property_name.as_str(), property_value.as_str())
-                    {
-                        if name_str.starts_with("delta.constraints.") {
-                            let constraint_name =
-                                name_str.strip_prefix("delta.constraints.").unwrap();
-                            check_constraints.insert(TypedConstraint::Check {
-                                name: Some(constraint_name.to_string()),
-                                expression: value_str.to_string(),
-                                columns: None,
-                            });
-                        }
-                    }
+                ) && let (Some(name_str), Some(value_str)) =
+                    (property_name.as_str(), property_value.as_str())
+                    && name_str.starts_with("delta.constraints.")
+                {
+                    let constraint_name = name_str.strip_prefix("delta.constraints.").unwrap();
+                    check_constraints.insert(TypedConstraint::Check {
+                        name: Some(constraint_name.to_string()),
+                        expression: value_str.to_string(),
+                        columns: None,
+                    });
                 }
             }
         }
@@ -302,15 +298,13 @@ impl ConstraintsProcessor {
             for row in table.rows() {
                 if let (Ok(constraint_name), Ok(column_name)) =
                     (row.get_attr("constraint_name"), row.get_attr("column_name"))
-                {
-                    if let (Some(name_str), Some(col_str)) =
+                    && let (Some(name_str), Some(col_str)) =
                         (constraint_name.as_str(), column_name.as_str())
-                    {
-                        constraint_columns
-                            .entry(name_str.to_string())
-                            .or_default()
-                            .push(col_str.to_string());
-                    }
+                {
+                    constraint_columns
+                        .entry(name_str.to_string())
+                        .or_default()
+                        .push(col_str.to_string());
                 }
             }
 
@@ -353,32 +347,30 @@ impl ConstraintsProcessor {
                     row.get_attr("parent_schema_name"),
                     row.get_attr("parent_table_name"),
                     row.get_attr("parent_column_name"),
+                ) && let (
+                    Some(name_str),
+                    Some(col_str),
+                    Some(catalog_str),
+                    Some(schema_str),
+                    Some(table_str),
+                    Some(to_col_str),
+                ) = (
+                    constraint_name.as_str(),
+                    column_name.as_str(),
+                    to_catalog.as_str(),
+                    to_schema.as_str(),
+                    to_table.as_str(),
+                    to_column.as_str(),
                 ) {
-                    if let (
-                        Some(name_str),
-                        Some(col_str),
-                        Some(catalog_str),
-                        Some(schema_str),
-                        Some(table_str),
-                        Some(to_col_str),
-                    ) = (
-                        constraint_name.as_str(),
-                        column_name.as_str(),
-                        to_catalog.as_str(),
-                        to_schema.as_str(),
-                        to_table.as_str(),
-                        to_column.as_str(),
-                    ) {
-                        let entry = fk_data
-                            .entry(name_str.to_string())
-                            .or_insert_with(|| FkData {
-                                columns: Vec::new(),
-                                to: format!("`{catalog_str}`.`{schema_str}`.`{table_str}`"),
-                                to_columns: Vec::new(),
-                            });
-                        entry.columns.push(col_str.to_string());
-                        entry.to_columns.push(to_col_str.to_string());
-                    }
+                    let entry = fk_data
+                        .entry(name_str.to_string())
+                        .or_insert_with(|| FkData {
+                            columns: Vec::new(),
+                            to: format!("`{catalog_str}`.`{schema_str}`.`{table_str}`"),
+                            to_columns: Vec::new(),
+                        });
+                    entry.columns.push(col_str.to_string());
+                    entry.to_columns.push(to_col_str.to_string());
                 }
             }
 
@@ -425,6 +417,7 @@ mod tests {
         properties::ModelConstraint,
         relations::relation_configs::{ComponentConfig, RelationChangeSet},
     };
+    use dbt_test_primitives::assert_contains;
     use std::collections::{BTreeMap, BTreeSet};
     use std::io;
     use std::sync::Arc;
@@ -509,6 +502,7 @@ fk_composite,parent_type,main,default,parents,type
             quoting_ignore_case: false,
             materialized: DbtMaterialization::Table,
             static_analysis: dbt_common::io_args::StaticAnalysisKind::On,
+            static_analysis_off_reason: None,
             enabled: true,
             extended_model: false,
             persist_docs: None,
@@ -614,7 +608,7 @@ fk_composite,parent_type,main,default,parents,type
         assert!(diff.is_some());
 
         let diff_config = diff.unwrap();
-        assert!(diff_config.set_non_nulls.contains("name"));
+        assert_contains!(diff_config.set_non_nulls, "name");
         assert_eq!(diff_config.set_constraints.len(), 2);
         assert_eq!(diff_config.unset_constraints.len(), 1);
     }
@@ -633,8 +627,8 @@ fk_composite,parent_type,main,default,parents,type
 
         if let Some(DatabricksComponentConfig::Constraints(config)) = component {
             assert_eq!(config.set_non_nulls.len(), 2);
-            assert!(config.set_non_nulls.contains("id"));
-            assert!(config.set_non_nulls.contains("name"));
+            assert_contains!(config.set_non_nulls, "id");
+            assert_contains!(config.set_non_nulls, "name");
             assert!(config.set_constraints.is_empty());
         } else {
             panic!("Expected Constraints config");
@@ -818,8 +812,8 @@ fk_composite,parent_type,main,default,parents,type
 
         if let Some(DatabricksComponentConfig::Constraints(config)) = component {
             assert_eq!(config.set_non_nulls.len(), 2);
-            assert!(config.set_non_nulls.contains("id"));
-            assert!(config.set_non_nulls.contains("name"));
+            assert_contains!(config.set_non_nulls, "id");
+            assert_contains!(config.set_non_nulls, "name");
             // Only not-null constraints from columns (model constraints would also be processed here)
             assert!(config.set_constraints.is_empty());
         } else {
@@ -897,7 +891,7 @@ fk_composite,parent_type,main,default,parents,type
             parse_constraints(&columns, &model_constraints).unwrap();
 
         assert_eq!(non_nulls.len(), 1);
-        assert!(non_nulls.contains("id"));
+        assert_contains!(non_nulls, "id");
 
         assert_eq!(other_constraints.len(), 2);
         assert!(other_constraints.iter().any(|c| match c {

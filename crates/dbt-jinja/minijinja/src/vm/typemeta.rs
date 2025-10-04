@@ -10,7 +10,7 @@ use crate::types::function::{LambdaType, UserDefinedFunctionType};
 use crate::types::list::ListType;
 use crate::types::struct_::StructType;
 use crate::types::tuple::TupleType;
-use crate::types::utils::{infer_type_from_const_value, instr_name, CodeLocation};
+use crate::types::utils::{infer_type_from_const_value, instr_name};
 use crate::types::DynObject;
 use crate::types::Type;
 use crate::value::ValueMap;
@@ -396,7 +396,7 @@ impl TypecheckStack {
         self.0.last()
     }
 
-    pub fn drain<R>(&mut self, range: R) -> std::vec::Drain<TypeWithConstraint>
+    pub fn drain<R>(&mut self, range: R) -> std::vec::Drain<'_, TypeWithConstraint>
     where
         R: RangeBounds<usize>,
     {
@@ -483,26 +483,6 @@ impl TypecheckState {
                 BTreeMap::new(),
             )
         }
-    }
-}
-
-/// Represents a type error
-/// We current only use the 'message', 'line_num' and 'col_num' are saved for future uses
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub struct TypeError {
-    pub message: String,
-    pub location: CodeLocation,
-}
-
-impl std::fmt::Display for TypeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "TypeError: {}", self.message)
-    }
-}
-
-impl std::fmt::Debug for TypeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "TypeError: {}", self.message)
     }
 }
 
@@ -721,7 +701,7 @@ impl<'src> TypeChecker<'src> {
                         None
                     };
                     typestate.locals.insert(
-                        name.to_string(),
+                        (*name).to_string(),
                         value_type.clone(),
                         listener.clone(),
                         span_location,
@@ -1475,30 +1455,9 @@ impl<'src> TypeChecker<'src> {
                     typestate.drop_top(arg_count.unwrap_or(0) as usize);
                     typestate.stack.push(Type::Bool);
                 }
-                Instruction::CallFunction(name, arg_count, span) => {
+                Instruction::CallFunction(name, arg_count, span, ref_or_source_span) => {
                     // TYPECHECK: YES
                     listener.set_span(span);
-                    // check the parameter types
-                    // For internal rust functions
-                    // if let Some(func) = state.lookup(name).filter(|func| !func.is_undefined()) {
-                    //     let mut rv_type: String;
-                    //     if let Some(arg_cnt) = arg_count {
-                    //         let _args = typestate.get_call_args(*arg_cnt);
-                    //     }
-                    //     rv_type = func.sign().to_string();
-                    //     if let Some(pos) = rv_type.find("->") {
-                    //         rv_type = rv_type[pos + 2..].trim().to_string();
-                    //     } else {
-                    //         rv_type = "value".to_string(); // default return type
-                    //     }
-                    //     let mut set = HashSet::new();
-                    //     set.insert(parse_type(&rv_type));
-                    //     typestate.stack.push(set);
-                    // }
-                    // // else if search the name in funcsigns, for defined macros
-                    // else {
-                    // TYPECHECK: YES
-                    // check the parameter types
 
                     if *name == "caller" {
                         // judge whether current block is a macro
@@ -1540,6 +1499,36 @@ impl<'src> TypeChecker<'src> {
                                 &kwargs,
                                 listener.clone(),
                             )?);
+
+                            if *name == "ref" {
+                                if let Some(ref_or_source_span) = ref_or_source_span {
+                                    if let Type::String(Some(name)) = &args[0] {
+                                        listener.on_model_reference(
+                                            name,
+                                            &ref_or_source_span.start_line,
+                                            &ref_or_source_span.start_col,
+                                            &ref_or_source_span.start_offset,
+                                            &ref_or_source_span.end_line,
+                                            &ref_or_source_span.end_col,
+                                            &ref_or_source_span.end_offset,
+                                        );
+                                    }
+                                }
+                            } else if *name == "source" {
+                                if let Some(ref_or_source_span) = ref_or_source_span {
+                                    if let Type::String(Some(name)) = args.last().unwrap() {
+                                        listener.on_model_source_reference(
+                                            name,
+                                            &ref_or_source_span.start_line,
+                                            &ref_or_source_span.start_col,
+                                            &ref_or_source_span.start_offset,
+                                            &ref_or_source_span.end_line,
+                                            &ref_or_source_span.end_col,
+                                            &ref_or_source_span.end_offset,
+                                        );
+                                    }
+                                }
+                            }
                         }
                     } else if let Ok(Type::Object(funcsign)) = typestate
                         .locals
@@ -1555,6 +1544,11 @@ impl<'src> TypeChecker<'src> {
                                 &kwargs,
                                 listener.clone(),
                             )?);
+                            if let (Some(def_span), Some(def_path)) =
+                                (funcsign.get_span(), funcsign.get_path())
+                            {
+                                listener.on_function_call(span, &def_span, &def_path);
+                            }
                         }
                     } else if let Ok(Type::Any { hard: true }) = typestate
                         .locals
@@ -1571,6 +1565,11 @@ impl<'src> TypeChecker<'src> {
                                 &kwargs,
                                 listener.clone(),
                             )?);
+                            if let (Some(def_span), Some(def_path)) =
+                                (funcsign.get_span(), funcsign.get_path())
+                            {
+                                listener.on_function_call(span, &def_span, &def_path);
+                            }
                         }
                     } else if let Some(template_name) = macro_namespace_template_resolver(
                         &typecheck_resolved_context,
@@ -1587,6 +1586,11 @@ impl<'src> TypeChecker<'src> {
                                     &kwargs,
                                     listener.clone(),
                                 )?);
+                                if let (Some(def_span), Some(def_path)) =
+                                    (funcsign.get_span(), funcsign.get_path())
+                                {
+                                    listener.on_function_call(span, &def_span, &def_path);
+                                }
                             }
                         }
                     } else if let Some(arg_cnt) = arg_count {
@@ -1634,6 +1638,13 @@ impl<'src> TypeChecker<'src> {
                                     &kwargs,
                                     listener.clone(),
                                 )?);
+                                if let (Some(def_span), Some(def_path)) =
+                                    (funcsign.get_span(), funcsign.get_path())
+                                {
+                                    listener.on_function_call(span, &def_span, &def_path);
+                                }
+                            } else {
+                                typestate.stack.push(Type::Any { hard: false });
                             }
                             continue;
                         }
@@ -1891,7 +1902,11 @@ impl<'src> TypeChecker<'src> {
                             }
                         }
                         TypeConstraintOperation::Is(test_name, is_true) => {
-                            let test_type = Type::from_str(test_name)?;
+                            let test_type = if test_name == "true" || test_name == "false" {
+                                Type::Bool
+                            } else {
+                                Type::from_str(test_name)?
+                            };
                             if !is_true {
                                 if let Ok(type_) =
                                     typestate.locals.get(name, suppressed_listener.clone())
@@ -2076,12 +2091,12 @@ pub fn macro_namespace_template_resolver(
     let current_package_name = typecheck_resolved_context
         .get(TARGET_PACKAGE_NAME)
         .cloned()
-        .unwrap_or(Value::from("dbt"));
+        .unwrap_or_else(|| Value::from("dbt"));
     let current_package_name = current_package_name.as_str().unwrap();
     let root_package = typecheck_resolved_context
         .get(ROOT_PACKAGE_NAME)
         .cloned()
-        .unwrap_or(Value::from("dbt"));
+        .unwrap_or_else(|| Value::from("dbt"));
     let root_package = root_package.as_str().unwrap();
     let dbt_and_adapters = typecheck_resolved_context
         .get(DBT_AND_ADAPTERS_NAMESPACE)

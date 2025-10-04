@@ -1,32 +1,33 @@
-use crate::AdapterType;
-use crate::cast_util::dyn_base_columns_to_value;
+use crate::column::ColumnBuilder;
+use crate::columns::StdColumn;
 use crate::errors::{AdapterError, AdapterErrorKind};
 use crate::funcs::{execute_macro, none_value};
+use crate::metadata::CatalogAndSchema;
 use crate::record_batch_utils::get_column_values;
 use crate::relation_object::RelationObject;
 use crate::response::{AdapterResponse, ResultObject};
 use crate::snapshots::SnapshotStrategy;
-use crate::sql_engine::{SqlEngine, execute_query_with_retry};
-use crate::{AdapterResult, AdapterTyping};
-use dbt_agate::AgateTable;
+use crate::sql_engine::{Options as ExecuteOptions, SqlEngine, execute_query_with_retry};
+use crate::{AdapterResult, AdapterType, AdapterTyping};
 
+use adbc_core::options::OptionValue;
 use arrow::array::{RecordBatch, StringArray, TimestampMillisecondArray};
 use arrow_schema::{DataType, Schema};
+use dbt_agate::AgateTable;
 use dbt_common::FsResult;
 use dbt_common::behavior_flags::BehaviorFlag;
 use dbt_frontend_common::dialect::Dialect;
-use dbt_schemas::schemas::columns::base::{BaseColumn, StdColumn, string_type};
 use dbt_schemas::schemas::common::Constraint;
 use dbt_schemas::schemas::common::ConstraintSupport;
 use dbt_schemas::schemas::common::ConstraintType;
 use dbt_schemas::schemas::common::DbtIncrementalStrategy;
-use dbt_schemas::schemas::common::ResolvedQuoting;
 use dbt_schemas::schemas::dbt_column::{DbtColumn, DbtColumnRef};
 use dbt_schemas::schemas::manifest::{BigqueryClusterConfig, BigqueryPartitionConfig};
 use dbt_schemas::schemas::project::ModelConfig;
 use dbt_schemas::schemas::relations::base::{BaseRelation, ComponentName};
 use dbt_schemas::schemas::relations::relation_configs::BaseRelationConfig;
 use dbt_schemas::schemas::{CommonAttributes, InternalDbtNodeAttributes};
+use dbt_xdbc::salesforce::DATA_TRANSFORM_RUN_TIMEOUT;
 use dbt_xdbc::{Connection, QueryCtx};
 use minijinja::{State, Value, args};
 
@@ -55,8 +56,8 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
     }
 
     /// Get DB config by key
-    fn get_db_config(&self, _key: &str) -> Option<Cow<'_, str>> {
-        unimplemented!("typed adapter method implementation")
+    fn get_db_config(&self, key: &str) -> Option<Cow<'_, str>> {
+        self.engine().config(key)
     }
 
     /// The set of standard builtin strategies which this adapter supports out-of-the-box.
@@ -78,7 +79,17 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
     }
 
     /// Create a new connection
-    fn new_connection(&self, node_id: Option<String>) -> AdapterResult<Box<dyn Connection>>;
+    fn new_connection(
+        &self,
+        state: Option<&State>,
+        node_id: Option<String>,
+    ) -> AdapterResult<Box<dyn Connection>> {
+        if let Some(replay_adapter) = self.as_replay() {
+            replay_adapter.replay_new_connection(state, node_id)
+        } else {
+            self.engine().new_connection(state, node_id)
+        }
+    }
 
     /// Helper method for execute
     #[allow(clippy::too_many_arguments)]
@@ -87,10 +98,11 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         &self,
         dialect: Dialect,
         engine: Arc<SqlEngine>,
+        state: Option<&State>,
         conn: &'_ mut dyn Connection,
         query_ctx: &QueryCtx,
         _auto_begin: bool,
-        _fetch: bool,
+        fetch: bool,
         _limit: Option<i64>,
         options: Option<HashMap<String, String>>,
     ) -> AdapterResult<(AdapterResponse, AgateTable)> {
@@ -101,49 +113,96 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         // BigQuery API supports multi-statement
         // https://cloud.google.com/bigquery/docs/reference/standard-sql/procedural-language
         let statements = if self.adapter_type() == AdapterType::Bigquery {
-            vec![sql]
+            if engine.splitter().is_empty(&sql, dialect) {
+                vec![]
+            } else {
+                vec![sql]
+            }
         } else {
-            engine.split_statements(&sql, dialect)
+            engine.split_and_filter_statements(&sql, dialect)
         };
-        let options = options.unwrap_or_default();
+        if statements.is_empty() {
+            return Ok((AdapterResponse::default(), AgateTable::default()));
+        }
+
+        let mut options = options
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(key, value)| (key, OptionValue::String(value)))
+            .collect::<Vec<_>>();
+        if let Some(state) = state {
+            options.extend(self.get_adbc_execute_options(state));
+        }
+
+        // Configure warehouse specific options
+        #[allow(clippy::single_match)]
+        match self.adapter_type() {
+            AdapterType::Salesforce => {
+                if let Some(timeout) = engine.config("data_transform_run_timeout") {
+                    let timeout = timeout.parse::<i64>().map_err(|e| {
+                        AdapterError::new(
+                            AdapterErrorKind::Configuration,
+                            format!("data_transform_run_timeout must be an integer string: {e}",),
+                        )
+                    })?;
+                    options.push((
+                        DATA_TRANSFORM_RUN_TIMEOUT.to_string(),
+                        OptionValue::Int(timeout),
+                    ));
+                }
+            }
+            _ => {}
+        }
+
         let mut last_batch = None;
         for statement in statements {
             last_batch = Some(execute_query_with_retry(
                 engine.clone(),
+                state,
                 conn,
                 &query_ctx.with_sql(statement),
                 1,
                 &options,
+                fetch,
             )?);
         }
 
-        let table = match last_batch {
-            Some(batch) => AgateTable::from_record_batch(Arc::new(batch)),
-            None => AgateTable::default(),
-        };
+        let last_batch = last_batch.expect("last_batch should never be None");
 
-        let response = AdapterResponse {
-            // TODO: This is hardcoded, should be derived from the sql statement?
-            message: format!("SELECT {}", table.num_rows()),
-            // TODO: This is hardcoded, should be derived from the sql statement?
-            code: "SELECT".to_string(),
-            rows_affected: table.num_rows() as i64,
-            query_id: None,
-        };
+        let response = AdapterResponse::new(&last_batch, self.adapter_type());
+        let table = AgateTable::from_record_batch(Arc::new(last_batch));
 
         Ok((response, table))
     }
 
     /// Query execution implementation for a specific adapter.
+    #[allow(clippy::too_many_arguments)]
     fn execute(
         &self,
+        state: Option<&State>,
         conn: &'_ mut dyn Connection,
         query_ctx: &QueryCtx,
         auto_begin: bool,
         fetch: bool,
         limit: Option<i64>,
         options: Option<HashMap<String, String>>,
-    ) -> AdapterResult<(AdapterResponse, AgateTable)>;
+    ) -> AdapterResult<(AdapterResponse, AgateTable)> {
+        if let Some(replay_adapter) = self.as_replay() {
+            return replay_adapter
+                .replay_execute(state, conn, query_ctx, auto_begin, fetch, limit, options);
+        }
+        self.execute_inner(
+            self.adapter_type().into(),
+            Arc::clone(self.engine()),
+            state,
+            conn,
+            query_ctx,
+            auto_begin,
+            fetch,
+            limit,
+            options,
+        )
+    }
 
     /// Execute a statement, expect no results.
     fn exec_stmt(
@@ -154,6 +213,7 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
     ) -> AdapterResult<AdapterResponse> {
         // default values are the same as in dispatch_adapter_calls()
         let (response, _) = self.execute(
+            None,       // empty state
             conn,       // connection
             query_ctx,  // sql string wrapper
             auto_begin, // auto_begin
@@ -172,6 +232,7 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         limit: Option<i64>,
     ) -> AdapterResult<(AdapterResponse, AgateTable)> {
         self.execute(
+            None,      // state
             conn,      // connection
             query_ctx, // sql string wrapper
             false,     // auto_begin
@@ -189,8 +250,8 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         fetch: bool,
         limit: Option<i64>,
     ) -> AdapterResult<(AdapterResponse, AgateTable)> {
-        let mut conn = self.new_connection(None)?;
-        self.execute(&mut *conn, query_ctx, auto_begin, fetch, limit, None)
+        let mut conn = self.new_connection(None, None)?;
+        self.execute(None, &mut *conn, query_ctx, auto_begin, fetch, limit, None)
     }
 
     /// Add a query to run.
@@ -211,8 +272,27 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
     /// Quote
     fn quote(&self, state: &State, identifier: &str) -> AdapterResult<String>;
 
-    /// List schemas
-    fn list_schemas(&self, result: Arc<RecordBatch>) -> AdapterResult<Vec<String>>;
+    /// List schemas from a [RecordBatch] result of `show schemas` or equivalent.
+    fn list_schemas(&self, result_set: Arc<RecordBatch>) -> AdapterResult<Vec<String>> {
+        let schema_column_values = {
+            let col_name = match self.adapter_type() {
+                AdapterType::Snowflake => "name",
+                AdapterType::Databricks => "databaseName",
+                AdapterType::Bigquery => "schema_name",
+                AdapterType::Postgres | AdapterType::Redshift => "nspname",
+                AdapterType::Salesforce => "name",
+            };
+            get_column_values::<StringArray>(&result_set, col_name)?
+        };
+
+        let n = result_set.num_rows();
+        let mut schemas = Vec::<String>::with_capacity(n);
+        for i in 0..n {
+            let name: &str = schema_column_values.value(i);
+            schemas.push(name.to_string());
+        }
+        Ok(schemas)
+    }
 
     /// Get relation that represents (database, schema, identifier)
     /// tuple. This function checks that the warehouse has the
@@ -273,19 +353,19 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         state: &State,
         source_relation: Arc<dyn BaseRelation>,
         target_relation: Arc<dyn BaseRelation>,
-    ) -> AdapterResult<Value> {
+    ) -> AdapterResult<Vec<StdColumn>> {
         // Get columns for both relations
         let source_cols = self.get_columns_in_relation(state, source_relation)?;
         let target_cols = self.get_columns_in_relation(state, target_relation)?;
 
         let source_cols_map: BTreeMap<_, _> = source_cols
             .into_iter()
-            .map(|col| (col.name(), col))
+            .map(|col| (col.name().to_string(), col))
             .collect();
         let target_cols_set: std::collections::HashSet<_> =
-            target_cols.into_iter().map(|col| col.name()).collect();
+            target_cols.into_iter().map(|col| col.into_name()).collect();
 
-        let result: Vec<Arc<dyn BaseColumn>> = source_cols_map
+        Ok(source_cols_map
             .into_iter()
             .filter_map(|(name, col)| {
                 if target_cols_set.contains(&name) {
@@ -294,9 +374,7 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
                     Some(col)
                 }
             })
-            .collect();
-        let result = dyn_base_columns_to_value(result)?;
-        Ok(result)
+            .collect())
     }
 
     /// Get columns in relation
@@ -304,13 +382,7 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         &self,
         state: &State,
         relation: Arc<dyn BaseRelation>,
-    ) -> AdapterResult<Vec<Arc<dyn BaseColumn>>>;
-
-    /// Convert a Schema of Arrow to be represented via BaseColumn
-    fn arrow_schema_to_dbt_columns(
-        &self,
-        schema: Arc<Schema>,
-    ) -> AdapterResult<Vec<Arc<dyn BaseColumn>>>;
+    ) -> AdapterResult<Vec<StdColumn>>;
 
     /// Truncate relation
     /// https://github.com/dbt-labs/dbt-adapters/blob/main/dbt-adapters/src/dbt/adapters/sql/impl.py#L147
@@ -332,15 +404,12 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         identifier: &str,
         quote_key: &ComponentName,
     ) -> AdapterResult<String> {
-        if self.get_resolved_quoting().get_part(quote_key) {
+        if self.quoting().get_part(quote_key) {
             self.quote(state, identifier)
         } else {
             Ok(identifier.to_string())
         }
     }
-
-    /// Get resolved quoting
-    fn get_resolved_quoting(&self) -> ResolvedQuoting;
 
     /// Quote seed column, default to true if not provided
     /// reference: https://github.com/dbt-labs/dbt-adapters/blob/main/dbt-adapters/src/dbt/adapters/base/impl.py#L1072
@@ -357,8 +426,6 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         }
     }
 
-    fn convert_type_inner(&self, _state: &State, data_type: &DataType) -> AdapterResult<String>;
-
     /// Convert type.
     fn convert_type(
         &self,
@@ -366,6 +433,9 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         table: Arc<AgateTable>,
         col_idx: i64,
     ) -> AdapterResult<String> {
+        // XXX: Core uses the flattened agate table types. Here we use the original arrow
+        // schema containing the original table types including nested types. This might
+        // be what Core developers expected to get from Python agate types as well. (?)
         let schema = table.original_record_batch().schema();
         let data_type = schema.field(col_idx as usize).data_type();
 
@@ -380,7 +450,16 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
             data_type
         };
 
-        self.convert_type_inner(state, data_type)
+        if let Some(replay_adapter) = self.as_replay() {
+            // XXX: isn't the point of replay adapter to compare what it does against the actual code?
+            return replay_adapter.replay_convert_type(state, data_type);
+        }
+
+        let mut out = String::new();
+        self.engine()
+            .type_formatter()
+            .format_arrow_type_as_sql(data_type, &mut out)?;
+        Ok(out)
     }
 
     /// Expand the to_relation table's column types to match the schema of from_relation
@@ -396,32 +475,36 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         // Create HashMaps for efficient lookup
         let from_columns_map = from_columns
             .into_iter()
-            .map(|c| (c.name(), c))
+            .map(|c| (c.name().to_string(), c))
             .collect::<BTreeMap<_, _>>();
 
         let to_columns_map = to_columns
             .into_iter()
-            .map(|c| (c.name(), c))
+            .map(|c| (c.name().to_string(), c))
             .collect::<BTreeMap<_, _>>();
 
         for (column_name, reference_column) in from_columns_map {
             let to_relation_cloned = to_relation.clone();
-            if let Some(target_column) = to_columns_map.get(&column_name) {
-                if target_column.can_expand_to(reference_column.to_value()?)? {
-                    let col_string_size = reference_column.string_size()?;
-                    let new_type = string_type(col_string_size);
+            if let Some(target_column) = to_columns_map.get(&column_name)
+                && target_column.can_expand_to(&reference_column)?
+            {
+                let col_string_size = reference_column
+                    .string_size()
+                    .map_err(|msg| AdapterError::new(AdapterErrorKind::UnexpectedResult, msg))?;
+                let new_type = reference_column
+                    .as_static()
+                    .string_type(Some(col_string_size as usize));
 
-                    // Create args for macro execution
-                    execute_macro(
-                        state,
-                        args!(
-                            relation => RelationObject::new(to_relation_cloned).as_value(),
-                            column_name => column_name,
-                            new_column_type => Value::from(new_type),
-                        ),
-                        "alter_column_type",
-                    )?;
-                }
+                // Create args for macro execution
+                execute_macro(
+                    state,
+                    args!(
+                        relation => RelationObject::new(to_relation_cloned).as_value(),
+                        column_name => column_name,
+                        new_column_type => Value::from(new_type),
+                    ),
+                    "alter_column_type",
+                )?;
             }
         }
         Ok(none_value())
@@ -606,13 +689,19 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
     }
 
     /// load dataframe only used by bigquery adapter
+    #[allow(clippy::too_many_arguments)]
     fn load_dataframe(
         &self,
         _query_ctx: &QueryCtx,
         _conn: &'_ mut dyn Connection,
-        _args: &[Value],
+        _database: &str,
+        _schema: &str,
+        _table_name: &str,
+        _agate_table: Arc<AgateTable>,
+        _file_path: &str,
+        _field_delimiter: &str,
     ) -> AdapterResult<Value> {
-        unimplemented!("only available with BigQuery adapter")
+        unimplemented!("only available with BigQuery or Salesforce adapter")
     }
 
     /// alter_table_add_columns
@@ -662,19 +751,49 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         Ok(result)
     }
 
+    /// Convert an Arrow [Schema] to a [Vec] of [StdColumn]s.
+    ///
+    /// This is not part of the Jinja adapter API.
+    ///
+    /// NOTE(jason): This schema might come directly out of the driver and is not
+    /// a sdf frontend schema - this function might not format types perfectly yet
+    ///
+    /// NOTE(felipecrv): we are working on making it easy to not confuse
+    /// driver-generated schemas versus canonicalized sdf frontend schemas
+    fn schema_to_columns(&self, schema: &Arc<Schema>) -> AdapterResult<Vec<StdColumn>> {
+        let engine = self.engine();
+        let type_formatter = engine.type_formatter();
+        let builder = ColumnBuilder::new(self.adapter_type());
+
+        let fields = schema.fields();
+        let mut columns = Vec::<StdColumn>::with_capacity(fields.len());
+        for field in fields {
+            let column = builder.build(field, type_formatter)?;
+            columns.push(column);
+        }
+        Ok(columns)
+    }
+
     /// Get column schema from query
     fn get_column_schema_from_query(
         &self,
+        state: &State,
         conn: &mut dyn Connection,
         query_ctx: &QueryCtx,
-    ) -> AdapterResult<Vec<Arc<dyn BaseColumn>>>;
+    ) -> AdapterResult<Vec<StdColumn>> {
+        if let Some(replay_adapter) = self.as_replay() {
+            return replay_adapter.replay_get_column_schema_from_query(state, conn, query_ctx);
+        }
+        let batch = self.engine().execute(Some(state), conn, query_ctx)?;
+        self.schema_to_columns(&batch.schema())
+    }
 
     /// Get columns in select sql
     fn get_columns_in_select_sql(
         &self,
         _conn: &'_ mut dyn Connection,
         _sql: &str,
-    ) -> AdapterResult<Vec<Arc<dyn BaseColumn>>> {
+    ) -> AdapterResult<Vec<StdColumn>> {
         unimplemented!("only available with BigQuery adapter")
     }
 
@@ -702,6 +821,7 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
     /// get_table_options
     fn get_table_options(
         &self,
+        _state: &State,
         _config: ModelConfig,
         _node: &CommonAttributes,
         _temporary: bool,
@@ -712,6 +832,7 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
     /// get_view_options
     fn get_view_options(
         &self,
+        _state: &State,
         _config: ModelConfig,
         _node: &CommonAttributes,
     ) -> AdapterResult<BTreeMap<String, Value>> {
@@ -727,14 +848,37 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         unimplemented!("only available with BigQuery adapter")
     }
 
-    /// list_relations_without_caching
-    fn list_relations_without_caching(
+    /// Lists all relations in the provided [CatalogAndSchema]
+    fn list_relations(
         &self,
-        _state: &State,
-        _conn: &'_ mut dyn Connection,
-        _relation: Value,
-    ) -> AdapterResult<Value> {
-        unimplemented!("only available with BigQuery adapter")
+        query_ctx: &QueryCtx,
+        conn: &'_ mut dyn Connection,
+        db_schema: &CatalogAndSchema,
+    ) -> AdapterResult<Vec<Arc<dyn BaseRelation>>> {
+        use crate::metadata::*;
+        use dbt_common::adapter::AdapterType::*;
+
+        if let Some(replay_adapter) = self.as_replay() {
+            return replay_adapter.replay_list_relations(query_ctx, conn, db_schema);
+        }
+
+        let adapter = self.as_typed_base_adapter();
+        match self.adapter_type() {
+            Snowflake => snowflake::list_relations(adapter, query_ctx, conn, db_schema),
+            Bigquery => bigquery::list_relations(adapter, query_ctx, conn, db_schema),
+            Databricks => databricks::list_relations(adapter, query_ctx, conn, db_schema),
+            Redshift => redshift::list_relations(adapter, query_ctx, conn, db_schema),
+            Postgres | Salesforce => {
+                let err = AdapterError::new(
+                    AdapterErrorKind::Internal,
+                    format!(
+                        "list_relations_without_caching is not implemented for this adapter: {}",
+                        self.adapter_type()
+                    ),
+                );
+                Err(err)
+            }
+        }
     }
 
     /// Behavior (flags)
@@ -781,6 +925,7 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
     fn get_relation_config(
         &self,
         _state: &State,
+        _conn: &mut dyn Connection,
         _relation: Arc<dyn BaseRelation>,
     ) -> AdapterResult<Arc<dyn BaseRelationConfig>> {
         unimplemented!("only available with Databricks adapter")
@@ -840,10 +985,8 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         strategy: Arc<SnapshotStrategy>,
     ) -> AdapterResult<()> {
         let columns = self.get_columns_in_relation(state, relation)?;
-        let names_in_relation: Vec<String> = columns
-            .iter()
-            .map(|c| c.name_prop().to_lowercase())
-            .collect();
+        let names_in_relation: Vec<String> =
+            columns.iter().map(|c| c.name().to_lowercase()).collect();
 
         // missing columns
         let mut missing: Vec<String> = Vec::new();
@@ -852,10 +995,10 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         // here because they aren't always present.
         let mut hardcoded_columns = vec!["dbt_scd_id", "dbt_valid_from", "dbt_valid_to"];
 
-        if let Some(ref s) = strategy.hard_deletes {
-            if s == "new_record" {
-                hardcoded_columns.push("dbt_is_deleted");
-            }
+        if let Some(ref s) = strategy.hard_deletes
+            && s == "new_record"
+        {
+            hardcoded_columns.push("dbt_is_deleted");
         }
 
         for column in hardcoded_columns {
@@ -930,8 +1073,60 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         }
     }
 
-    /// Convenience to check if this [TypedBaseAdapter] implementer is used for replaying recordings
-    fn is_replay(&self) -> bool {
-        false
+    /// Optional fast-path for replay adapters: return schema existence from the trace
+    /// when available. Default is None for non-replay adapters.
+    fn schema_exists_from_trace(&self, _database: &str, _schema: &str) -> Option<bool> {
+        None
     }
+
+    /// Get the default ADBC statement options, including query comment labels if necessary
+    fn get_adbc_execute_options(&self, _state: &State) -> ExecuteOptions {
+        Vec::new()
+    }
+}
+
+/// Abstract interface for the concrete replay adapter implementation.
+///
+/// NOTE: this is a growing interface that is currently growing.
+pub trait ReplayAdapter: TypedBaseAdapter {
+    fn replay_new_connection(
+        &self,
+        state: Option<&State>,
+        node_id: Option<String>,
+    ) -> AdapterResult<Box<dyn Connection>>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn replay_execute(
+        &self,
+        state: Option<&State>,
+        conn: &'_ mut dyn Connection,
+        query_ctx: &QueryCtx,
+        auto_begin: bool,
+        fetch: bool,
+        limit: Option<i64>,
+        options: Option<HashMap<String, String>>,
+    ) -> AdapterResult<(AdapterResponse, AgateTable)>;
+
+    fn replay_convert_type(&self, state: &State, data_type: &DataType) -> AdapterResult<String>;
+
+    fn replay_list_relations(
+        &self,
+        query_ctx: &QueryCtx,
+        conn: &'_ mut dyn Connection,
+        db_schema: &CatalogAndSchema,
+    ) -> AdapterResult<Vec<Arc<dyn BaseRelation>>>;
+
+    fn replay_get_column_schema_from_query(
+        &self,
+        state: &State,
+        _conn: &mut dyn Connection,
+        _query_ctx: &QueryCtx,
+    ) -> AdapterResult<Vec<StdColumn>>;
+
+    fn replay_get_columns_in_relation(
+        &self,
+        state: &State,
+        relation: Arc<dyn BaseRelation>,
+        cache_result: Option<Vec<StdColumn>>,
+    ) -> Result<Value, minijinja::Error>;
 }

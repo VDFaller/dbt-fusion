@@ -28,19 +28,19 @@ impl TryFrom<&Value> for DescribeMaterializedViewResults {
             .get_item(&Value::from_safe_string("materialized_view".into()))
             .map_err(|e| format!("Expected key `materialized_view`: {e}"))?
             .downcast_object::<AgateTable>()
-            .ok_or("Failed to convert materialized_view to AgateTable".to_string())?;
+            .ok_or("Failed to convert materialized_view to AgateTable")?;
 
         let columns = value
             .get_item(&Value::from_safe_string("columns".into()))
             .map_err(|e| format!("Expected key `columns`: {e}"))?
             .downcast_object::<AgateTable>()
-            .ok_or("Failed to convert columns to AgateTable".to_string())?;
+            .ok_or("Failed to convert columns to AgateTable")?;
 
         let query = value
             .get_item(&Value::from_safe_string("query".into()))
             .map_err(|e| format!("Expected key `query`: {e}"))?
             .downcast_object::<AgateTable>()
-            .ok_or("Failed to convert query to AgateTable".to_string())?;
+            .ok_or("Failed to convert query to AgateTable")?;
 
         Ok(Self {
             materialized_view,
@@ -318,14 +318,14 @@ impl TryFrom<DescribeMaterializedViewResults> for RedshiftMaterializedViewConfig
             .rows()
             .into_iter()
             .next()
-            .ok_or("query table is empty".to_string())?;
+            .ok_or("query table is empty")?;
 
         let mv = value
             .materialized_view
             .rows()
             .into_iter()
             .next()
-            .ok_or("materialized_view table is empty".to_string())?;
+            .ok_or("materialized_view table is empty")?;
 
         let mv_name = get_string_by_name_from_agate_row(&mv, "table")
             .ok_or("Failed to get table name from materialized_view")?;
@@ -384,16 +384,13 @@ impl TryFrom<DescribeMaterializedViewResults> for RedshiftMaterializedViewConfig
 
             // sort_columns = [row for row in columns.rows if row.get("sort_key_position", 0) > 0]
             for row in columns_table.rows().into_iter() {
-                if let Ok(sort_pos_value) = row.get_attr("sort_key_position") {
-                    if let Some(sort_pos) = sort_pos_value.as_i64() {
-                        if sort_pos > 0 {
-                            if let Ok(col_name_value) = row.get_attr("column_name") {
-                                if let Some(col_name) = col_name_value.as_str() {
-                                    sort_columns.push((sort_pos as usize, col_name.to_string()));
-                                }
-                            }
-                        }
-                    }
+                if let Ok(sort_pos_value) = row.get_attr("sort_key_position")
+                    && let Some(sort_pos) = sort_pos_value.as_i64()
+                    && sort_pos > 0
+                    && let Ok(col_name_value) = row.get_attr("column_name")
+                    && let Some(col_name) = col_name_value.as_str()
+                {
+                    sort_columns.push((sort_pos as usize, col_name.to_string()));
                 }
             }
 

@@ -27,20 +27,27 @@ pub struct SemanticManifestSemanticModel {
 
 impl From<DbtSemanticModel> for SemanticManifestSemanticModel {
     fn from(model: DbtSemanticModel) -> Self {
+        let mut config: Option<SemanticLayerElementConfig> = None;
+        if let Some(meta) = model.deprecated_config.meta
+            && !meta.is_empty()
+        {
+            config = Some(SemanticLayerElementConfig { meta: Some(meta) });
+        }
+
         SemanticManifestSemanticModel {
             name: model.__common_attr__.name,
             description: model.__common_attr__.description,
             label: model.__semantic_model_attr__.label,
-            config: Some(SemanticLayerElementConfig {
-                meta: model.deprecated_config.meta,
-            }),
-            defaults: model.__semantic_model_attr__.defaults,
+            config,
             node_relation: model.__semantic_model_attr__.node_relation,
             primary_entity: model.__semantic_model_attr__.primary_entity,
             entities: model.__semantic_model_attr__.entities,
-            measures: model.__semantic_model_attr__.measures,
             dimensions: model.__semantic_model_attr__.dimensions,
-            metadata: model.__semantic_model_attr__.metadata,
+
+            // TODO: make sure these are supposed to be empty for backward compatibility
+            defaults: None,
+            measures: vec![], // Do NOT map from DbtSemanticModel.measures, that's only for manifest.json
+            metadata: None,
         }
     }
 }

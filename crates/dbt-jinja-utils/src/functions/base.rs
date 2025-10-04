@@ -273,9 +273,7 @@ pub fn env_var(
         }
         (Err(_), Some(default)) => {
             env_vars_guard.insert(var.to_string(), DEFAULT_ENV_PLACEHOLDER.to_string());
-            // coerce the default value to a string
-            let default_as_str = default.to_string();
-            Ok(Value::from(default_as_str))
+            Ok(default.clone())
         }
         _ => {
             let err = Error::new(
@@ -366,18 +364,18 @@ pub fn tojson(_state: &State, args: &[Value]) -> Result<Value, Error> {
         Ok(mut json_str) => {
             if sort_keys {
                 // Parse the JSON string back to a Value to sort keys
-                if let Ok(mut json_value) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                    if let Some(obj) = json_value.as_object_mut() {
-                        let sorted: serde_json::Map<String, serde_json::Value> = obj
-                            .iter()
-                            .collect::<BTreeMap<_, _>>()
-                            .into_iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect();
-                        json_value = serde_json::Value::Object(sorted);
-                        json_str =
-                            serde_json::to_string(&json_value).unwrap_or_else(|_| "{}".to_string());
-                    }
+                if let Ok(mut json_value) = serde_json::from_str::<serde_json::Value>(&json_str)
+                    && let Some(obj) = json_value.as_object_mut()
+                {
+                    let sorted: serde_json::Map<String, serde_json::Value> = obj
+                        .iter()
+                        .collect::<BTreeMap<_, _>>()
+                        .into_iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    json_value = serde_json::Value::Object(sorted);
+                    json_str =
+                        serde_json::to_string(&json_value).unwrap_or_else(|_| "{}".to_string());
                 }
             }
             Ok(Value::from_safe_string(json_str))
@@ -488,12 +486,9 @@ pub fn toyaml(_state: &State, args: &[Value]) -> Result<Value, Error> {
     };
 
     // Sort keys if requested
-    if sort_keys {
-        if let Some(obj) = json_value.as_object_mut() {
-            let sorted_map: BTreeMap<_, _> =
-                obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-            *obj = sorted_map.into_iter().collect();
-        }
+    if sort_keys && let Some(obj) = json_value.as_object_mut() {
+        let sorted_map: BTreeMap<_, _> = obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        *obj = sorted_map.into_iter().collect();
     }
 
     match dbt_serde_yaml::to_string(&json_value) {
@@ -640,7 +635,7 @@ pub fn render_fn() -> impl Fn(&State, &[Value], Kwargs) -> Result<Value, Error> 
 
         let env = state.env();
 
-        let template = env.template_from_str(sql, &[])?;
+        let template = env.template_from_str(sql)?;
         let rendered = template.render(state.get_base_context(), &[])?;
         Ok(Value::from(rendered))
     }
@@ -697,14 +692,26 @@ pub fn try_or_compiler_error_fn()
     move |state: &State<'_, '_>, args: &[Value], kwargs: Kwargs| -> Result<Value, Error> {
         let mut args = ArgParser::new(args, Some(kwargs));
         let message_if_exception = args.get::<String>("message_if_exception")?;
-        let func = args.get::<Value>("func")?;
+        let location_of_func = args.get::<Value>("loc")?;
+        let func_name = args.get::<String>("func")?;
         // Get remaining args and kwargs
         let mut remaining_args = args.get_args_as_vec_of_values();
         let drained_kwargs = args.drain_kwargs();
         let remaining_kwargs = Kwargs::from_iter(drained_kwargs);
         remaining_args.push(remaining_kwargs.into());
-        // Call the function
-        match func.call(state, &remaining_args, &[]) {
+
+        let result = if location_of_func.is_none() {
+            let func = state.lookup(&func_name).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidOperation,
+                    format!("Unknown function {func_name}"),
+                )
+            })?;
+            func.call(state, &remaining_args, &[])
+        } else {
+            location_of_func.call_method(state, &func_name, &remaining_args, &[])
+        };
+        match result {
             Ok(result) => Ok(result),
             // TODO: we need to raise CompilationError(message_if_exception, self.model)
             Err(_) => Err(Error::new(
@@ -749,7 +756,7 @@ pub fn zip_fn() -> impl Fn(&[Value], Kwargs) -> Result<Value, Error> {
         for arg in args {
             match arg.try_iter() {
                 Ok(iter) => iterators.push(iter.collect()),
-                Err(_) => return Ok(default.unwrap_or(Value::from(()))),
+                Err(_) => return Ok(default.unwrap_or_else(|| Value::from(()))),
             }
         }
 
@@ -1006,9 +1013,7 @@ impl Object for Exceptions {
             "relation_wrong_type" => {
                 let mut args = ArgParser::new(args, None);
                 let relation = args.get::<Value>("relation").unwrap_or(Value::UNDEFINED);
-                let expected_type = args
-                    .get::<String>("expected_type")
-                    .unwrap_or("".to_string());
+                let expected_type = args.get::<String>("expected_type").unwrap_or_default();
 
                 // Get the relation type from the relation value
                 let relation_type = if relation.is_undefined() {
@@ -1257,7 +1262,7 @@ mod tests {
         {{ result | sort | join(',') }}
         "#;
 
-        let tmpl = env.template_from_str(template_source, &[]).unwrap();
+        let tmpl = env.template_from_str(template_source).unwrap();
         let output = tmpl.render(Value::UNDEFINED, &[]).unwrap();
 
         // Should contain all unique elements from both sets: 1,2,3,4
@@ -1279,7 +1284,7 @@ mod tests {
         {{ result | length }}
         "#;
 
-        let tmpl = env.template_from_str(template_source, &[]).unwrap();
+        let tmpl = env.template_from_str(template_source).unwrap();
         let output = tmpl.render(Value::UNDEFINED, &[]).unwrap();
 
         // Should have 6 unique elements
@@ -1299,7 +1304,7 @@ mod tests {
         {{ result | sort | join(',') }}
         "#;
 
-        let tmpl = env.template_from_str(template_source, &[]).unwrap();
+        let tmpl = env.template_from_str(template_source).unwrap();
         let output = tmpl.render(Value::UNDEFINED, &[]).unwrap();
 
         // Should remove duplicates: 1,2,3,4,5
@@ -1312,7 +1317,7 @@ mod tests {
         env.add_function("tojson", tojson);
 
         let template_source = r#"{{ tojson({'a': 1, 'b': 'hello'}) }}"#;
-        let tmpl = env.template_from_str(template_source, &[]).unwrap();
+        let tmpl = env.template_from_str(template_source).unwrap();
         let output = tmpl.render(Value::UNDEFINED, &[]).unwrap();
         assert_eq!(output.trim(), r#"{"a":1,"b":"hello"}"#);
     }
@@ -1323,7 +1328,7 @@ mod tests {
         env.add_function("tojson", tojson);
 
         let template_source = r#"{{ tojson({'a': 1, 'b': {'c': 3}}) }}"#;
-        let tmpl = env.template_from_str(template_source, &[]).unwrap();
+        let tmpl = env.template_from_str(template_source).unwrap();
         let output = tmpl.render(Value::UNDEFINED, &[]).unwrap();
         assert_eq!(output.trim(), r#"{"a":1,"b":{"c":3}}"#);
     }
@@ -1334,7 +1339,7 @@ mod tests {
         env.add_function("tojson", tojson);
 
         let template_source = r#"{{ tojson({'b': 2, 'a': 1}, sort_keys=True) }}"#;
-        let tmpl = env.template_from_str(template_source, &[]).unwrap();
+        let tmpl = env.template_from_str(template_source).unwrap();
         let output = tmpl.render(Value::UNDEFINED, &[]).unwrap();
         assert_eq!(output.trim(), r#"{"a":1,"b":2}"#);
     }
@@ -1345,7 +1350,7 @@ mod tests {
         env.add_function("toyaml", toyaml);
 
         let template_source = r#"{{ toyaml({'a': 1, 'b': 'hello'}) }}"#;
-        let tmpl = env.template_from_str(template_source, &[]).unwrap();
+        let tmpl = env.template_from_str(template_source).unwrap();
         let output = tmpl.render(Value::UNDEFINED, &[]).unwrap();
         assert_eq!(output.trim(), "a: 1\nb: hello");
     }
@@ -1356,7 +1361,7 @@ mod tests {
         env.add_function("toyaml", toyaml);
 
         let template_source = r#"{{ toyaml({'a': 1, 'b': {'c': 3}}) }}"#;
-        let tmpl = env.template_from_str(template_source, &[]).unwrap();
+        let tmpl = env.template_from_str(template_source).unwrap();
         let output = tmpl.render(Value::UNDEFINED, &[]).unwrap();
         assert_eq!(output.trim(), "a: 1\nb:\n  c: 3");
     }
@@ -1367,7 +1372,7 @@ mod tests {
         env.add_function("toyaml", toyaml);
 
         let template_source = r#"{{ toyaml({'b': 2, 'a': 1}, sort_keys=True) }}"#;
-        let tmpl = env.template_from_str(template_source, &[]).unwrap();
+        let tmpl = env.template_from_str(template_source).unwrap();
         let output = tmpl.render(Value::UNDEFINED, &[]).unwrap();
         assert_eq!(output.trim(), "a: 1\nb: 2");
     }

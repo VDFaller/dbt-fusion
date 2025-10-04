@@ -5,7 +5,7 @@ use super::{
     task_seq::CommandFn,
     utils::{
         maybe_normalize_schema_name, maybe_normalize_slashes, maybe_normalize_time,
-        normalize_version,
+        normalize_inline_sql_files, normalize_version,
     },
 };
 use futures::FutureExt as _;
@@ -28,7 +28,7 @@ use dbt_common::{
     stdfs::{self},
 };
 
-type TextualPatch = String;
+pub(super) type TextualPatch = String;
 
 // Snowflake prompt for our REPL
 static SNOWFLAKE_PROMPT: Lazy<Regex> =
@@ -41,6 +41,7 @@ fn postprocess_actual(content: String, sort_output: bool) -> String {
         maybe_normalize_time,
         normalize_version,
         maybe_normalize_tmp_paths,
+        normalize_inline_sql_files,
     ]
     .iter()
     .fold(content, |acc, transform| transform(acc));
@@ -55,6 +56,7 @@ fn postprocess_golden(content: String, sort_output: bool) -> String {
         maybe_normalize_time,
         normalize_version,
         maybe_normalize_tmp_paths,
+        normalize_inline_sql_files,
     ]
     .iter()
     .fold(content, |acc, transform| transform(acc));
@@ -62,25 +64,25 @@ fn postprocess_golden(content: String, sort_output: bool) -> String {
     if sort_output { sort_lines(res) } else { res }
 }
 
-fn diff_goldie(
-    channel: &str,
+pub(super) fn diff_goldie<P: Fn(String) -> String>(
+    goldie_type: &str,
     postprocessed_actual: String,
     goldie_path: &Path,
-    sort_output: bool,
+    goldie_post_processor: P,
 ) -> Option<TextualPatch> {
     let goldie_exists = goldie_path.exists();
     let golden = if goldie_exists {
         stdfs::read_to_string(goldie_path).unwrap_or_else(|_| {
             panic!(
                 "cannot read golden {} from {}",
-                channel,
+                goldie_type,
                 goldie_path.display()
             )
         })
     } else {
         "".to_string()
     };
-    let golden = postprocess_golden(golden, sort_output);
+    let golden = goldie_post_processor(golden);
     let actual = maybe_normalize_slashes(postprocessed_actual);
 
     if goldie_exists && golden == actual {
@@ -112,6 +114,7 @@ fn diff_goldie(
 
 pub struct CompareEnv {
     pub project_dir: PathBuf,
+    pub target_dir: PathBuf,
     pub stdout_path: PathBuf,
     pub stderr_path: PathBuf,
     pub goldie_stdout_path: PathBuf,
@@ -128,6 +131,8 @@ pub fn create_compare_env(
     let project_dir = &project_env.absolute_project_dir;
     // golden files are read from here
     let golden_dir = &test_env.golden_dir;
+    // Target dir is in scratch space
+    let target_dir = test_env.temp_dir.join("target");
 
     // Prepare stdout and stderr
     let task_suffix = if task_index > 0 {
@@ -147,6 +152,7 @@ pub fn create_compare_env(
 
     CompareEnv {
         project_dir: project_dir.clone(),
+        target_dir,
         stdout_path,
         stderr_path,
         goldie_stdout_path,
@@ -184,8 +190,10 @@ pub async fn execute_and_compare(
     let res = AssertUnwindSafe(exe(
         cmd_vec.to_vec(),
         compare_env.project_dir,
+        compare_env.target_dir,
         stdout_file,
         stderr_file,
+        test_env.get_tracing_handle(),
     ))
     .catch_unwind()
     .await;
@@ -247,15 +255,17 @@ pub fn compare_or_update(
         Ok(vec![])
     } else {
         // Compare the generated files to the golden files
-        let patches = diff_goldie("stderr", stderr_content, &goldie_stderr_path, sort_output)
-            .into_iter()
-            .chain(diff_goldie(
-                "stdout",
-                stdout_content,
-                &goldie_stdout_path,
-                sort_output,
-            ))
-            .collect::<Vec<_>>();
+        let patches = diff_goldie("stderr", stderr_content, &goldie_stderr_path, |golden| {
+            postprocess_golden(golden, sort_output)
+        })
+        .into_iter()
+        .chain(diff_goldie(
+            "stdout",
+            stdout_content,
+            &goldie_stdout_path,
+            |golden| postprocess_golden(golden, sort_output),
+        ))
+        .collect::<Vec<_>>();
         Ok(patches)
     }
 }
@@ -335,7 +345,7 @@ mod tests {
         let line = " Succeeded [ 44.65s] test  fusion_tests_schema__ga_analytics_regression__alex.source_unique_incident_io_severity_id";
         let postprocess_actual = postprocess_actual(line.to_string(), true);
         assert_eq!(
-            " Succeeded [000.00s] test  fusion_tests_schema__replaced.source_unique_incident_io_severity_id",
+            " Succeeded [duration] test  fusion_tests_schema__replaced.source_unique_incident_io_severity_id",
             postprocess_actual
         );
     }
@@ -365,5 +375,15 @@ mod tests {
         let line = "32ms 101us 694ns";
         let postprocess_actual = postprocess_actual(line.to_string(), false);
         assert_eq!("duration", postprocess_actual);
+    }
+
+    #[test]
+    fn test_normalize_inline_sql_files() {
+        let line = "Compiling model inline_a1b2c3d4.sql to target/compiled/inline_a1b2c3d4.sql";
+        let postprocess_actual = postprocess_actual(line.to_string(), false);
+        assert_eq!(
+            "Compiling model inline_#randhash#.sql to target/compiled/inline_#randhash#.sql",
+            postprocess_actual
+        );
     }
 }

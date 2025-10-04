@@ -1,20 +1,32 @@
-use crate::TrackedStatement;
 use crate::auth::Auth;
+use crate::base_adapter::backend_of;
 use crate::config::AdapterConfig;
+use crate::databricks::databricks_compute_from_state;
 use crate::errors::{AdapterError, AdapterErrorKind, AdapterResult};
+use crate::query_comment::{EMPTY_CONFIG, QueryCommentConfig};
+use crate::record_and_replay::{RecordEngine, ReplayEngine};
+use crate::sql_types::{NaiveTypeFormatterImpl, TypeFormatter};
 use crate::stmt_splitter::StmtSplitter;
+use crate::{AdapterResponse, TrackedStatement};
 
 use adbc_core::options::{OptionStatement, OptionValue};
 use arrow::array::RecordBatch;
 use arrow::compute::concat_batches;
 use arrow_schema::Schema;
 use core::result::Result;
-use dbt_common::cancellation::{Cancellable, CancellationToken};
+use dbt_common::adapter::AdapterType;
+use dbt_common::cancellation::{Cancellable, CancellationToken, never_cancels};
 use dbt_common::constants::EXECUTING;
+use dbt_common::create_debug_span;
+use dbt_common::hashing::code_hash;
+use dbt_common::tracing::span_info::record_current_span_status_from_attrs;
 use dbt_frontend_common::dialect::Dialect;
+use dbt_schemas::schemas::common::ResolvedQuoting;
+use dbt_schemas::schemas::telemetry::{QueryExecuted, QueryOutcome};
 use dbt_xdbc::semaphore::Semaphore;
-use dbt_xdbc::{Backend, Connection, Database, QueryCtx, connection, database, driver};
+use dbt_xdbc::{Backend, Connection, Database, QueryCtx, Statement, connection, database, driver};
 use log;
+use minijinja::State;
 use serde_json::json;
 use std::borrow::Cow;
 use tracy_client::span;
@@ -23,13 +35,25 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::hash::{BuildHasher, Hasher};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::{Arc, LazyLock};
 use std::{thread, time::Duration};
 
-use super::record_and_replay::{RecordEngine, ReplayEngine};
+pub type Options = Vec<(String, OptionValue)>;
 
-type Options = Vec<(String, OptionValue)>;
+/// Naive statement splitter used in the MockAdapter
+///
+/// IMPORTANT: not suitable for production use.
+/// TODO: remove when the full stmt splitter is available to this crate.
+static NAIVE_STMT_SPLITTER: LazyLock<Arc<dyn StmtSplitter>> =
+    LazyLock::new(|| Arc::new(crate::stmt_splitter::NaiveStmtSplitter));
+
+/// Naive type formatter used in the MockAdapter
+///
+/// IMPORTANT: not suitable for production use. DEFAULTS TO SNOWFLAKE ALSO.
+/// TODO: remove when the full formatter is available to this crate.
+static NAIVE_TYPE_FORMATTER: LazyLock<Box<dyn TypeFormatter>> =
+    LazyLock::new(|| Box::new(NaiveTypeFormatterImpl::new(AdapterType::Snowflake)));
 
 #[derive(Default)]
 struct IdentityHasher {
@@ -70,7 +94,37 @@ pub struct DatabaseMap {
     inner: HashMap<database::Fingerprint, Box<dyn Database>, IdentityBuildHasher>,
 }
 
+pub struct NoopConnection;
+
+impl Connection for NoopConnection {
+    fn new_statement(&mut self) -> adbc_core::error::Result<Box<dyn Statement>> {
+        unimplemented!("ADBC statement creation in mock connection")
+    }
+
+    fn cancel(&mut self) -> adbc_core::error::Result<()> {
+        unimplemented!("ADBC connection cancellation in mock connection")
+    }
+
+    fn commit(&mut self) -> adbc_core::error::Result<()> {
+        unimplemented!("ADBC transaction commit in mock connection")
+    }
+
+    fn rollback(&mut self) -> adbc_core::error::Result<()> {
+        unimplemented!("ADBC transaction rollback in mock connection")
+    }
+
+    fn get_table_schema(
+        &self,
+        _catalog: Option<&str>,
+        _db_schema: Option<&str>,
+        _table_name: &str,
+    ) -> adbc_core::error::Result<Schema> {
+        unimplemented!("ADBC table schema retrieval in mock connection")
+    }
+}
+
 pub struct ActualEngine {
+    adapter_type: AdapterType,
     /// Auth configurator
     auth: Arc<dyn Auth>,
     /// Configuration
@@ -79,18 +133,29 @@ pub struct ActualEngine {
     configured_databases: RwLock<DatabaseMap>,
     /// Semaphore for limiting the number of concurrent connections
     semaphore: Arc<Semaphore>,
-    /// Global CLI cancellation token
-    cancellation_token: CancellationToken,
+    /// Resolved quoting policy
+    quoting: ResolvedQuoting,
     /// Statement splitter
     splitter: Arc<dyn StmtSplitter>,
+    /// Query comment config
+    query_comment: QueryCommentConfig,
+    /// Type formatter for the dilect this engine is for
+    pub type_formatter: Box<dyn TypeFormatter>,
+    /// Global CLI cancellation token
+    cancellation_token: CancellationToken,
 }
 
 impl ActualEngine {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        adapter_type: AdapterType,
         auth: Arc<dyn Auth>,
         config: AdapterConfig,
-        token: CancellationToken,
+        quoting: ResolvedQuoting,
         splitter: Arc<dyn StmtSplitter>,
+        query_comment: QueryCommentConfig,
+        type_formatter: Box<dyn TypeFormatter>,
+        token: CancellationToken,
     ) -> Self {
         let threads = config
             .get("threads")
@@ -104,13 +169,22 @@ impl ActualEngine {
 
         let permits = if threads > 0 { threads } else { u32::MAX };
         Self {
+            adapter_type,
             auth,
             config,
+            quoting,
             configured_databases: RwLock::new(DatabaseMap::default()),
             semaphore: Arc::new(Semaphore::new(permits)),
-            cancellation_token: token,
             splitter,
+            type_formatter,
+            query_comment,
+
+            cancellation_token: token,
         }
+    }
+
+    fn adapter_type(&self) -> AdapterType {
+        self.adapter_type
     }
 
     fn load_driver_and_configure_database(
@@ -164,10 +238,30 @@ impl ActualEngine {
         Ok(conn)
     }
 
-    fn new_connection(&self, _node_id: Option<String>) -> AdapterResult<Box<dyn Connection>> {
-        // TODO(felipecrv): Make this codepath more efficient
-        // (no need to reconfigure the default database)
-        self.new_connection_with_config(&self.config)
+    fn new_connection(
+        &self,
+        state: Option<&State>,
+        _node_id: Option<String>,
+    ) -> AdapterResult<Box<dyn Connection>> {
+        match self.adapter_type() {
+            AdapterType::Databricks => {
+                if let Some(databricks_compute) = state.and_then(databricks_compute_from_state) {
+                    let augmented_config = {
+                        let mut mapping = self.config.repr().clone();
+                        mapping.insert("databricks_compute".into(), databricks_compute.into());
+                        AdapterConfig::new(mapping)
+                    };
+                    self.new_connection_with_config(&augmented_config)
+                } else {
+                    self.new_connection_with_config(&self.config)
+                }
+            }
+            _ => {
+                // TODO(felipecrv): Make this codepath more efficient
+                // (no need to reconfigure the default database)
+                self.new_connection_with_config(&self.config)
+            }
+        }
     }
 
     fn cancellation_token(&self) -> CancellationToken {
@@ -185,29 +279,58 @@ pub enum SqlEngine {
     Record(RecordEngine),
     /// Engine used for replaying db interaction
     Replay(ReplayEngine),
+    /// Mock engine for the MockAdapter
+    Mock(AdapterType),
 }
 
 impl SqlEngine {
     /// Create a new [`SqlEngine::Warehouse`] based on the given configuration.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        adapter_type: AdapterType,
         auth: Arc<dyn Auth>,
         config: AdapterConfig,
+        quoting: ResolvedQuoting,
+        stmt_splitter: Arc<dyn StmtSplitter>,
+        query_comment: QueryCommentConfig,
+        type_formatter: Box<dyn TypeFormatter>,
         token: CancellationToken,
-        splitter: Arc<dyn StmtSplitter>,
     ) -> Arc<Self> {
-        let engine = ActualEngine::new(auth, config, token, splitter);
+        let engine = ActualEngine::new(
+            adapter_type,
+            auth,
+            config,
+            quoting,
+            stmt_splitter,
+            query_comment,
+            type_formatter,
+            token,
+        );
         Arc::new(SqlEngine::Warehouse(Arc::new(engine)))
     }
 
     /// Create a new [`SqlEngine::Replay`] based on the given path and adapter type.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_for_replaying(
-        backend: Backend,
+        adapter_type: AdapterType,
         path: PathBuf,
         config: AdapterConfig,
+        quoting: ResolvedQuoting,
+        stmt_splitter: Arc<dyn StmtSplitter>,
+        query_comment: QueryCommentConfig,
+        type_formatter: Box<dyn TypeFormatter>,
         token: CancellationToken,
-        splitter: Arc<dyn StmtSplitter>,
     ) -> Arc<Self> {
-        let engine = ReplayEngine::new(backend, path, config, token, splitter);
+        let engine = ReplayEngine::new(
+            adapter_type,
+            path,
+            config,
+            quoting,
+            stmt_splitter,
+            query_comment,
+            type_formatter,
+            token,
+        );
         Arc::new(SqlEngine::Replay(engine))
     }
 
@@ -217,12 +340,35 @@ impl SqlEngine {
         Arc::new(SqlEngine::Record(engine))
     }
 
-    /// Get the statement splitter for this engine
-    pub fn splitter(&self) -> Arc<dyn StmtSplitter> {
+    pub fn is_mock(&self) -> bool {
+        matches!(self, SqlEngine::Mock(_))
+    }
+
+    pub fn quoting(&self) -> ResolvedQuoting {
         match self {
-            SqlEngine::Warehouse(engine) => engine.splitter.clone(),
+            SqlEngine::Warehouse(engine) => engine.quoting,
+            SqlEngine::Record(engine) => engine.quoting(),
+            SqlEngine::Replay(engine) => engine.quoting(),
+            SqlEngine::Mock(_) => ResolvedQuoting::default(),
+        }
+    }
+
+    /// Get the statement splitter for this engine
+    pub fn splitter(&self) -> &dyn StmtSplitter {
+        match self {
+            SqlEngine::Warehouse(engine) => engine.splitter.as_ref(),
             SqlEngine::Record(engine) => engine.splitter(),
             SqlEngine::Replay(engine) => engine.splitter(),
+            SqlEngine::Mock(_) => NAIVE_STMT_SPLITTER.as_ref(),
+        }
+    }
+
+    pub fn type_formatter(&self) -> &dyn TypeFormatter {
+        match self {
+            SqlEngine::Warehouse(engine) => engine.type_formatter.as_ref(),
+            SqlEngine::Record(engine) => engine.type_formatter(),
+            SqlEngine::Replay(engine) => engine.type_formatter(),
+            SqlEngine::Mock(_adapter_type) => NAIVE_TYPE_FORMATTER.as_ref(),
         }
     }
 
@@ -232,8 +378,22 @@ impl SqlEngine {
     /// The dialect must be provided by the caller since the mapping from Backend to
     /// AdapterType/Dialect is not always deterministic (e.g., Generic backend,
     /// shared drivers like Postgres/Redshift).
-    pub fn split_statements(&self, sql: &str, dialect: Dialect) -> Vec<String> {
-        self.splitter().split(sql, dialect)
+    pub fn split_and_filter_statements(&self, sql: &str, dialect: Dialect) -> Vec<String> {
+        self.splitter()
+            .split(sql, dialect)
+            .into_iter()
+            .filter(|statement| !self.splitter().is_empty(statement, dialect))
+            .collect()
+    }
+
+    /// Get the query comment config for this engine
+    pub fn query_comment(&self) -> &QueryCommentConfig {
+        match self {
+            SqlEngine::Warehouse(engine) => &engine.query_comment,
+            SqlEngine::Record(engine) => engine.query_comment(),
+            SqlEngine::Replay(engine) => engine.query_comment(),
+            SqlEngine::Mock(_) => &EMPTY_CONFIG,
+        }
     }
 
     /// Create a new connection to the warehouse.
@@ -244,10 +404,23 @@ impl SqlEngine {
         let _span = span!("ActualEngine::new_connection");
         let conn = match &self {
             Self::Warehouse(actual_engine) => actual_engine.new_connection_with_config(config),
-            Self::Record(record_engine) => record_engine.new_connection(None),
-            Self::Replay(replay_engine) => replay_engine.new_connection(None),
+            // TODO: the record and replay engines should have a new_connection_with_config()
+            // method instead of a new_connection method
+            Self::Record(record_engine) => record_engine.new_connection(None, None),
+            Self::Replay(replay_engine) => replay_engine.new_connection(None, None),
+            Self::Mock(_) => Ok(Box::new(NoopConnection) as Box<dyn Connection>),
         }?;
         Ok(conn)
+    }
+
+    /// Get the adapter type for this engine
+    pub fn adapter_type(&self) -> AdapterType {
+        match self {
+            SqlEngine::Warehouse(actual_engine) => actual_engine.adapter_type(),
+            SqlEngine::Record(record_engine) => record_engine.adapter_type(),
+            SqlEngine::Replay(replay_engine) => replay_engine.adapter_type(),
+            SqlEngine::Mock(adapter_type) => *adapter_type,
+        }
     }
 
     pub fn backend(&self) -> Backend {
@@ -255,35 +428,55 @@ impl SqlEngine {
             SqlEngine::Warehouse(actual_engine) => actual_engine.auth.backend(),
             SqlEngine::Record(record_engine) => record_engine.backend(),
             SqlEngine::Replay(replay_engine) => replay_engine.backend(),
+            SqlEngine::Mock(adapter_type) => backend_of(*adapter_type),
         }
     }
 
     /// Create a new connection to the warehouse.
-    pub fn new_connection(&self, node_id: Option<String>) -> AdapterResult<Box<dyn Connection>> {
+    pub fn new_connection(
+        &self,
+        state: Option<&State>,
+        node_id: Option<String>,
+    ) -> AdapterResult<Box<dyn Connection>> {
         match &self {
-            Self::Warehouse(actual_engine) => actual_engine.new_connection(node_id),
-            Self::Record(record_engine) => record_engine.new_connection(node_id),
-            Self::Replay(replay_engine) => replay_engine.new_connection(node_id),
+            Self::Warehouse(actual_engine) => actual_engine.new_connection(state, node_id),
+            Self::Record(record_engine) => record_engine.new_connection(state, node_id),
+            Self::Replay(replay_engine) => replay_engine.new_connection(state, node_id),
+            Self::Mock(_) => Ok(Box::new(NoopConnection)),
         }
     }
 
     /// Execute the given SQL query or statement.
     pub fn execute(
         &self,
+        state: Option<&State>,
         conn: &'_ mut dyn Connection,
         query_ctx: &QueryCtx,
     ) -> AdapterResult<RecordBatch> {
-        self.execute_with_options(query_ctx, conn, Options::new())
+        self.execute_with_options(state, query_ctx, conn, Options::new(), true)
     }
 
     /// Execute the given SQL query or statement.
     pub fn execute_with_options(
         &self,
+        state: Option<&State>,
         query_ctx: &QueryCtx,
         conn: &'_ mut dyn Connection,
         options: Options,
+        fetch: bool,
     ) -> AdapterResult<RecordBatch> {
         assert!(query_ctx.sql().is_some() || !options.is_empty());
+
+        let query_ctx = if let Some(sql) = query_ctx.sql() {
+            if let Some(state) = state {
+                &query_ctx.with_sql(self.query_comment().add_comment(state, sql)?)
+            } else {
+                query_ctx
+            }
+        } else {
+            query_ctx
+        };
+
         Self::log_query_ctx_for_execution(query_ctx);
 
         let token = self.cancellation_token();
@@ -310,6 +503,9 @@ impl SqlEngine {
             let reader = stmt.execute()?;
             let schema = reader.schema();
             let mut batches = Vec::with_capacity(1);
+            if !fetch {
+                return Ok((schema, batches));
+            }
             for res in reader {
                 let batch = res.map_err(adbc_core::error::Error::from)?;
                 batches.push(batch);
@@ -320,6 +516,22 @@ impl SqlEngine {
             Ok((schema, batches))
         };
         let _span = span!("SqlEngine::execute");
+
+        let sql = query_ctx.sql().unwrap_or_default();
+        let sql_hash = code_hash(sql.as_ref());
+        let adapter_type = self.adapter_type();
+        let _query_span_guard = create_debug_span!(
+            QueryExecuted::start(
+                sql,
+                sql_hash,
+                adapter_type.as_ref().to_owned(),
+                query_ctx.node_id(),
+                query_ctx.desc()
+            )
+            .into()
+        )
+        .entered();
+
         let (schema, batches) = match do_execute(conn) {
             Ok(res) => res,
             Err(Cancellable::Cancelled) => {
@@ -327,14 +539,49 @@ impl SqlEngine {
                     AdapterErrorKind::Cancelled,
                     "SQL statement execution was cancelled",
                 );
+
+                // TODO: wouldn't it be possible to salvage query_id if at least one batch was produced?
+                record_current_span_status_from_attrs(|attrs| {
+                    if let Some(attrs) = attrs.downcast_mut::<QueryExecuted>() {
+                        // dbt core had different event codes for start and end of a query
+                        attrs.dbt_core_event_code = "E017".to_string();
+                        attrs.set_query_outcome(QueryOutcome::Canceled);
+                    }
+                });
+
                 return Err(e);
             }
-            Err(Cancellable::Error(e)) => return Err(e.into()),
+            Err(Cancellable::Error(e)) => {
+                // TODO: wouldn't it be possible to salvage query_id if at least one batch was produced?
+                record_current_span_status_from_attrs(|attrs| {
+                    if let Some(attrs) = attrs.downcast_mut::<QueryExecuted>() {
+                        // dbt core had different event codes for start and end of a query
+                        attrs.dbt_core_event_code = "E017".to_string();
+                        attrs.set_query_outcome(QueryOutcome::Error);
+                        attrs.query_error_adapter_message =
+                            Some(format!("{:?}: {}", e.status, e.message));
+                        attrs.query_error_vendor_code = Some(e.vendor_code);
+                    }
+                });
+
+                return Err(e.into());
+            }
         };
         let total_batch = concat_batches(&schema, &batches)?;
+
+        record_current_span_status_from_attrs(|attrs| {
+            if let Some(attrs) = attrs.downcast_mut::<QueryExecuted>() {
+                // dbt core had different event codes for start and end of a query
+                attrs.dbt_core_event_code = "E017".to_string();
+                attrs.set_query_outcome(QueryOutcome::Success);
+                attrs.query_id = AdapterResponse::query_id(&total_batch, adapter_type)
+            }
+        });
+
         Ok(total_batch)
     }
 
+    // TODO: kill this when telemtry starts writing dbt.log
     /// Format query context as we want to see it in a log file and log it in query_log
     pub fn log_query_ctx_for_execution(ctx: &QueryCtx) {
         let mut buf = String::new();
@@ -382,6 +629,17 @@ impl SqlEngine {
             Self::Warehouse(actual_engine) => actual_engine.config.get_string(key),
             Self::Record(record_engine) => record_engine.config(key),
             Self::Replay(replay_engine) => replay_engine.config(key),
+            Self::Mock(_) => None,
+        }
+    }
+
+    // Get full config object
+    pub fn get_config(&self) -> &AdapterConfig {
+        match self {
+            Self::Warehouse(actual_engine) => &actual_engine.config,
+            Self::Record(record_engine) => record_engine.get_config(),
+            Self::Replay(replay_engine) => replay_engine.get_config(),
+            Self::Mock(_) => unreachable!("Mock engine does not support get_config"),
         }
     }
 
@@ -390,6 +648,7 @@ impl SqlEngine {
             Self::Warehouse(actual_engine) => actual_engine.cancellation_token(),
             Self::Record(record_engine) => record_engine.cancellation_token(),
             Self::Replay(replay_engine) => replay_engine.cancellation_token(),
+            Self::Mock(_) => never_cancels(),
         }
     }
 }
@@ -400,20 +659,18 @@ impl SqlEngine {
 /// https://github.com/dbt-labs/dbt-adapters/blob/996a302fa9107369eb30d733dadfaf307023f33d/dbt-adapters/src/dbt/adapters/sql/connections.py#L84
 pub fn execute_query_with_retry(
     engine: Arc<SqlEngine>,
+    state: Option<&State>,
     conn: &'_ mut dyn Connection,
     query_ctx: &QueryCtx,
     retry_limit: u32,
-    options: &HashMap<String, String>,
+    options: &Options,
+    fetch: bool,
 ) -> AdapterResult<RecordBatch> {
     let mut attempt = 0;
     let mut last_error = None;
 
-    let options = options
-        .iter()
-        .map(|(key, value)| (key.clone(), OptionValue::String(value.clone())))
-        .collect::<Options>();
     while attempt < retry_limit {
-        match engine.execute_with_options(query_ctx, conn, options.clone()) {
+        match engine.execute_with_options(state, query_ctx, conn, options.clone(), fetch) {
             Ok(result) => return Ok(result),
             Err(err) => {
                 last_error = Some(err.clone());

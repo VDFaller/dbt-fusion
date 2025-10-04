@@ -1,5 +1,6 @@
 use clap::ValueEnum;
 use dbt_serde_yaml::{JsonSchema, Value};
+use dbt_telemetry::NodeType;
 use pathdiff::diff_paths;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -37,8 +38,8 @@ pub struct IoArgs {
     pub in_dir: PathBuf,
     pub out_dir: PathBuf,
     pub log_path: Option<PathBuf>,
-    pub otm_file_name: Option<String>,
-    pub otm_parquet_file_name: Option<String>,
+    pub otel_file_name: Option<String>,
+    pub otel_parquet_file_name: Option<String>,
     pub export_to_otlp: bool,
     pub log_format: LogFormat,
     pub log_level: Option<LevelFilter>,
@@ -75,7 +76,7 @@ impl fmt::Debug for IoArgs {
             .field("in_dir", &self.in_dir)
             .field("out_dir", &self.out_dir)
             .field("log_path", &self.log_path)
-            .field("otm_file_name", &self.otm_file_name)
+            .field("otel_file_name", &self.otel_file_name)
             .field("status_reporter", &self.status_reporter.is_some())
             .finish()
     }
@@ -88,15 +89,15 @@ impl IoArgs {
         let in_dir = &self.in_dir;
         let out_dir = &self.out_dir;
 
-        if path.starts_with(in_dir) {
-            if let Some(relative_path) = diff_paths(path, in_dir) {
-                return relative_path.to_string_lossy().to_string();
-            }
+        if path.starts_with(in_dir)
+            && let Some(relative_path) = diff_paths(path, in_dir)
+        {
+            return relative_path.to_string_lossy().to_string();
         }
-        if path.starts_with(out_dir) {
-            if let Some(relative_path) = diff_paths(path, out_dir) {
-                return relative_path.to_string_lossy().to_string();
-            }
+        if path.starts_with(out_dir)
+            && let Some(relative_path) = diff_paths(path, out_dir)
+        {
+            return relative_path.to_string_lossy().to_string();
         }
         if path.is_relative() {
             let target_path = in_dir.join("target").join(path);
@@ -111,8 +112,8 @@ impl IoArgs {
     /// This function takes an artifact path, which may either be a workspace
     /// resource, or some generated temp location, and returns a path to its
     /// corresponding location in the workspace
-    pub fn map_to_workspace_path(&self, path: &Path, resource_type: &str) -> PathBuf {
-        if resource_type == "unit_test" || resource_type == "snapshot" {
+    pub fn map_to_workspace_path(&self, path: &Path, resource_type: NodeType) -> PathBuf {
+        if resource_type == NodeType::UnitTest || resource_type == NodeType::Snapshot {
             let special_component_idx = path.components().position(|c| {
                 c.as_os_str() == DBT_GENERIC_TESTS_DIR_NAME
                     || c.as_os_str() == DBT_SNAPSHOTS_DIR_NAME
@@ -179,6 +180,10 @@ pub struct EvalArgs {
     pub packages_install_path: Option<PathBuf>,
     // A package to add to deps
     pub add_package: Option<String>,
+    // Upgrade deps
+    pub upgrade: bool,
+    // Generate lock file only
+    pub lock: bool,
     // The profile to use
     pub profile: Option<String>,
     // The target within the profile to use for the dbt run
@@ -241,6 +246,7 @@ pub struct EvalArgs {
     pub static_analysis: StaticAnalysisKind,
     pub interactive: bool,
     pub check_conformance: bool,
+    pub validate_semantic_manifest: bool,
     pub task_cache_url: String,
     pub run_cache_mode: RunCacheMode,
     pub show_scans: bool,
@@ -264,6 +270,8 @@ pub struct EvalArgs {
     pub refresh_sources: bool,
     pub send_anonymous_usage_stats: bool,
     pub check_all: bool,
+    // todo: temporary, until Sampling is public, maps (source) unique_id to renamed (database, schema, table)
+    pub sample_renaming: BTreeMap<String, (String, String, String)>,
 }
 impl fmt::Debug for EvalArgs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -381,6 +389,19 @@ impl Display for ClapResourceType {
     }
 }
 
+impl From<&ClapResourceType> for NodeType {
+    fn from(value: &ClapResourceType) -> Self {
+        match value {
+            ClapResourceType::Model => NodeType::Model,
+            ClapResourceType::Source => NodeType::Source,
+            ClapResourceType::Seed => NodeType::Seed,
+            ClapResourceType::Snapshot => NodeType::Snapshot,
+            ClapResourceType::Test => NodeType::Test,
+            ClapResourceType::UnitTest => NodeType::UnitTest,
+        }
+    }
+}
+
 #[derive(
     Debug,
     Clone,
@@ -409,6 +430,7 @@ pub enum Phases {
     JinjaCheck, // dbt jinja-check
     Compile,    // dbt compile
     Show,       // dbt show
+    Sample,     // dbt sample
     Lineage,
     RunOperation,
     #[default]
@@ -513,6 +535,28 @@ pub enum StaticAnalysisKind {
     On,
 }
 
+#[derive(
+    Debug,
+    Copy,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    ValueEnum,
+    Display,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+#[clap(rename_all = "lowercase")]
+pub enum StaticAnalysisOffReason {
+    ConfiguredOff,
+    UnableToFetchSchema,
+    NoDownstream,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum BuildCacheMode {
@@ -588,6 +632,7 @@ pub enum ShowOptions {
     SourcedSchemas,
     Schema,
     Data,
+    Verdict,
     Stats,
     Lineage,
     All,
@@ -617,6 +662,7 @@ impl ShowOptions {
             | ShowOptions::ProgressAnalyze
             | ShowOptions::Schema
             | ShowOptions::Data
+            | ShowOptions::Verdict
             | ShowOptions::Lineage
             | ShowOptions::All
             | ShowOptions::RawLineage
@@ -624,6 +670,23 @@ impl ShowOptions {
             | ShowOptions::Completed
             | ShowOptions::None => "".to_string(),
         }
+    }
+}
+
+#[derive(ValueEnum, Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PersistTarget {
+    #[default]
+    Warehouse,
+    Local,
+}
+impl Display for PersistTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            PersistTarget::Warehouse => "warehouse",
+            PersistTarget::Local => "local",
+        };
+        write!(f, "{s}")
     }
 }
 // ----------------------------------------------------------------------------------------------

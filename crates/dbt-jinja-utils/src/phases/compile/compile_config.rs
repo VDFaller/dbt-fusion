@@ -1,6 +1,6 @@
 //! Module for the parse config object to be used during parsing
 
-use std::{collections::BTreeMap, rc::Rc, sync::Arc};
+use std::{collections::BTreeMap, rc::Rc, slice, sync::Arc};
 
 use dashmap::DashMap;
 use minijinja::{
@@ -62,7 +62,7 @@ impl Object for CompileConfig {
                 let name: String = args.get("name")?;
                 let default = args
                     .get_optional::<Value>("default")
-                    .unwrap_or(Value::from(None::<Option<String>>));
+                    .unwrap_or_else(|| Value::from(None::<Option<String>>));
 
                 // Get the value first
                 let result = match self.config.get(&name) {
@@ -74,7 +74,7 @@ impl Object for CompileConfig {
                 let validator = args.get_optional::<Value>("validator");
                 if let Some(validator) = validator {
                     // Pass the actual value to the validator
-                    let result = validator.call(state, &[result.clone()], listeners);
+                    let result = validator.call(state, slice::from_ref(&result), listeners);
                     result?;
                 }
 
@@ -112,7 +112,7 @@ impl Object for CompileConfig {
 
                 Ok(persist_docs_map
                     .get_value(&Value::from("relation"))
-                    .unwrap_or(Value::from(false)))
+                    .unwrap_or_else(|| Value::from(false)))
             }
             "persist_column_docs" => {
                 let default_value = Value::from(BTreeMap::<String, Value>::new());
@@ -132,7 +132,7 @@ impl Object for CompileConfig {
 
                 Ok(persist_docs_map
                     .get_value(&Value::from("columns"))
-                    .unwrap_or(Value::from(false)))
+                    .unwrap_or_else(|| Value::from(false)))
             }
             _ => Err(MinijinjaError::new(
                 MinijinjaErrorKind::UnknownMethod,

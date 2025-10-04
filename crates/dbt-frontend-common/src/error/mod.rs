@@ -225,10 +225,10 @@ pub struct FrontendError {
 impl std::fmt::Display for FrontendError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "{}", self.context)?;
-        if self.code == ErrorCode::Unknown {
-            if let Some(cause) = self.cause.as_ref() {
-                write!(f, ": {cause:?}")?;
-            }
+        if self.code == ErrorCode::Unknown
+            && let Some(cause) = self.cause.as_ref()
+        {
+            write!(f, ": {cause:?}")?;
         }
         Ok(())
     }
@@ -879,10 +879,10 @@ pub trait LiftableResult<T>: private::Sealed {
     where
         Self: Sized,
     {
-        self.lift(|_err| ErrContext {
+        self.lift(|err| ErrContext {
             code: ErrorCode::Unexpected,
             location: CodeLocation::default(),
-            context: "An unexpected error occurred".to_string(),
+            context: format!("An unexpected error occurred: {err}"),
         })
     }
 }

@@ -6,6 +6,10 @@ pub const DBT_SA_CLI: &str = "dbt-sa-cli";
 // ----------------------------------------------------------------------------------------------
 // dbt inputs
 pub const DBT_MIN_SUPPORTED_VERSION: &str = "1.8.0";
+// (versusfacit): Load state from catalogs.yml. We only permit a single
+// catalogs.yml. A possible future direction will be to move this to
+// ~/.dbt directory. This depends on read catalog and Xplat decisions.
+pub const DBT_CATALOGS_YML: &str = "catalogs.yml";
 pub const DBT_PROJECT_YML: &str = "dbt_project.yml";
 pub const DBT_PROFILES_YML: &str = "profiles.yml";
 
@@ -42,11 +46,13 @@ pub const DBT_RUN_DIR_NAME: &str = "run";
 pub const DBT_DB_DIR_NAME: &str = "db";
 pub const DBT_LOG_DIR_NAME: &str = "logs";
 pub const DBT_DEAFULT_LOG_FILE_NAME: &str = "dbt.log";
+pub const DBT_DEAFULT_QUERY_LOG_FILE_NAME: &str = "query_log.sql";
 pub const DBT_ROOT_PACKAGE_VAR_PREFIX: &str = "__root__";
 pub const DBT_GENERIC_TESTS_DIR_NAME: &str = "generic_tests";
 pub const DBT_SNAPSHOTS_DIR_NAME: &str = "snapshots";
 // ----------------------------------------------------------------------------------------------
 pub const DBT_MODELS_DIR_NAME: &str = "models";
+pub const DBT_SELECTORS_YML: &str = "selectors.yml";
 
 // ----------------------------------------------------------------------------------------------
 // dbt packages
@@ -118,6 +124,7 @@ pub const FINISHED: &str = "  Finished";
 pub const PREVIEWING: &str = "Previewing";
 pub const INLINE_NODE: &str = "sql_operation.inline";
 pub const NOOP: &str = "noop";
+pub const SAMPLING: &str = "  Sampling";
 
 // log targets
 pub const EXECUTING: &str = " ExecutingSql";

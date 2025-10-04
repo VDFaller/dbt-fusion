@@ -17,19 +17,18 @@ dbt-error = { workspace = true }
 dbt-frontend-common = { workspace = true }
 dbt-telemetry = { workspace = true }
 # leaf dependencies (depend on little more than std lib)
+blake3 = { workspace = true }
 dbt-cancel = { workspace = true }
-dbt-proc-macros = { workspace = true }
+hex = { workspace = true }
 md5 = { workspace = true }
 
 clap = { workspace = true, features = ["derive", "env"] }
 counter = { workspace = true }
-dialoguer = { workspace = true }
-int-enum = { workspace = true }
 itertools = { workspace = true }
 rand = { workspace = true }
 regex = { workspace = true }
 unicode-segmentation = { version = "1.12" }
-uuid = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
 
 arrow = { workspace = true }
 arrow-schema = { workspace = true }
@@ -41,7 +40,7 @@ dbt-serde_yaml = { workspace = true }
 humantime = { workspace = true }
 minijinja = { workspace = true }
 parquet = { workspace = true }
-prost = { workspace = true }
+scc = { workspace = true }
 
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -61,8 +60,8 @@ log = { workspace = true }
 rust-embed = { workspace = true }
 
 # Tracing
+proto-rust = { workspace = true }
 tracing = { workspace = true }
-tracing-log = { workspace = true } # temporary until we migrate to tracing exclusively
 tracing-subscriber = { workspace = true }
 
 # Embedded OTLP exporter for traces
@@ -78,6 +77,7 @@ powershell_script = "1.1.0"
 
 [dev-dependencies]
 bytes = { workspace = true }
+dbt-test-primitives = { workspace = true }
 indoc = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 

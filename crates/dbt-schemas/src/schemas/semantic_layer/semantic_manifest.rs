@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::schemas::Nodes;
-use crate::schemas::manifest::DbtManifest;
 use crate::schemas::semantic_layer::metric::SemanticManifestMetric;
+use crate::schemas::semantic_layer::project_configuration::SemanticManifestProjectConfiguration;
 use crate::schemas::semantic_layer::saved_query::SemanticManifestSavedQuery;
 use crate::schemas::semantic_layer::semantic_model::SemanticManifestSemanticModel;
 
@@ -20,23 +20,37 @@ pub struct SemanticManifest {
     pub saved_queries: Vec<SemanticManifestSavedQuery>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-pub struct SemanticManifestProjectConfiguration {}
-
 impl From<Nodes> for SemanticManifest {
     fn from(nodes: Nodes) -> Self {
         SemanticManifest {
             semantic_models: nodes
                 .semantic_models
+                .clone()
                 .into_values()
                 .map(|m| (*m).clone().into())
                 .collect(),
             metrics: nodes
                 .metrics
                 .into_values()
-                .map(|m| (*m).clone().into())
+                .map(|m| {
+                    // don't hydrate input measures into semantic_manifest.json (only used for manifest.json)
+                    let mut semantic_manifest_metric: SemanticManifestMetric = (*m).clone().into();
+                    semantic_manifest_metric.type_params.input_measures = Some(vec![]);
+                    semantic_manifest_metric
+                })
                 .collect(),
-            project_configuration: SemanticManifestProjectConfiguration {},
+            project_configuration: SemanticManifestProjectConfiguration {
+                dsi_package_version: Default::default(),
+                metadata: None,
+                time_spines: nodes
+                    .models
+                    .into_values()
+                    .filter(|m| m.__model_attr__.time_spine.is_some())
+                    .map(|m| (*m).clone().__model_attr__.time_spine.unwrap())
+                    .collect(),
+                // deprecated fields
+                time_spine_table_configurations: vec![],
+            },
             saved_queries: nodes
                 .saved_queries
                 .into_values()
@@ -46,18 +60,7 @@ impl From<Nodes> for SemanticManifest {
     }
 }
 
-impl From<DbtManifest> for SemanticManifest {
-    fn from(_manifest: DbtManifest) -> Self {
-        SemanticManifest {
-            semantic_models: vec![],
-            metrics: vec![],
-            project_configuration: SemanticManifestProjectConfiguration {},
-            saved_queries: vec![],
-        }
-    }
-}
-
-#[derive(Debug, Default, Serialize, Deserialize, Clone, JsonSchema)]
+#[derive(Debug, Default, Serialize, Deserialize, Clone, Eq, PartialEq, JsonSchema)]
 pub struct SemanticLayerElementConfig {
     pub meta: Option<BTreeMap<String, YmlValue>>,
 }

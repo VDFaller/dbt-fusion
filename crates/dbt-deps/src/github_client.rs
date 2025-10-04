@@ -20,12 +20,9 @@ pub fn clone_and_checkout(
         maybe_checkout_subdir,
         remove_git_dir,
     )?;
-    let commit_sha = checkout(
-        clone_dir,
-        revision.clone().unwrap_or("HEAD".to_string()).as_str(),
-    )?;
+    let commit_sha = checkout(clone_dir, revision.as_deref().unwrap_or("HEAD"))?;
     Ok((
-        clone_dir.join(maybe_checkout_subdir.clone().unwrap_or("".to_string())),
+        clone_dir.join(maybe_checkout_subdir.clone().unwrap_or_default()),
         commit_sha,
     ))
 }
@@ -113,10 +110,10 @@ pub fn clone(
     }
 
     // Only add branch if we have a non-commit revision
-    if let Some(revision) = revision {
-        if !is_commit(revision) {
-            clone_cmd.arg("--branch").arg(revision);
-        }
+    if let Some(revision) = revision
+        && !is_commit(revision)
+    {
+        clone_cmd.arg("--branch").arg(revision);
     }
 
     clone_cmd.arg(repo);

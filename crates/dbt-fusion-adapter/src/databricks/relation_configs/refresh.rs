@@ -12,7 +12,7 @@ use dbt_schemas::schemas::InternalDbtNodeAttributes;
 use minijinja::Value;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
 pub struct RefreshConfig {
     pub cron: Option<String>,
     pub time_zone_value: Option<String>,
@@ -41,6 +41,19 @@ impl RefreshConfig {
     }
 }
 
+impl PartialEq for RefreshConfig {
+    // Reference: https://github.com/databricks/dbt-databricks/blob/87073fe7f26bede434a3bd783717a6e49d35893f/dbt/adapters/databricks/relation_configs/refresh.py#L28
+    fn eq(&self, other: &Self) -> bool {
+        self.cron == other.cron
+            && (self.time_zone_value == other.time_zone_value
+                || (self.time_zone_value.is_none()
+                    && other
+                        .time_zone_value
+                        .as_ref()
+                        .is_some_and(|value| value.to_lowercase().contains("utc"))))
+    }
+}
+
 #[derive(Debug)]
 pub struct RefreshProcessor;
 
@@ -64,29 +77,27 @@ impl DatabricksComponentProcessor for RefreshProcessor {
         for row in describe_extended.rows() {
             if let (Ok(key_val), Ok(value_val)) =
                 (row.get_item(&Value::from(0)), row.get_item(&Value::from(1)))
+                && let (Some(key_str), Some(value_str)) = (key_val.as_str(), value_val.as_str())
+                && key_str == "Refresh Schedule"
             {
-                if let (Some(key_str), Some(value_str)) = (key_val.as_str(), value_val.as_str()) {
-                    if key_str == "Refresh Schedule" {
-                        if value_str == "MANUAL" {
-                            return Some(DatabricksComponentConfig::Refresh(RefreshConfig::new(
-                                None, None, false,
-                            )));
-                        }
-
-                        if let Some(captures) = schedule_regex.captures(value_str) {
-                            let cron = captures.get(1).map(|m| m.as_str().to_string());
-                            let time_zone_value = captures.get(2).map(|m| m.as_str().to_string());
-
-                            return Some(DatabricksComponentConfig::Refresh(RefreshConfig::new(
-                                cron,
-                                time_zone_value,
-                                false,
-                            )));
-                        }
-
-                        return None; // Unparseable schedule format
-                    }
+                if value_str == "MANUAL" {
+                    return Some(DatabricksComponentConfig::Refresh(RefreshConfig::new(
+                        None, None, false,
+                    )));
                 }
+
+                if let Some(captures) = schedule_regex.captures(value_str) {
+                    let cron = captures.get(1).map(|m| m.as_str().to_string());
+                    let time_zone_value = captures.get(2).map(|m| m.as_str().to_string());
+
+                    return Some(DatabricksComponentConfig::Refresh(RefreshConfig::new(
+                        cron,
+                        time_zone_value,
+                        false,
+                    )));
+                }
+
+                return None; // Unparseable schedule format
             }
         }
 
@@ -209,6 +220,7 @@ mod tests {
                 quoting_ignore_case: false,
                 materialized: DbtMaterialization::StreamingTable,
                 static_analysis: dbt_common::io_args::StaticAnalysisKind::On,
+                static_analysis_off_reason: None,
                 enabled: true,
                 extended_model: false,
                 persist_docs: None,

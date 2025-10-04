@@ -44,6 +44,7 @@ pub async fn resolve_groups(
                 base_ctx,
                 &[],
                 dependency_package_name,
+                true,
             )?;
 
             let group_properties_config = if let Some(properties) = &group.config {
@@ -81,6 +82,7 @@ pub async fn resolve_groups(
                     quoting: Default::default(),
                     materialized: Default::default(),
                     static_analysis: Default::default(),
+                    static_analysis_off_reason: None,
                     enabled: true,
                     extended_model: false,
                     persist_docs: None,

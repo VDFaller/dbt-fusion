@@ -1,9 +1,12 @@
+use crate::task::env::TracingReloadHandle;
+
 use super::TestResult;
+use super::log_capture::JsonLogEvent;
 use clap::Parser;
 use dbt_common::{
-    DiscreteEventEmitter,
+    DiscreteEventEmitter, FsError,
     cancellation::{CancellationToken, never_cancels},
-    logging::dbt_compat_log::LogEntry,
+    tracing::FsTraceConfig,
 };
 use std::{
     fs::File,
@@ -32,14 +35,24 @@ static BRACKETED_DURATION_PATTERN: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\[\s*\d+(?:\.\d+)?s\s*\]").unwrap());
 static IN_DURATION_PATTERN: Lazy<Regex> = Lazy::new(|| {
     // Matches: "in 1s", "in 500ms", "in 1s 298ms", "in 2m 10s", etc.
-    Regex::new(r"\bin\s+\d+(?:\.\d+)?(?:ns|us|μs|µs|ms|s|m|h)(?:\s+\d+(?:\.\d+)?(?:ns|us|μs|µs|ms|s|m|h))*\b")
+    Regex::new(
+        r"\bin\s+\d+(?:\.\d+)?(?:ns|us|μs|ms|s|m|h)(?:\s+\d+(?:\.\d+)?(?:ns|us|μs|ms|s|m|h))*\b",
+    )
+    .unwrap()
+});
+static LAST_UPDATED_DURATION_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    // Matches: "Last updated 1s ago", "Last updated 500ms ago", "Last updated 1s 298ms ago", "Last updated 2m 10s ago", etc.
+    Regex::new(r"\bLast updated\s+\d+(?:\.\d+)?(?:ns|us|μs|ms|s|m|h)(?:\s+\d+(?:\.\d+)?(?:ns|us|μs|ms|s|m|h))* ago\b")
         .unwrap()
 });
 static MULTI_UNIT_DURATION_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    // Matches sequences of 2+ duration tokens (e.g., "32ms 101us", "4s 703ms 195us 939ns")
-    Regex::new(r"\b\d+(?:\.\d+)?(?:ns|us|μs|µs|ms|s|m|h)(?:\s+\d+(?:\.\d+)?(?:ns|us|μs|µs|ms|s|m|h)){1,}\b").unwrap()
+    // Matches sequences of 1+ duration tokens (e.g., "939ns", "32ms 101us", "4s 703ms 195us 939ns")
+    Regex::new(r"\b\d+(?:\.\d+)?(?:ns|us|μs|ms|s|m|h)(?:\s+\d+(?:\.\d+)?(?:ns|us|μs|ms|s|m|h))*\b")
+        .unwrap()
 });
 static AGE_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r"\bage:\s*\d+").unwrap());
+static INLINE_SQL_PATTERN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"inline_[a-f0-9]{8}\.sql").unwrap());
 
 /// Copies a directory and its contents, excluding .gitignored files.
 pub fn copy_dir_non_ignored(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> FsResult<()> {
@@ -204,6 +217,11 @@ pub fn maybe_normalize_time(output: String) -> String {
         .replace_all(&result, "in duration")
         .to_string();
 
+    // Replace trailing "Last updated ... ago" duration phrases with a stable token
+    result = LAST_UPDATED_DURATION_PATTERN
+        .replace_all(&result, "Last updated Xs ago")
+        .to_string();
+
     // Replace multi-unit duration sequences like "32ms 101us 694ns" with a stable token
     result = MULTI_UNIT_DURATION_PATTERN
         .replace_all(&result, "duration")
@@ -222,6 +240,13 @@ pub fn normalize_version(output: String) -> String {
         format!("dbt-fusion {}", env!("CARGO_PKG_VERSION")).as_str(),
         "dbt-fusion ",
     )
+}
+
+pub fn normalize_inline_sql_files(output: String) -> String {
+    // Replace inline SQL file names like "inline_a1b2c3d4.sql" with "inline_#randhash#.sql"
+    INLINE_SQL_PATTERN
+        .replace_all(&output, "inline_#randhash#.sql")
+        .to_string()
 }
 
 /// Strips the full test name of the crate name and returns the test name.
@@ -251,13 +276,16 @@ pub fn strip_leading_relative(path: &Path) -> &Path {
 }
 
 // Util function to execute fusion commands in tests
+#[allow(clippy::too_many_arguments)]
 pub async fn exec_fs<Fut, P: Parser>(
     cmd_vec: Vec<String>,
     project_dir: PathBuf,
+    target_dir: PathBuf,
     stdout_file: File,
     stderr_file: File,
     execute_fs: impl FnOnce(SystemArgs, P, Arc<dyn DiscreteEventEmitter>, CancellationToken) -> Fut,
     from_lib: impl FnOnce(&P) -> SystemArgs,
+    tracing_handle: TracingReloadHandle,
 ) -> FsResult<i32>
 where
     Fut: Future<Output = FsResult<i32>>,
@@ -280,8 +308,29 @@ where
 
     let cli = P::parse_from(cmd_vec);
     let arg = from_lib(&cli);
+    let trace_config = FsTraceConfig::new_from_io_args(
+        Some(&project_dir),
+        Some(&target_dir),
+        &arg.io,
+        "dbt-tests",
+    );
+    let (middlewares, consumer_layers, mut shutdown_items) = trace_config.build_layers()?;
+    tracing_handle.with_tracing_consumer(middlewares, consumer_layers);
 
-    execute_fs(arg, cli, event_emitter, token).await
+    let result = execute_fs(arg, cli, event_emitter, token).await;
+
+    let shutdown_errors: Vec<FsError> = shutdown_items
+        .iter_mut()
+        .filter_map(|item| item.shutdown().err())
+        .map(|err| *err)
+        .collect();
+
+    match result {
+        // If the run itself failed - return it's error and ignore shutdown
+        Err(_) => result,
+        Ok(_) if shutdown_errors.is_empty() => result,
+        _ => unexpected_err!("Failed to shutdown telemetry"),
+    }
 }
 
 /// The purpose of this guard is two fold:
@@ -424,12 +473,11 @@ pub fn relative_to_git_root(path: &Path) -> Option<PathBuf> {
     None
 }
 
-pub fn assert_str_in_log_messages(logs: &[LogEntry], search_str: &str) -> FsResult<()> {
+pub fn assert_str_in_log_messages(logs: &[JsonLogEvent], search_str: &str) -> FsResult<()> {
     if logs.iter().any(|log| {
-        log.info
-            .as_ref()
+        log.info()
             .map(|info| info.msg.as_str())
-            .unwrap_or("")
+            .unwrap_or_default()
             .contains(search_str)
     }) {
         Ok(())

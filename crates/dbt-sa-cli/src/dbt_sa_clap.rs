@@ -113,6 +113,10 @@ pub struct InitArgs {
 pub struct DepsArgs {
     #[arg(long)]
     pub add_package: Option<String>,
+    #[arg(long)]
+    pub upgrade: bool,
+    #[arg(long)]
+    pub lock: bool,
 
     // Flattened Common args
     #[clap(flatten)]
@@ -260,10 +264,18 @@ pub struct CommonArgs {
     #[arg(global = true, long, env = "DBT_LOG_PATH")]
     pub log_path: Option<PathBuf>,
 
-    /// Set 'otm_file_name' for the current run, overriding 'DBT_OTM_FILE_NAME'.
-    /// If set, OTEL telemetry will be written to `$log_path/otm_file_name`.
-    #[arg(global = true, long, env = "DBT_OTM_FILE_NAME", hide = true)]
-    pub otm_file_name: Option<String>,
+    /// Set 'otel-file-name' for the current run, overriding 'DBT_OTEL_FILE_NAME'.
+    /// If set, OTEL telemetry will be written to `$log_path/otel-file-name`.
+    #[arg(global = true, long = "otel-file-name", env = "DBT_OTEL_FILE_NAME")]
+    pub otel_file_name: Option<String>,
+    /// Set 'otel-parquet-file-name' for the current run, overriding 'DBT_OTEL_PARQUET_FILE_NAME'.
+    /// If set, OTEL telemetry will be written to `$target_path/metadata/otel-parquet-file-name` in Parquet format.
+    #[arg(
+        global = true,
+        long = "otel-parquet-file-name",
+        env = "DBT_OTEL_PARQUET_FILE_NAME"
+    )]
+    pub otel_parquet_file_name: Option<String>,
 
     /// Set logging format; use --log-format-file to override.
     #[arg(global = true, long, env = "DBT_LOG_FORMAT", default_value_t = LogFormat::Default,)]
@@ -327,7 +339,7 @@ impl Cli {
                     let out_dir = self
                         .target_path()
                         .map(|p| if p.is_relative() { in_dir.join(p) } else { p })
-                        .unwrap_or(in_dir.join(DBT_TARGET_DIR_NAME));
+                        .unwrap_or_else(|| in_dir.join(DBT_TARGET_DIR_NAME));
                     stdfs::create_dir_all(&out_dir).map_err(|e| {
                         fs_err!(
                             ErrorCode::IoError,
@@ -399,6 +411,9 @@ impl DepsArgs {
     pub fn to_eval_args(&self, arg: SystemArgs, in_dir: &Path, out_dir: &Path) -> EvalArgs {
         let mut eval_args = self.common_args.to_eval_args(arg, in_dir, out_dir);
         eval_args.phase = Phases::Deps;
+        eval_args.add_package = self.add_package.clone();
+        eval_args.upgrade = self.upgrade;
+        eval_args.lock = self.lock;
         eval_args
     }
 }
@@ -470,8 +485,8 @@ impl InitArgs {
                 log_level: self.common_args.log_level,
                 log_level_file: self.common_args.log_level_file,
                 log_path: self.common_args.log_path.clone(),
-                otm_file_name: self.common_args.otm_file_name.clone(),
-                otm_parquet_file_name: None,
+                otel_file_name: self.common_args.otel_file_name.clone(),
+                otel_parquet_file_name: self.common_args.otel_parquet_file_name.clone(),
                 export_to_otlp: false,
                 show_all_deprecations: self.common_args.show_all_deprecations,
                 show_timings: arg.from_main,
@@ -564,8 +579,8 @@ impl CommonArgs {
                 log_level: self.log_level,
                 log_level_file: self.log_level_file,
                 log_path: self.log_path.clone(),
-                otm_file_name: self.otm_file_name.clone(),
-                otm_parquet_file_name: None,
+                otel_file_name: self.otel_file_name.clone(),
+                otel_parquet_file_name: self.otel_parquet_file_name.clone(),
                 export_to_otlp: false,
                 show_all_deprecations: arg.io.show_all_deprecations,
                 show_timings: arg.from_main,
@@ -657,8 +672,8 @@ pub fn from_main(cli: &Cli) -> SystemArgs {
                 (false, _) => cli.common_args().log_level_file,
             },
             log_path: cli.common_args().log_path,
-            otm_file_name: cli.common_args().otm_file_name,
-            otm_parquet_file_name: None,
+            otel_file_name: cli.common_args().otel_file_name,
+            otel_parquet_file_name: cli.common_args().otel_parquet_file_name,
             export_to_otlp: false,
             show_all_deprecations: cli.common_args().show_all_deprecations,
             show_timings: true, // always true for main
@@ -691,8 +706,8 @@ pub fn from_lib(cli: &Cli) -> SystemArgs {
             log_level: cli.common_args().log_level,
             log_level_file: cli.common_args().log_level_file,
             log_path: cli.common_args().log_path,
-            otm_file_name: cli.common_args().otm_file_name,
-            otm_parquet_file_name: None,
+            otel_file_name: cli.common_args().otel_file_name,
+            otel_parquet_file_name: cli.common_args().otel_parquet_file_name,
             export_to_otlp: false,
             show_all_deprecations: cli.common_args().show_all_deprecations,
             show_timings: false, // always false for lib

@@ -24,8 +24,6 @@ members = [
   "crates/dbt-selector-parser",
   "crates/dbt-proc-macros",
 
-  "crates/dbt-init",
-  "crates/dbt-adapter-proc-macros",
   "crates/dbt-fusion-adapter",
   "crates/dbt-ident",
   "crates/dbt-jinja-utils",
@@ -35,8 +33,10 @@ members = [
   "crates/vortex-client",
   "crates/vortex-events",
   "crates/proto-rust",
+  "crates/proto-rust-macros",
   "crates/dbt-env",
   "crates/dbt-test-utils", 
+  "crates/dbt-sample",
   "crates/dbt-lint",
 ]
 
@@ -48,9 +48,9 @@ description = "Fusion: A fast dbt engine, SQL compiler, local development framew
 edition = "2024"
 homepage = "https://getdbt.com"
 keywords = ["sql", "parquet", "json", "csv", "dbt"]
-license = "<>"
+license = "Elastic-2.0"
 repository = "https://github.com/dbt-labs/dbt-fusion"
-version = "2.0.0-preview.9"
+version = "2.0.0-preview.36"
 
 [patch.crates-io]
 
@@ -81,35 +81,35 @@ datafusion-physical-plan = { git = "https://github.com/sdf-labs/datafusion", rev
 #datafusion-physical-plan = { path = "../datafusion/datafusion/physical-plan" }
 
 # All arrow dependencies (run `cargo tree --prefix none | grep ^arrow | cut -d ' ' -f1 | sort -u` to get this list)
-arrow = { git = "https://github.com/sdf-labs/arrow-rs", rev = "253647cf5fe650d0cdc50557e0fb73957d3de616" } # @ sdf/55.1.0
-arrow-arith = { git = "https://github.com/sdf-labs/arrow-rs", rev = "253647cf5fe650d0cdc50557e0fb73957d3de616" } # @ sdf/55.1.0
-arrow-array = { git = "https://github.com/sdf-labs/arrow-rs", rev = "253647cf5fe650d0cdc50557e0fb73957d3de616" } # @ sdf/55.1.0
-arrow-buffer = { git = "https://github.com/sdf-labs/arrow-rs", rev = "253647cf5fe650d0cdc50557e0fb73957d3de616" } # @ sdf/55.1.0
-arrow-cast = { git = "https://github.com/sdf-labs/arrow-rs", rev = "253647cf5fe650d0cdc50557e0fb73957d3de616" } # @ sdf/55.1.0
-arrow-csv = { git = "https://github.com/sdf-labs/arrow-rs", rev = "253647cf5fe650d0cdc50557e0fb73957d3de616" } # @ sdf/55.1.0
-arrow-data = { git = "https://github.com/sdf-labs/arrow-rs", rev = "253647cf5fe650d0cdc50557e0fb73957d3de616" } # @ sdf/55.1.0
-arrow-ipc = { git = "https://github.com/sdf-labs/arrow-rs", rev = "253647cf5fe650d0cdc50557e0fb73957d3de616" } # @ sdf/55.1.0
-arrow-json = { git = "https://github.com/sdf-labs/arrow-rs", rev = "253647cf5fe650d0cdc50557e0fb73957d3de616" } # @ sdf/55.1.0
-arrow-ord = { git = "https://github.com/sdf-labs/arrow-rs", rev = "253647cf5fe650d0cdc50557e0fb73957d3de616" } # @ sdf/55.1.0
-arrow-row = { git = "https://github.com/sdf-labs/arrow-rs", rev = "253647cf5fe650d0cdc50557e0fb73957d3de616" } # @ sdf/55.1.0
-arrow-schema = { git = "https://github.com/sdf-labs/arrow-rs", rev = "253647cf5fe650d0cdc50557e0fb73957d3de616" } # @ sdf/55.1.0
-arrow-select = { git = "https://github.com/sdf-labs/arrow-rs", rev = "253647cf5fe650d0cdc50557e0fb73957d3de616" } # @ sdf/55.1.0
-arrow-string = { git = "https://github.com/sdf-labs/arrow-rs", rev = "253647cf5fe650d0cdc50557e0fb73957d3de616" } # @ sdf/55.1.0
+arrow = { git = "https://github.com/sdf-labs/arrow-rs", rev = "63a95c7060cb22b620ea60caadf5251f4ddcd6e0" } # @ sdf/55.1.0
+arrow-arith = { git = "https://github.com/sdf-labs/arrow-rs", rev = "63a95c7060cb22b620ea60caadf5251f4ddcd6e0" } # @ sdf/55.1.0
+arrow-array = { git = "https://github.com/sdf-labs/arrow-rs", rev = "63a95c7060cb22b620ea60caadf5251f4ddcd6e0" } # @ sdf/55.1.0
+arrow-buffer = { git = "https://github.com/sdf-labs/arrow-rs", rev = "63a95c7060cb22b620ea60caadf5251f4ddcd6e0" } # @ sdf/55.1.0
+arrow-cast = { git = "https://github.com/sdf-labs/arrow-rs", rev = "63a95c7060cb22b620ea60caadf5251f4ddcd6e0" } # @ sdf/55.1.0
+arrow-csv = { git = "https://github.com/sdf-labs/arrow-rs", rev = "63a95c7060cb22b620ea60caadf5251f4ddcd6e0" } # @ sdf/55.1.0
+arrow-data = { git = "https://github.com/sdf-labs/arrow-rs", rev = "63a95c7060cb22b620ea60caadf5251f4ddcd6e0" } # @ sdf/55.1.0
+arrow-ipc = { git = "https://github.com/sdf-labs/arrow-rs", rev = "63a95c7060cb22b620ea60caadf5251f4ddcd6e0" } # @ sdf/55.1.0
+arrow-json = { git = "https://github.com/sdf-labs/arrow-rs", rev = "63a95c7060cb22b620ea60caadf5251f4ddcd6e0" } # @ sdf/55.1.0
+arrow-ord = { git = "https://github.com/sdf-labs/arrow-rs", rev = "63a95c7060cb22b620ea60caadf5251f4ddcd6e0" } # @ sdf/55.1.0
+arrow-row = { git = "https://github.com/sdf-labs/arrow-rs", rev = "63a95c7060cb22b620ea60caadf5251f4ddcd6e0" } # @ sdf/55.1.0
+arrow-schema = { git = "https://github.com/sdf-labs/arrow-rs", rev = "63a95c7060cb22b620ea60caadf5251f4ddcd6e0" } # @ sdf/55.1.0
+arrow-select = { git = "https://github.com/sdf-labs/arrow-rs", rev = "63a95c7060cb22b620ea60caadf5251f4ddcd6e0" } # @ sdf/55.1.0
+arrow-string = { git = "https://github.com/sdf-labs/arrow-rs", rev = "63a95c7060cb22b620ea60caadf5251f4ddcd6e0" } # @ sdf/55.1.0
 # OR, when working locally
-# arrow = { path = "../arrow-rs/arrow" }
-# arrow-arith = { path = "../arrow-rs/arrow-arith" }
-# arrow-array = { path = "../arrow-rs/arrow-array" }
-# arrow-buffer = { path = "../arrow-rs/arrow-buffer" }
-# arrow-cast = { path = "../arrow-rs/arrow-cast" }
-# arrow-csv = { path = "../arrow-rs/arrow-csv" }
-# arrow-data = { path = "../arrow-rs/arrow-data" }
-# arrow-ipc = { path = "../arrow-rs/arrow-ipc" }
-# arrow-json = { path = "../arrow-rs/arrow-json" }
-# arrow-ord = { path = "../arrow-rs/arrow-ord" }
-# arrow-row = { path = "../arrow-rs/arrow-row" }
-# arrow-schema = { path = "../arrow-rs/arrow-schema" }
-# arrow-select = { path = "../arrow-rs/arrow-select" }
-# arrow-string = { path = "../arrow-rs/arrow-string" }
+#arrow = { path = "../arrow-rs/arrow" }
+#arrow-arith = { path = "../arrow-rs/arrow-arith" }
+#arrow-array = { path = "../arrow-rs/arrow-array" }
+#arrow-buffer = { path = "../arrow-rs/arrow-buffer" }
+#arrow-cast = { path = "../arrow-rs/arrow-cast" }
+#arrow-csv = { path = "../arrow-rs/arrow-csv" }
+#arrow-data = { path = "../arrow-rs/arrow-data" }
+#arrow-ipc = { path = "../arrow-rs/arrow-ipc" }
+#arrow-json = { path = "../arrow-rs/arrow-json" }
+#arrow-ord = { path = "../arrow-rs/arrow-ord" }
+#arrow-row = { path = "../arrow-rs/arrow-row" }
+#arrow-schema = { path = "../arrow-rs/arrow-schema" }
+#arrow-select = { path = "../arrow-rs/arrow-select" }
+#arrow-string = { path = "../arrow-rs/arrow-string" }
 
 [profile.dev.package."*"]
 # Enable basic optimizations for all non-member dependencies. This greatly
@@ -155,7 +155,6 @@ opt-level = 3
 
 
 # fs source available dependencies
-dbt-adapter-proc-macros = { path = "crates/dbt-adapter-proc-macros" }
 dbt-agate = { path = "crates/dbt-agate" }
 dbt-auth = { path = "crates/dbt-auth" }
 dbt-cancel = { path = "crates/dbt-cancel" }
@@ -176,6 +175,7 @@ dbt-parser = { path = "crates/dbt-parser" }
 dbt-proc-macros = { path = "crates/dbt-proc-macros" }
 dbt-sa-cli = { path = "crates/dbt-sa-cli" }
 
+dbt-sample = { path = "crates/dbt-sample" }
 dbt-schemas = { path = "crates/dbt-schemas" }
 dbt-selector-parser = { path = "crates/dbt-selector-parser" }
 dbt-telemetry = { path = "crates/dbt-telemetry" }
@@ -183,6 +183,7 @@ dbt-test-containers = { path = "crates/dbt-test-containers" }
 dbt-test-primitives = { path = "crates/dbt-test-primitives" }
 dbt-test-utils = { path = "crates/dbt-test-utils" }
 proto-rust = { path = "crates/proto-rust" }
+proto-rust-macros = { path = "crates/proto-rust-macros" }
 vortex-client = { path = "crates/vortex-client" }
 vortex-events = { path = "crates/vortex-events" }
 
@@ -207,7 +208,7 @@ minijinja-contrib = { path = "crates/dbt-jinja/minijinja-contrib", features = [
 snowflake-api = { path = "crates/snowflake-rs/snowflake-api" }
 
 # serde
-dbt-serde_yaml = { git = "https://github.com/sdf-labs/dbt-serde-yaml", rev = "02493ca60206081121bc3f09218703af858cb1c4", features = [
+dbt-serde_yaml = { git = "https://github.com/sdf-labs/dbt-serde-yaml", rev = "9ccae3e49f77fcd0a92230a1e41c51d74279409f", features = [
   "filename",
   "schemars",
   "flatten_dunder",
@@ -237,8 +238,8 @@ parquet = { version = "=55.1.0" }
 serde_arrow = { version = "0.13.4", features = ["arrow-55"] }
 
 # xdbc
-adbc-core = { git = "https://github.com/dbt-labs/arrow-adbc", package = "adbc_core", version = "0.20.0", rev = "34c0a6f7cd039334683bc0b05b9bc3430e0b7e86" } # @ apache-arrow-adbc-20-rust
-adbc-driver-manager = { git = "https://github.com/dbt-labs/arrow-adbc", package = "adbc_driver_manager", version = "0.20.0", rev = "34c0a6f7cd039334683bc0b05b9bc3430e0b7e86", features = [
+adbc-core = { git = "https://github.com/dbt-labs/arrow-adbc", package = "adbc_core", version = "0.20.0", rev = "6aa8ce231ad9145733c8b6a844223ffff57bf1ea" } # @ apache-arrow-adbc-20-rust
+adbc-driver-manager = { git = "https://github.com/dbt-labs/arrow-adbc", package = "adbc_driver_manager", version = "0.20.0", rev = "6aa8ce231ad9145733c8b6a844223ffff57bf1ea", features = [
   "windows-sys",
   "windows-registry",
 ] } # @ apache-arrow-adbc-20-rust
@@ -282,7 +283,7 @@ datafusion-physical-expr = { version = "48.0.1" }
 datafusion-physical-plan = { version = "48.0.1" }
 
 # uuid
-uuid = { version = "1.16.0", features = ["v4"] }
+uuid = { version = "1.16.0", features = ["v4", "serde"] }
 
 # networking & cache
 redis = { version = "0.31.0", features = [
@@ -391,6 +392,7 @@ rustyline = { version = "15.0.0", default-features = false, features = [
 # datatypes and algos
 base64 = "0.22.1"
 bigdecimal = "0.4.7"
+bitflags = "2.9.4"
 blake3 = "1.5.0"
 chrono = { version = "0.4.41", features = ["std", "clock", "serde"] }
 chrono-tz = { version = "0.10" }
@@ -409,11 +411,12 @@ linked-hash-map = "0.5.6"
 linked_hash_set = "0.1.4"
 md5 = "0.7.0"
 petgraph = "0.8.1"
-pkcs8 = { version = "0.10", features = ["pkcs5"] }
+pkcs8 = { version = "0.10", features = ["pkcs5", "3des"] }
 rand = "0.9.0"
 regex = "1.11.1"
 rsa = "0.9"
 rust-lapper = "1.1.0"
+scc = "3.1.2"
 sha2 = "0.10.8"
 similar = "2.6"
 siphasher = { version = "1.0.1" }
@@ -422,12 +425,10 @@ ustr = "1.0.0"
 zstd-safe = "7"
 
 # testing
-difference = "2.0.0"
 fake = { version = "4.4.0", features = ["derive", "uuid", "time"] }
 goldie = "0.5.0"
 indoc = "2.0.6"
 merge = { version = "0.2.0" }
-mock_instant = "0.5.3"
 mockito = "1.2"
 pretty_assertions = { version = "1.4.1" }
 sqllogictest = "0.26.0"
@@ -466,12 +467,25 @@ log = { version = "0.4.27", features = ["kv_serde"] }
 
 # tracing (observability)
 tracing = "0.1.41"
-tracing-log = "0.2.0" # temporary until we migrate to tracing exclusively
-tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
+
+# proc macro dependencies
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }
+
+# gRPC dependencies
+tonic = "0.14.1"
+tonic-build = "0.14.1"
+
+# Security and cryptography dependencies
+ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
+jsonwebtoken = { version = "9", features = ["use_pem"] }
 
 # OpenTelemetry (optional embedded OTLP exporter for traces, see dbt-common)
 opentelemetry = "0.30.0"
 opentelemetry-otlp = "0.30.0"
+opentelemetry-proto = "=0.30.0"
 opentelemetry-semantic-conventions = "0.30.0"
 opentelemetry_sdk = "0.30.0"
 

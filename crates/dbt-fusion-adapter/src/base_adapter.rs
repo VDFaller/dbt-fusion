@@ -1,12 +1,18 @@
-use crate::metadata::{CatalogAndSchema, MetadataAdapter};
+use crate::cache::RelationCache;
+use crate::columns::StdColumnType;
+use crate::metadata::*;
 use crate::sql_engine::SqlEngine;
-use crate::typed_adapter::TypedBaseAdapter;
+use crate::typed_adapter::{ReplayAdapter, TypedBaseAdapter};
 use crate::{AdapterResponse, AdapterResult};
 
 use dbt_agate::AgateTable;
 use dbt_common::FsResult;
+use dbt_common::adapter::SchemaRegistry;
 use dbt_common::cancellation::CancellationToken;
+use dbt_common::io_args::ReplayMode;
+use dbt_schemas::schemas::InternalDbtNodeAttributes;
 use dbt_schemas::schemas::common::ResolvedQuoting;
+use dbt_schemas::schemas::project::QueryComment;
 use dbt_schemas::schemas::relations::base::{BaseRelation, ComponentName};
 use dbt_xdbc::{Backend, Connection};
 use minijinja::arg_utils::ArgParser;
@@ -17,9 +23,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::Arc;
 
-/// The type of the adapter.
-///
-/// Used to identify the specific database adapter being used.
+/// The type of the adapter. Used to identify the specific database adapter being used.
 pub type AdapterType = dbt_common::adapter::AdapterType;
 
 pub fn backend_of(adapter_type: AdapterType) -> Backend {
@@ -36,7 +40,9 @@ pub fn backend_of(adapter_type: AdapterType) -> Backend {
 /// Type queries to be implemented for every [BaseAdapter]
 pub trait AdapterTyping {
     /// Get name/type of this adapter
-    fn adapter_type(&self) -> AdapterType;
+    fn adapter_type(&self) -> AdapterType {
+        self.engine().adapter_type()
+    }
 
     /// Get a reference to the metadata adapter if supported.
     fn as_metadata_adapter(&self) -> Option<&dyn MetadataAdapter>;
@@ -44,14 +50,29 @@ pub trait AdapterTyping {
     /// Get a reference to the typed base adapter if supported.
     fn as_typed_base_adapter(&self) -> &dyn TypedBaseAdapter;
 
-    /// Get column type instance
-    fn column_type(&self) -> Option<Value>;
+    /// True if called on the [ParseAdapter].
+    fn is_parse(&self) -> bool {
+        false
+    }
 
-    /// Get the [SqlEngine], if available
-    fn engine(&self) -> Option<&Arc<SqlEngine>>;
+    /// This adapter as the replay adapter if it is one, None otherwise.
+    fn as_replay(&self) -> Option<&dyn ReplayAdapter> {
+        None
+    }
+
+    /// Get column type instance
+    fn column_type(&self) -> Option<Value> {
+        let value = Value::from_object(StdColumnType::new(self.adapter_type()));
+        Some(value)
+    }
+
+    /// Get the [SqlEngine]
+    fn engine(&self) -> &Arc<SqlEngine>;
 
     /// Get the [ResolvedQuoting]
-    fn quoting(&self) -> ResolvedQuoting;
+    fn quoting(&self) -> ResolvedQuoting {
+        self.engine().quoting()
+    }
 
     /// Quote a component of a relation
     fn quote_component(
@@ -73,7 +94,9 @@ pub trait AdapterTyping {
         }
     }
 
-    fn cancellation_token(&self) -> CancellationToken;
+    fn cancellation_token(&self) -> CancellationToken {
+        self.engine().cancellation_token()
+    }
 }
 
 /// Base adapter
@@ -86,6 +109,7 @@ pub trait BaseAdapter: fmt::Display + fmt::Debug + AdapterTyping + Send + Sync {
     /// Create a new connection
     fn new_connection(
         &self,
+        state: Option<&State>,
         node_id: Option<String>,
     ) -> Result<Box<dyn Connection>, MinijinjaError>;
 
@@ -112,13 +136,53 @@ pub trait BaseAdapter: fmt::Display + fmt::Debug + AdapterTyping + Send + Sync {
     ) -> Result<Value, MinijinjaError>;
 
     /// Encloses identifier in the correct quotes for the adapter when escaping reserved column names etc.
-    fn quote(&self, state: &State, _args: &[Value]) -> Result<Value, MinijinjaError>;
+    ///
+    /// https://github.com/dbt-labs/dbt-adapters/blob/5fba80c621c3f0f732dba71aa6cf9055792b6495/dbt-adapters/src/dbt/adapters/base/impl.py#L1064
+    ///
+    /// ```python
+    /// @classmethod
+    /// def quote(
+    ///     cls,
+    ///     identifier: str
+    /// ) -> str
+    /// ```
+    fn quote(&self, state: &State, identifier: &str) -> Result<Value, MinijinjaError>;
 
     /// Quote as configured.
-    fn quote_as_configured(&self, state: &State, _args: &[Value]) -> Result<Value, MinijinjaError>;
+    ///
+    /// https://github.com/dbt-labs/dbt-adapters/blob/5fba80c621c3f0f732dba71aa6cf9055792b6495/dbt-adapters/src/dbt/adapters/base/impl.py#L1070C5-L1070C75
+    ///
+    /// ```python
+    /// def quote_as_configured(
+    ///     self,
+    ///     identifier: str,
+    ///     quote_key: str
+    /// ) -> str
+    /// ```
+    fn quote_as_configured(
+        &self,
+        state: &State,
+        identifier: &str,
+        quote_key: &str,
+    ) -> Result<Value, MinijinjaError>;
 
     /// Quote seed column.
-    fn quote_seed_column(&self, state: &State, _args: &[Value]) -> Result<Value, MinijinjaError>;
+    ///
+    /// https://github.com/dbt-labs/dbt-adapters/blob/5fba80c621c3f0f732dba71aa6cf9055792b6495/dbt-adapters/src/dbt/adapters/base/impl.py#L1091
+    ///
+    /// ```python
+    /// def quote_seed_column(
+    ///     self,
+    ///     column: str,
+    ///     quote_config: Optional[bool]
+    /// ) -> str
+    /// ```
+    fn quote_seed_column(
+        &self,
+        state: &State,
+        column: &str,
+        quote_config: Option<bool>,
+    ) -> Result<Value, MinijinjaError>;
 
     /// Convert type.
     fn convert_type(&self, state: &State, _args: &[Value]) -> Result<Value, MinijinjaError>;
@@ -262,10 +326,21 @@ pub trait BaseAdapter: fmt::Display + fmt::Debug + AdapterTyping + Send + Sync {
     fn rename_relation(&self, state: &State, args: &[Value]) -> Result<Value, MinijinjaError>;
 
     /// Expand target column types.
+    ///
+    /// https://github.com/dbt-labs/dbt-adapters/blob/main/dbt-adapters/src/dbt/adapters/base/impl.py#L764
+    ///
+    /// ```python
+    /// def expand_column_types(
+    ///     self,
+    ///     goal: BaseRelation,
+    ///     current: BaseRelation
+    /// ) -> None
+    /// ```
     fn expand_target_column_types(
         &self,
         state: &State,
-        args: &[Value],
+        from_relation: Arc<dyn BaseRelation>,
+        to_relation: Arc<dyn BaseRelation>,
     ) -> Result<Value, MinijinjaError>;
 
     /// List schemas.
@@ -329,10 +404,19 @@ pub trait BaseAdapter: fmt::Display + fmt::Debug + AdapterTyping + Send + Sync {
     fn get_missing_columns(&self, state: &State, args: &[Value]) -> Result<Value, MinijinjaError>;
 
     /// Get columns in relation.
+    ///
+    /// https://github.com/dbt-labs/dbt-adapters/blob/main/dbt-adapters/src/dbt/adapters/base/impl.py#L741
+    ///
+    /// ```python
+    /// def get_columns_in_relation(
+    ///     self,
+    ///     relation: BaseRelation
+    /// ) -> List[Column]
+    /// ```
     fn get_columns_in_relation(
         &self,
         state: &State,
-        args: &[Value],
+        relation: Arc<dyn BaseRelation>,
     ) -> Result<Value, MinijinjaError>;
 
     /// Render raw columns constants.
@@ -415,9 +499,17 @@ pub trait BaseAdapter: fmt::Display + fmt::Debug + AdapterTyping + Send + Sync {
     ) -> Result<Value, MinijinjaError>;
 
     /// load_dataframe
-    fn load_dataframe(&self, _state: &State, _args: &[Value]) -> Result<Value, MinijinjaError> {
-        unimplemented!("only available with BigQuery adapter")
-    }
+    #[allow(clippy::too_many_arguments)]
+    fn load_dataframe(
+        &self,
+        _state: &State,
+        _database: &str,
+        _schema: &str,
+        _table_name: &str,
+        _agate_table: Arc<AgateTable>,
+        _file_path: &str,
+        _field_delimiter: &str,
+    ) -> Result<Value, MinijinjaError>;
 
     /// upload_file
     fn upload_file(&self, _state: &State, _args: &[Value]) -> Result<Value, MinijinjaError> {
@@ -445,7 +537,11 @@ pub trait BaseAdapter: fmt::Display + fmt::Debug + AdapterTyping + Send + Sync {
     }
 
     /// describe_relation
-    fn describe_relation(&self, _state: &State, _args: &[Value]) -> Result<Value, MinijinjaError>;
+    fn describe_relation(
+        &self,
+        _state: &State,
+        _relation: Arc<dyn BaseRelation>,
+    ) -> Result<Value, MinijinjaError>;
 
     /// grant_access_to
     fn grant_access_to(&self, _state: &State, _args: &[Value]) -> Result<Value, MinijinjaError>;
@@ -584,4 +680,47 @@ pub trait BaseAdapter: fmt::Display + fmt::Debug + AdapterTyping + Send + Sync {
     fn is_cached(&self, _relation: &Arc<dyn BaseRelation>) -> bool {
         false
     }
+}
+
+/// A factory for adapters, relations and columns.
+///
+/// It can create adapters wrapped in a boxed `dyn BaseAdapter`
+/// objects. Similarly, it can create boxed `dyn BaseRelation`
+/// and `StdColumn` objects.
+pub trait AdapterFactory: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
+    fn create_adapter(
+        &self,
+        adapter_type: AdapterType,
+        config: dbt_serde_yaml::Mapping,
+        replay_mode: Option<ReplayMode>,
+        flags: BTreeMap<String, Value>,
+        db: Option<Arc<dyn SchemaRegistry>>,
+        quoting: ResolvedQuoting,
+        query_comment: Option<QueryComment>,
+        token: CancellationToken,
+    ) -> FsResult<Arc<dyn BaseAdapter>>;
+
+    /// Create a relation from a InternalDbtNode
+    fn create_relation_from_node(
+        &self,
+        node: &dyn InternalDbtNodeAttributes,
+        adapter_type: AdapterType,
+    ) -> Result<Arc<dyn BaseRelation>, minijinja::Error>;
+
+    /// Return a new instance of the factory with a different relation cache.
+    fn with_relation_cache(&self, relation_cache: Arc<RelationCache>) -> Arc<dyn AdapterFactory>;
+}
+
+/// Check if the adapter type is supported
+///
+/// XXX: the definition of "supported" is lost here
+pub fn is_supported_dialect(adapter_type: AdapterType) -> bool {
+    matches!(
+        adapter_type,
+        AdapterType::Snowflake
+            | AdapterType::Bigquery
+            | AdapterType::Redshift
+            | AdapterType::Databricks
+    )
 }

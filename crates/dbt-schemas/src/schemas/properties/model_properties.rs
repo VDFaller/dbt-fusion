@@ -1,14 +1,20 @@
+use crate::default_to;
 use crate::schemas::common::ConstraintType;
+use crate::schemas::common::DimensionValidityParams;
 use crate::schemas::common::ModelFreshnessRules;
 use crate::schemas::common::Versions;
 use crate::schemas::data_tests::DataTests;
 use crate::schemas::dbt_column::ColumnProperties;
 use crate::schemas::dbt_column::ColumnPropertiesDimensionType;
 use crate::schemas::dbt_column::ColumnPropertiesEntityType;
-use crate::schemas::dbt_column::ColumnPropertiesGranularity;
+use crate::schemas::dbt_column::Granularity;
+use crate::schemas::project::DefaultTo;
 use crate::schemas::project::ModelConfig;
+use crate::schemas::project::SemanticModelConfig;
+use crate::schemas::project::configs::common::default_meta_and_tags;
 use crate::schemas::properties::MetricsProperties;
 use crate::schemas::properties::properties::GetConfig;
+use crate::schemas::semantic_layer::semantic_manifest::SemanticLayerElementConfig;
 use crate::schemas::serde::FloatOrString;
 use dbt_serde_yaml::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -35,7 +41,7 @@ pub struct ModelConstraint {
 // todo: consider revising this design: warn_unsupported, warn_unenforced are adapter specific constraint. You don't want to specify them on all models!
 
 #[skip_serializing_none]
-#[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
+#[derive(Default, Deserialize, Serialize, Debug, Clone, JsonSchema)]
 pub struct ModelProperties {
     pub columns: Option<Vec<ColumnProperties>>,
     pub config: Option<ModelConfig>,
@@ -47,17 +53,42 @@ pub struct ModelProperties {
     pub latest_version: Option<FloatOrString>,
     pub name: String,
     pub tests: Option<Vec<DataTests>>,
-    pub time_spine: Option<ModelsTimeSpine>,
+    pub time_spine: Option<ModelPropertiesTimeSpine>,
     pub versions: Option<Vec<Versions>>,
 
-    pub semantic_model: Option<bool>,
+    pub semantic_model: Option<ModelPropertiesSemanticModelConfig>,
     pub agg_time_dimension: Option<String>,
-    // TODO: rename to metrics once we figure out how to not render jinja for metrics nested under models
-    // Currently, dbt commands won't work because we attempt to render Jinja for model nodes, but with
-    // metrics in models, we attempt to render the `{{ Dimension(...) }}` jinja that should NOT be rendered
-    pub metrics_todo: Option<Vec<MetricsProperties>>,
-    pub derived_semantics: Option<Vec<DerivedSemantics>>,
+    pub metrics: Option<Vec<MetricsProperties>>,
+    pub derived_semantics: Option<DerivedSemantics>,
     pub primary_entity: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, JsonSchema, Default)]
+pub struct ModelPropertiesSemanticModelConfig {
+    pub enabled: bool,
+    pub name: Option<String>,
+    pub group: Option<String>,
+    pub config: Option<SemanticLayerElementConfig>,
+}
+
+impl DefaultTo<SemanticModelConfig> for ModelPropertiesSemanticModelConfig {
+    fn get_enabled(&self) -> Option<bool> {
+        Some(self.enabled)
+    }
+
+    fn default_to(&mut self, parent: &SemanticModelConfig) {
+        let enabled = &mut Some(self.enabled);
+        let group = &mut self.group;
+        let meta = &mut self.config.clone().unwrap_or_default().meta;
+        let tags = &mut None;
+
+        #[allow(unused, clippy::let_unit_value)]
+        let meta = default_meta_and_tags(meta, &parent.meta, tags, &parent.tags);
+        #[allow(unused)]
+        let tags = ();
+
+        default_to!(parent, [enabled, group]);
+    }
 }
 
 impl ModelProperties {
@@ -77,7 +108,7 @@ impl ModelProperties {
             versions: None,
             semantic_model: None,
             agg_time_dimension: None,
-            metrics_todo: None,
+            metrics: None,
             derived_semantics: None,
             primary_entity: None,
         }
@@ -92,14 +123,14 @@ impl GetConfig<ModelConfig> for ModelProperties {
 
 #[skip_serializing_none]
 #[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
-pub struct ModelsTimeSpine {
-    pub custom_granularities: Option<Vec<CustomGranularity>>,
+pub struct ModelPropertiesTimeSpine {
+    pub custom_granularities: Option<Vec<TimeSpineCustomGranularity>>,
     pub standard_granularity_column: String,
 }
 
 #[skip_serializing_none]
 #[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
-pub struct CustomGranularity {
+pub struct TimeSpineCustomGranularity {
     pub column_name: Option<String>,
     pub name: String,
 }
@@ -117,15 +148,27 @@ pub struct DerivedSemantics {
     pub entities: Option<Vec<DerivedEntity>>,
 }
 
+impl Default for DerivedSemantics {
+    fn default() -> Self {
+        Self {
+            dimensions: Some(vec![]),
+            entities: Some(vec![]),
+        }
+    }
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone, JsonSchema, PartialEq, Eq)]
 pub struct DerivedDimension {
     pub name: String,
     pub expr: String,
     #[serde(rename = "type")]
-    pub type_: Option<ColumnPropertiesDimensionType>,
-    pub granularity: Option<ColumnPropertiesGranularity>,
+    pub type_: ColumnPropertiesDimensionType,
+    pub granularity: Option<Granularity>,
     pub is_partition: Option<bool>,
     pub label: Option<String>,
+    pub description: Option<String>,
+    pub config: Option<SemanticLayerElementConfig>,
+    pub validity_params: Option<DimensionValidityParams>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, JsonSchema, PartialEq, Eq)]
@@ -135,4 +178,6 @@ pub struct DerivedEntity {
     #[serde(rename = "type")]
     pub type_: ColumnPropertiesEntityType,
     pub description: Option<String>,
+    pub label: Option<String>,
+    pub config: Option<SemanticLayerElementConfig>,
 }

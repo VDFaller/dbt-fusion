@@ -9,13 +9,14 @@ type YmlValue = dbt_serde_yaml::Value;
 use crate::schemas::{
     DbtExposure, DbtModel, DbtSeed, DbtSnapshot, DbtSource, DbtTest, DbtUnitTest,
     common::{
-        DbtChecksum, DbtContract, DbtQuoting, Expect, FreshnessDefinition, Given, IncludeExclude,
-        NodeDependsOn,
+        Access, DbtChecksum, DbtContract, DbtQuoting, Expect, FreshnessDefinition, Given,
+        IncludeExclude, NodeDependsOn,
     },
     dbt_column::DbtColumnRef,
     manifest::{
-        DbtOperation, DbtSavedQuery,
+        DbtMetric, DbtOperation, DbtSavedQuery, DbtSemanticModel,
         common::{DbtOwner, SourceFileMetadata, WhereFilterIntersection},
+        metric::{MeasureAggregationParameters, MetricTypeParams, NonAdditiveDimension},
         semantic_model::{NodeRelation, SemanticEntity, SemanticMeasure, SemanticModelDefaults},
     },
     nodes::TestMetadata,
@@ -23,8 +24,13 @@ use crate::schemas::{
         DataTestConfig, ExposureConfig, MetricConfig, ModelConfig, SavedQueryConfig, SeedConfig,
         SemanticModelConfig, SnapshotConfig, SourceConfig, UnitTestConfig,
     },
-    properties::{ModelConstraint, UnitTestOverrides},
+    properties::{
+        ModelConstraint, UnitTestOverrides,
+        metrics_properties::{AggregationType, MetricType},
+        model_properties::ModelPropertiesTimeSpine,
+    },
     ref_and_source::{DbtRef, DbtSourceWrapper},
+    semantic_layer::semantic_manifest::SemanticLayerElementConfig,
     serde::{StringOrArrayOfStrings, StringOrInteger},
 };
 
@@ -74,6 +80,10 @@ pub struct ManifestMaterializableCommonAttributes {
 
     // Meta
     pub description: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub meta: BTreeMap<String, YmlValue>,
 }
 
 #[skip_serializing_none]
@@ -147,6 +157,8 @@ impl From<DbtSeed> for ManifestSeed {
                 original_file_path: seed.__common_attr__.original_file_path,
                 patch_path: seed.__common_attr__.patch_path,
                 description: seed.__common_attr__.description,
+                tags: seed.__common_attr__.tags,
+                meta: seed.__common_attr__.meta,
             },
             __base_attr__: ManifestNodeBaseAttributes {
                 alias: seed.__base_attr__.alias,
@@ -192,6 +204,12 @@ pub struct ManifestUnitTest {
     pub versions: Option<IncludeExclude>,
     pub version: Option<StringOrInteger>,
     pub overrides: Option<UnitTestOverrides>,
+    #[serde(rename = "_event_status")]
+    pub field_event_status: Option<BTreeMap<String, YmlValue>>,
+    #[serde(rename = "_pre_injected_sql")]
+    pub field_pre_injected_sql: Option<String>,
+    pub tested_node_unique_id: Option<String>,
+    pub this_input_node_unique_id: Option<String>,
 }
 
 impl From<DbtUnitTest> for ManifestUnitTest {
@@ -208,6 +226,8 @@ impl From<DbtUnitTest> for ManifestUnitTest {
                 original_file_path: unit_test.__common_attr__.original_file_path,
                 patch_path: unit_test.__common_attr__.patch_path,
                 description: unit_test.__common_attr__.description,
+                tags: unit_test.__common_attr__.tags,
+                meta: unit_test.__common_attr__.meta,
             },
             __base_attr__: ManifestNodeBaseAttributes {
                 alias: unit_test.__base_attr__.alias,
@@ -238,6 +258,10 @@ impl From<DbtUnitTest> for ManifestUnitTest {
             versions: unit_test.__unit_test_attr__.versions,
             version: unit_test.__unit_test_attr__.version,
             overrides: unit_test.__unit_test_attr__.overrides,
+            field_event_status: unit_test.field_event_status,
+            field_pre_injected_sql: unit_test.field_pre_injected_sql,
+            tested_node_unique_id: unit_test.tested_node_unique_id,
+            this_input_node_unique_id: unit_test.this_input_node_unique_id,
         }
     }
 }
@@ -273,6 +297,8 @@ impl From<DbtTest> for ManifestDataTest {
                 original_file_path: test.__common_attr__.original_file_path,
                 patch_path: test.__common_attr__.patch_path,
                 description: test.__common_attr__.description,
+                tags: test.__common_attr__.tags,
+                meta: test.__common_attr__.meta,
             },
             __base_attr__: ManifestNodeBaseAttributes {
                 alias: test.__base_attr__.alias,
@@ -333,6 +359,8 @@ impl From<DbtSnapshot> for ManifestSnapshot {
                 original_file_path: snapshot.__common_attr__.original_file_path,
                 patch_path: snapshot.__common_attr__.patch_path,
                 description: snapshot.__common_attr__.description,
+                tags: snapshot.__common_attr__.tags,
+                meta: snapshot.__common_attr__.meta,
             },
             __base_attr__: ManifestNodeBaseAttributes {
                 alias: snapshot.__base_attr__.alias,
@@ -383,6 +411,8 @@ pub struct ManifestSource {
     pub loader: String,
     pub loaded_at_field: Option<String>,
     pub loaded_at_query: Option<String>,
+
+    #[serialize_always]
     pub freshness: Option<FreshnessDefinition>,
 
     pub __other__: BTreeMap<String, YmlValue>,
@@ -402,6 +432,8 @@ impl From<DbtSource> for ManifestSource {
                 original_file_path: source.__common_attr__.original_file_path,
                 patch_path: source.__common_attr__.patch_path,
                 description: source.__common_attr__.description,
+                tags: source.__common_attr__.tags,
+                meta: source.__common_attr__.meta,
             },
             relation_name: source.__base_attr__.relation_name,
             identifier: source.__source_attr__.identifier,
@@ -436,13 +468,15 @@ pub struct ManifestModel {
     pub __base_attr__: ManifestNodeBaseAttributes,
 
     // Model Specific Attributes
+    pub access: Option<Access>,
+    pub group: Option<String>,
     pub config: ModelConfig,
     pub version: Option<StringOrInteger>,
     pub latest_version: Option<StringOrInteger>,
     pub constraints: Option<Vec<ModelConstraint>>,
     pub deprecation_date: Option<String>,
     pub primary_key: Option<Vec<String>>,
-    pub time_spine: Option<YmlValue>,
+    pub time_spine: Option<ModelPropertiesTimeSpine>,
 
     pub __other__: BTreeMap<String, YmlValue>,
 }
@@ -461,6 +495,8 @@ impl From<DbtModel> for ManifestModel {
                 original_file_path: model.__common_attr__.original_file_path,
                 patch_path: model.__common_attr__.patch_path,
                 description: model.__common_attr__.description,
+                tags: model.__common_attr__.tags,
+                meta: model.__common_attr__.meta,
             },
             __base_attr__: ManifestNodeBaseAttributes {
                 alias: model.__base_attr__.alias,
@@ -482,15 +518,23 @@ impl From<DbtModel> for ManifestModel {
                 created_at: Default::default(),
                 compiled_path: Default::default(),
                 build_path: Default::default(),
-                contract: Default::default(),
+                contract: model.__model_attr__.contract.unwrap_or_default(),
             },
+            access: Some(model.__model_attr__.access),
+            group: model.__model_attr__.group,
             config: model.deprecated_config,
             version: model.__model_attr__.version,
             latest_version: model.__model_attr__.latest_version,
             constraints: Some(model.__model_attr__.constraints),
             deprecation_date: model.__model_attr__.deprecation_date,
             primary_key: Some(model.__model_attr__.primary_key),
-            time_spine: model.__model_attr__.time_spine,
+            time_spine: model
+                .__model_attr__
+                .time_spine
+                .map(|ts| ModelPropertiesTimeSpine {
+                    custom_granularities: Some(ts.custom_granularities),
+                    standard_granularity_column: ts.primary_column.name,
+                }),
             __other__: model.__other__,
         }
     }
@@ -630,8 +674,8 @@ pub struct ManifestMetric {
     // Metric Specific Attributes
     pub label: String,
     #[serde(rename = "type")]
-    pub metric_type: crate::schemas::manifest::metric::MetricType,
-    pub type_params: crate::schemas::manifest::metric::MetricTypeParams,
+    pub metric_type: MetricType,
+    pub type_params: MetricTypeParams,
     pub filter: Option<WhereFilterIntersection>,
     pub metadata: Option<SourceFileMetadata>,
     pub time_granularity: Option<String>,
@@ -643,6 +687,41 @@ pub struct ManifestMetric {
     pub metrics: Vec<Vec<String>>,
 
     pub __other__: BTreeMap<String, YmlValue>,
+}
+
+impl From<DbtMetric> for ManifestMetric {
+    fn from(metric: DbtMetric) -> Self {
+        Self {
+            __common_attr__: ManifestCommonAttributes {
+                unique_id: metric.__common_attr__.unique_id,
+                name: metric.__common_attr__.name,
+                package_name: metric.__common_attr__.package_name,
+                fqn: metric.__common_attr__.fqn,
+                path: metric.__common_attr__.path,
+                original_file_path: metric.__common_attr__.original_file_path,
+                description: metric.__common_attr__.description,
+                tags: metric.__common_attr__.tags,
+                meta: metric.__common_attr__.meta,
+            },
+            __base_attr__: ManifestMetricNodeBaseAttributes {
+                depends_on: metric.__metric_attr__.depends_on,
+                refs: metric.__metric_attr__.refs,
+                sources: metric.__metric_attr__.sources,
+                unrendered_config: metric.__metric_attr__.unrendered_config,
+                created_at: metric.__metric_attr__.created_at,
+            },
+            label: metric.__metric_attr__.label.unwrap_or_default(),
+            metric_type: metric.__metric_attr__.metric_type,
+            type_params: metric.__metric_attr__.type_params,
+            filter: metric.__metric_attr__.filter,
+            metadata: metric.__metric_attr__.metadata,
+            time_granularity: metric.__metric_attr__.time_granularity.clone(),
+            group: metric.__metric_attr__.group.clone(),
+            config: metric.deprecated_config.into(),
+            __other__: metric.__other__,
+            metrics: vec![], // TODO: metric.__metric_attr__.metrics.clone(),
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
@@ -720,7 +799,7 @@ pub struct ManifestSemanticModel {
     pub label: Option<String>,
     pub defaults: Option<SemanticModelDefaults>,
     pub entities: Vec<SemanticEntity>,
-    pub measures: Vec<SemanticMeasure>,
+    pub measures: Vec<ManifestSemanticModelMeasure>,
     pub dimensions: Vec<crate::schemas::common::Dimension>,
     pub metadata: Option<SourceFileMetadata>,
     pub primary_entity: Option<String>,
@@ -729,6 +808,78 @@ pub struct ManifestSemanticModel {
     pub config: ManifestSemanticModelConfig,
 
     pub __other__: BTreeMap<String, YmlValue>,
+}
+
+impl From<DbtSemanticModel> for ManifestSemanticModel {
+    fn from(semantic_model: DbtSemanticModel) -> Self {
+        Self {
+            __common_attr__: ManifestCommonAttributes {
+                unique_id: semantic_model.__common_attr__.unique_id,
+                name: semantic_model.__common_attr__.name,
+                package_name: semantic_model.__common_attr__.package_name,
+                fqn: semantic_model.__common_attr__.fqn,
+                path: semantic_model.__common_attr__.path,
+                original_file_path: semantic_model.__common_attr__.original_file_path,
+                description: semantic_model.__common_attr__.description,
+                tags: semantic_model.__common_attr__.tags,
+                meta: semantic_model.__common_attr__.meta,
+            },
+            __base_attr__: ManifestSemanticModelNodeBaseAttributes {
+                depends_on: semantic_model.__semantic_model_attr__.depends_on,
+                refs: semantic_model.__semantic_model_attr__.refs,
+                unrendered_config: semantic_model.__semantic_model_attr__.unrendered_config,
+                created_at: semantic_model.__semantic_model_attr__.created_at,
+            },
+            label: semantic_model.__semantic_model_attr__.label,
+            metadata: semantic_model.__semantic_model_attr__.metadata,
+            group: semantic_model.__semantic_model_attr__.group,
+            config: semantic_model.deprecated_config.into(),
+            __other__: semantic_model.__other__,
+            model: semantic_model.__semantic_model_attr__.model,
+            node_relation: semantic_model.__semantic_model_attr__.node_relation,
+            defaults: semantic_model.__semantic_model_attr__.defaults,
+            entities: semantic_model.__semantic_model_attr__.entities,
+            measures: semantic_model
+                .__semantic_model_attr__
+                .measures
+                .into_iter()
+                .map(ManifestSemanticModelMeasure::from)
+                .collect(),
+            dimensions: semantic_model.__semantic_model_attr__.dimensions,
+            primary_entity: semantic_model.__semantic_model_attr__.primary_entity,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestSemanticModelMeasure {
+    pub name: String,
+    pub agg: AggregationType,
+    pub description: Option<String>,
+    pub label: Option<String>,
+    pub create_metric: Option<bool>,
+    pub expr: Option<String>,
+    pub agg_params: Option<MeasureAggregationParameters>,
+    pub non_additive_dimension: Option<NonAdditiveDimension>,
+    pub agg_time_dimension: Option<String>,
+    pub config: Option<SemanticLayerElementConfig>,
+}
+
+impl From<SemanticMeasure> for ManifestSemanticModelMeasure {
+    fn from(measure: SemanticMeasure) -> Self {
+        Self {
+            name: measure.name,
+            agg: measure.agg,
+            description: measure.description,
+            label: measure.label,
+            create_metric: measure.create_metric,
+            expr: measure.expr,
+            agg_params: measure.agg_params,
+            non_additive_dimension: measure.non_additive_dimension,
+            agg_time_dimension: measure.agg_time_dimension,
+            config: measure.config,
+        }
+    }
 }
 
 #[skip_serializing_none]

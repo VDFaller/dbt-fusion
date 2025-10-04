@@ -50,6 +50,7 @@ pub struct ProjectDbtCloudConfig {
     pub api_key: Option<StringOrInteger>,
     pub application: Option<StringOrInteger>,
     pub environment: Option<StringOrInteger>,
+    pub tenant_hostname: Option<String>,
 }
 
 #[skip_serializing_none]
@@ -270,7 +271,7 @@ macro_rules! default_to {
 }
 
 pub trait IterChildren<T> {
-    fn iter_children(&self) -> Iter<String, ShouldBe<T>>;
+    fn iter_children(&self) -> Iter<'_, String, ShouldBe<T>>;
 }
 
 #[cfg(test)]

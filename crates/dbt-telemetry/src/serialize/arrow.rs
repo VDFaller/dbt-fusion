@@ -2,24 +2,26 @@
 
 use super::to_nanos;
 use crate::{
-    BuildPhase, BuildPhaseInfo, DevInternalInfo, InvocationCloudAttributes, InvocationEvalArgs,
-    InvocationInfo, InvocationMetrics, LegacyLogEventInfo, LogEventInfo, LogRecordInfo,
-    NodeExecutionStatus, NodeIdentifier, NodeInfo, ProcessInfo, RecordCodeLocation, SeverityNumber,
-    SpanEndInfo, SpanStartInfo, SpanStatus, StatusCode, TelemetryAttributes,
-    TelemetryAttributesType, TelemetryRecord, TelemetryRecordType, UnknownInfo, UpdateInfo,
-    WriteArtifactInfo,
+    ArtifactType, ExecutionPhase, LogRecordInfo, NodeCancelReason, NodeErrorType,
+    NodeMaterialization, NodeOutcome, NodeSkipReason, NodeType, QueryOutcome, SeverityNumber,
+    SpanEndInfo, SpanLinkInfo, SpanStartInfo, SpanStatus, StatusCode, TelemetryAttributes,
+    TelemetryEventTypeRegistry, TelemetryOutputFlags, TelemetryRecord, TelemetryRecordType,
 };
 use arrow::{
-    array::Array,
+    array::{Array, ArrayRef, ListArray, StructArray, new_null_array},
     compute::{CastOptions, cast_with_options},
-    datatypes::{DataType, Field, FieldRef, Schema, TimeUnit},
+    datatypes::{DataType, Field, FieldRef, Fields, Schema, TimeUnit},
     record_batch::RecordBatch,
     util::display::FormatOptions,
 };
+use arrow_schema::extension::Json as JsonExtensionType;
 use serde::{Deserialize, Serialize};
-use serde_arrow::schema::{SchemaLike, TracingOptions};
-use std::time::SystemTime;
-use std::{borrow::Cow, sync::Arc};
+// no serde_arrow schema tracing; we build schema manually
+use std::{
+    borrow::Cow,
+    sync::{Arc, LazyLock},
+};
+use std::{str::FromStr, time::SystemTime};
 
 // Create sudo impls for defaults on these two enums. This is only necessary
 // to make `ArrowTelemetryRecord` derive `Default` automatically, which in turn
@@ -33,150 +35,96 @@ impl Default for TelemetryRecordType {
     }
 }
 
-#[allow(clippy::derivable_impls)]
-impl Default for TelemetryAttributesType {
-    fn default() -> Self {
-        TelemetryAttributesType::Unknown
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ArrowSpanLink {
+    /// Arrow doesn't support u128 natively, so this is stored as a hex string.
+    pub trace_id: String,
+    pub span_id: u64,
+    /// JSON serialized attributes for the link.
+    pub json_payload: String,
+}
+
+impl<'a> TryFrom<&'a SpanLinkInfo> for ArrowSpanLink {
+    type Error = String;
+
+    fn try_from(link: &'a SpanLinkInfo) -> Result<Self, Self::Error> {
+        Ok(ArrowSpanLink {
+            trace_id: format!("{:032x}", link.trace_id),
+            span_id: link.span_id,
+            json_payload: serde_json::to_string(&link.attributes)
+                .map_err(|e| format!("Failed to serialize SpanLink attributes to JSON: {e}"))?,
+        })
     }
 }
 
+/// A special type used to derive the schema for telemetry records (envelope) in arrow
+/// serialization, as well as a intermediate representation for serialization and deserialization.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ArrowTelemetryRecord<'a> {
     pub record_type: TelemetryRecordType,
     /// Arrow doesn't support u128 natively, so this is stored as a hex string.
-    ///
-    /// Note that this is the exact same value as `invocation_id` which is generated
-    /// as UUID::v4 and stored as OTEL trace_id field for spans/logs.
     pub trace_id: String,
     pub span_id: Option<u64>,
-    pub span_name: Option<&'a str>,
+    pub event_id: Option<Cow<'a, str>>,
+    pub span_name: Option<Cow<'a, str>>,
     pub parent_span_id: Option<u64>,
+    pub links: Option<Vec<ArrowSpanLink>>,
     pub start_time_unix_nano: Option<u64>,
     pub end_time_unix_nano: Option<u64>,
     pub time_unix_nano: Option<u64>,
-    pub severity_number: u8,
-    pub severity_text: &'a str,
-    pub body: Option<&'a str>,
+    pub severity_number: i32,
+    pub severity_text: Cow<'a, str>,
+    pub body: Option<Cow<'a, str>>,
     pub status_code: Option<u32>,
-    pub status_message: Option<&'a str>,
-    pub event_type: TelemetryAttributesType,
+    pub status_message: Option<Cow<'a, str>>,
+    pub event_type: Cow<'a, str>,
     pub attributes: ArrowAttributes<'a>,
 }
 
+/// A special type used to derive the schema for telemetry event attributes in arrow
+/// serialization, as well as a intermediate representation for serialization and deserialization.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ArrowAttributes<'a> {
-    // Process fields
-    pub schema_url: Option<&'a str>,
-    pub schema_version: Option<u16>,
-    pub package: Option<&'a str>,
-    pub version: Option<&'a str>,
-    pub host_os: Option<&'a str>,
-    pub host_arch: Option<&'a str>,
-    // Invocation fields
-    pub raw_command: Option<&'a str>,
-    // Invocation eval args
-    pub command: Option<&'a str>,
-    pub profiles_dir: Option<&'a str>,
-    pub packages_install_path: Option<&'a str>,
-    pub target: Option<&'a str>,
-    pub profile: Option<&'a str>,
-    pub vars: Option<String>, // owned due to JSON serialization
-    pub limit: Option<u64>,
-    pub num_threads: Option<u64>,
-    pub selector: Option<&'a str>,
-    #[serde(borrow)]
-    pub select: Option<Cow<'a, [String]>>,
-    #[serde(borrow)]
-    pub exclude: Option<Cow<'a, [String]>>,
-    pub indirect_selection: Option<&'a str>,
-    #[serde(borrow)]
-    pub output_keys: Option<Cow<'a, [String]>>,
-    #[serde(borrow)]
-    pub resource_types: Option<Cow<'a, [String]>>,
-    #[serde(borrow)]
-    pub exclude_resource_types: Option<Cow<'a, [String]>>,
-    pub debug: Option<bool>,
-    pub log_format: Option<&'a str>,
-    pub log_level: Option<&'a str>,
-    pub log_path: Option<&'a str>,
-    pub target_path: Option<&'a str>,
-    pub project_dir: Option<&'a str>,
-    pub quiet: Option<bool>,
-    pub write_json: Option<bool>,
-    pub write_catalog: Option<bool>,
-    pub update_deps: Option<bool>,
-    pub replay_mode: Option<&'a str>,
-    pub replay_path: Option<&'a str>,
-    pub static_analysis: Option<&'a str>,
-    pub interactive: Option<bool>,
-    pub task_cache_url: Option<&'a str>,
-    pub run_cache_mode: Option<&'a str>,
-    pub show_scans: Option<bool>,
-    pub max_depth: Option<u64>,
-    pub use_fqtn: Option<bool>,
-    pub skip_unreferenced_table_check: Option<bool>,
-    pub state: Option<&'a str>,
-    pub defer_state: Option<&'a str>,
-    pub connection: Option<bool>,
-    pub warn_error: Option<bool>,
-    pub warn_error_options: Option<String>, // owned due to JSON serialization
-    pub version_check: Option<bool>,
-    pub defer: Option<bool>,
-    pub fail_fast: Option<bool>,
-    pub empty: Option<bool>,
-    pub sample: Option<&'a str>,
-    pub full_refresh: Option<bool>,
-    pub favor_state: Option<bool>,
-    pub refresh_sources: Option<bool>,
-    pub send_anonymous_usage_stats: Option<bool>,
-    pub check_all: Option<bool>,
-    // Invocation cloud attributes
-    pub account_id: Option<&'a str>,
-    pub environment_id: Option<&'a str>,
-    pub job_id: Option<&'a str>,
-    pub run_id: Option<&'a str>,
-    pub run_reason: Option<&'a str>,
-    pub run_reason_category: Option<&'a str>,
-    pub run_trigger_category: Option<&'a str>,
-    pub project_id: Option<&'a str>,
-    // Invocation metrics
-    pub total_errors: Option<u64>,
-    pub total_warnings: Option<u64>,
-    pub autofix_suggestions: Option<u64>,
-
-    // Update fields
-    pub update_version: Option<&'a str>,
-    pub update_package: Option<&'a str>,
-    pub exe_path: Option<&'a str>,
-    // Onboarding fields
-    pub onboarding_step: Option<&'a str>,
-    // Phase fields - BuildPhaseInfo union fields
-    pub phase: Option<BuildPhase>,
-    pub node_count: Option<u64>,
-    // Node fields
-    pub unique_id: Option<&'a str>,
-    pub fqn: Option<&'a str>,
-    pub status: Option<NodeExecutionStatus>,
-    pub num_rows: Option<u64>,
-    // DevInternal/Unknown fields
-    pub dev_name: Option<&'a str>,
-    // Location fields (common to multiple variants)
-    pub file: Option<&'a str>,
+    // This field is used to serialize all non-well known and commonly used attributes,
+    // as a JSON blob. This is especially useful for events which are not frequent per
+    // -invocation, as it avoids creating many sparse columns in the arrow table.
+    pub json_payload: Option<String>,
+    // Well-known fields common across many event types
+    pub name: Option<Cow<'a, str>>,
+    pub database: Option<Cow<'a, str>>,
+    pub schema: Option<Cow<'a, str>>,
+    pub identifier: Option<Cow<'a, str>>,
+    pub dbt_core_event_code: Option<Cow<'a, str>>,
+    // Well-known phase fields
+    pub phase: Option<ExecutionPhase>,
+    // Well-known node fields
+    pub unique_id: Option<Cow<'a, str>>,
+    pub materialization: Option<NodeMaterialization>,
+    pub custom_materialization: Option<Cow<'a, str>>,
+    pub node_type: Option<NodeType>,
+    pub node_outcome: Option<NodeOutcome>,
+    pub node_error_type: Option<NodeErrorType>,
+    pub node_cancel_reason: Option<NodeCancelReason>,
+    pub node_skip_reason: Option<NodeSkipReason>,
+    // CallTrace/Unknown fields
+    pub dev_name: Option<Cow<'a, str>>,
+    // Code location fields
+    pub file: Option<Cow<'a, str>>,
     pub line: Option<u32>,
-    pub module_path: Option<&'a str>,
-    pub location_target: Option<&'a str>,
     // Log fields
     pub code: Option<u32>,
-    pub dbt_core_code: Option<&'a str>,
-    pub original_severity_number: Option<u8>,
-    pub original_severity_text: Option<&'a str>,
-    // WriteArtifact fields
-    pub relative_path: Option<&'a str>,
-    pub duration_ms: Option<u64>,
-    // Event type for discriminated union. This is a duplicate
-    // from the owning `ArrowTelemetryRecord` but is usefull
-    // as it allows working with attributes outside of the record context.
-    pub event_type: TelemetryAttributesType,
+    pub original_severity_number: Option<i32>,
+    pub original_severity_text: Option<Cow<'a, str>>,
+    // Artifact paths
+    pub relative_path: Option<Cow<'a, str>>,
+    pub artifact_type: Option<ArtifactType>,
+    // Query fields
+    pub query_id: Option<Cow<'a, str>>,
+    pub query_outcome: Option<QueryOutcome>,
+    pub adapter_type: Option<Cow<'a, str>>,
+    pub query_error_vendor_code: Option<i32>,
+    /// Associated content hash (e.g. can be CAS hash for artifacts stored in CAS).
+    pub content_hash: Option<Cow<'a, str>>,
 }
 
 #[inline]
@@ -184,768 +132,238 @@ fn nanos_to_system_time(nanos: u64) -> SystemTime {
     SystemTime::UNIX_EPOCH + std::time::Duration::from_nanos(nanos)
 }
 
-fn arrow_to_location(arrow: &ArrowAttributes) -> RecordCodeLocation {
-    RecordCodeLocation {
-        file: arrow.file.map(str::to_string),
-        line: arrow.line,
-        module_path: arrow.module_path.map(str::to_string),
-        target: arrow.location_target.map(str::to_string),
-    }
-}
-
-impl<'a> From<&'a TelemetryRecord> for ArrowTelemetryRecord<'a> {
-    fn from(record: &'a TelemetryRecord) -> Self {
-        match record {
-            TelemetryRecord::SpanStart(span) => {
-                let attributes = ArrowAttributes::from(&span.attributes);
-                ArrowTelemetryRecord {
-                    record_type: record.into(),
-                    trace_id: format!("{:032x}", span.trace_id),
-                    span_id: Some(span.span_id),
-                    span_name: Some(&span.span_name),
-                    parent_span_id: span.parent_span_id,
-                    start_time_unix_nano: Some(to_nanos(&span.start_time_unix_nano)),
-                    end_time_unix_nano: None,
-                    time_unix_nano: None,
-                    severity_number: span.severity_number as u8,
-                    severity_text: span.severity_text.as_ref(),
-                    body: None,
-                    status_code: None,
-                    status_message: None,
-                    event_type: TelemetryAttributesType::from(&span.attributes),
-                    attributes,
-                }
-            }
-            TelemetryRecord::SpanEnd(span) => {
-                let attributes = ArrowAttributes::from(&span.attributes);
-                ArrowTelemetryRecord {
-                    record_type: record.into(),
-                    trace_id: format!("{:032x}", span.trace_id),
-                    span_id: Some(span.span_id),
-                    span_name: Some(&span.span_name),
-                    parent_span_id: span.parent_span_id,
-                    start_time_unix_nano: Some(to_nanos(&span.start_time_unix_nano)),
-                    end_time_unix_nano: Some(to_nanos(&span.end_time_unix_nano)),
-                    time_unix_nano: None,
-                    severity_number: span.severity_number as u8,
-                    severity_text: span.severity_text.as_ref(),
-                    body: None,
-                    status_code: span.status.as_ref().map(|s| s.code as u32),
-                    status_message: span.status.as_ref().and_then(|s| s.message.as_deref()),
-                    event_type: TelemetryAttributesType::from(&span.attributes),
-                    attributes,
-                }
-            }
-            TelemetryRecord::LogRecord(log) => {
-                let attributes = ArrowAttributes::from(&log.attributes);
-                ArrowTelemetryRecord {
-                    record_type: record.into(),
-                    trace_id: format!("{:032x}", log.trace_id),
-                    span_id: log.span_id,
-                    span_name: log.span_name.as_deref(),
-                    parent_span_id: None,
-                    start_time_unix_nano: None,
-                    end_time_unix_nano: None,
-                    time_unix_nano: Some(to_nanos(&log.time_unix_nano)),
-                    severity_number: log.severity_number as u8,
-                    severity_text: log.severity_text.as_ref(),
-                    body: Some(log.body.as_ref()),
-                    status_code: None,
-                    status_message: None,
-                    event_type: TelemetryAttributesType::from(&log.attributes),
-                    attributes,
-                }
-            }
-        }
-    }
-}
-
-impl<'a> From<&'a TelemetryAttributes> for ArrowAttributes<'a> {
-    fn from(attr: &'a TelemetryAttributes) -> Self {
-        match attr {
-            // Some attribute types should never end up as arrow, so we just
-            // nominally match them here, but return default.
-            TelemetryAttributes::InlineCompiledCode(_) => Default::default(),
-            // Now, real mappings
-            TelemetryAttributes::Process(ProcessInfo {
-                schema_url,
-                schema_version,
-                package,
-                version,
-                host_os,
-                host_arch,
-            }) => ArrowAttributes {
-                schema_url: Some(schema_url.as_str()),
-                schema_version: Some(*schema_version),
-                package: Some(package.as_str()),
-                version: Some(version),
-                host_os: Some(host_os),
-                host_arch: Some(host_arch),
-                event_type: TelemetryAttributesType::from(attr),
-                ..Default::default()
-            },
-            TelemetryAttributes::Invocation(boxed_info) => {
-                let InvocationInfo {
-                    // we are not serializing `invocation_id` as a separate column,
-                    // as it should be canonically used via the `trace_id` field.
-                    // Invocation span is the only place where `invocation_id` exist
-                    // and used in fusion telemetry infra to set the trace_id field.
-                    invocation_id: _,
-                    raw_command,
-                    eval_args,
-                    process_info,
-                    cloud_args,
-                    metrics,
-                } = boxed_info.as_ref();
-
-                ArrowAttributes {
-                    raw_command: Some(raw_command),
-                    // Eval args
-                    command: Some(eval_args.command.as_str()),
-                    profiles_dir: eval_args.profiles_dir.as_deref(),
-                    packages_install_path: eval_args.packages_install_path.as_deref(),
-                    target: eval_args.target.as_deref(),
-                    profile: eval_args.profile.as_deref(),
-                    vars: Some(
-                        serde_json::to_string(&eval_args.vars)
-                            .expect("Failed to serialize vars to JSON"),
-                    ),
-                    limit: eval_args.limit,
-                    num_threads: eval_args.num_threads,
-                    selector: eval_args.selector.as_deref(),
-                    select: Some(Cow::from(&eval_args.select)),
-                    exclude: Some(Cow::from(&eval_args.exclude)),
-                    indirect_selection: eval_args.indirect_selection.as_deref(),
-                    output_keys: Some(Cow::from(&eval_args.output_keys)),
-                    resource_types: Some(Cow::from(&eval_args.resource_types)),
-                    exclude_resource_types: Some(Cow::from(&eval_args.exclude_resource_types)),
-                    debug: Some(eval_args.debug),
-                    log_format: Some(eval_args.log_format.as_str()),
-                    log_level: eval_args.log_level.as_deref(),
-                    log_path: eval_args.log_path.as_deref(),
-                    target_path: eval_args.target_path.as_deref(),
-                    project_dir: eval_args.project_dir.as_deref(),
-                    quiet: Some(eval_args.quiet),
-                    write_json: Some(eval_args.write_json),
-                    write_catalog: Some(eval_args.write_catalog),
-                    update_deps: Some(eval_args.update_deps),
-                    replay_mode: eval_args.replay_mode.as_deref(),
-                    replay_path: eval_args.replay_path.as_deref(),
-                    static_analysis: Some(eval_args.static_analysis.as_str()),
-                    interactive: Some(eval_args.interactive),
-                    task_cache_url: Some(eval_args.task_cache_url.as_str()),
-                    run_cache_mode: Some(eval_args.run_cache_mode.as_str()),
-                    show_scans: Some(eval_args.show_scans),
-                    max_depth: Some(eval_args.max_depth),
-                    use_fqtn: Some(eval_args.use_fqtn),
-                    skip_unreferenced_table_check: Some(eval_args.skip_unreferenced_table_check),
-                    state: eval_args.state.as_deref(),
-                    defer_state: eval_args.defer_state.as_deref(),
-                    connection: Some(eval_args.connection),
-                    warn_error: Some(eval_args.warn_error),
-                    warn_error_options: Some(
-                        serde_json::to_string(&eval_args.warn_error_options)
-                            .expect("Failed to serialize warn_error_options to JSON"),
-                    ),
-                    version_check: Some(eval_args.version_check),
-                    defer: eval_args.defer,
-                    fail_fast: Some(eval_args.fail_fast),
-                    empty: Some(eval_args.empty),
-                    sample: eval_args.sample.as_deref(),
-                    full_refresh: Some(eval_args.full_refresh),
-                    favor_state: Some(eval_args.favor_state),
-                    refresh_sources: Some(eval_args.refresh_sources),
-                    send_anonymous_usage_stats: Some(eval_args.send_anonymous_usage_stats),
-                    check_all: Some(eval_args.check_all),
-                    // Process attributes
-                    schema_url: Some(process_info.schema_url.as_str()),
-                    schema_version: Some(process_info.schema_version),
-                    package: Some(process_info.package.as_str()),
-                    version: Some(process_info.version.as_str()),
-                    host_os: Some(process_info.host_os.as_str()),
-                    host_arch: Some(process_info.host_arch.as_str()),
-                    // Cloud attributes
-                    account_id: cloud_args.account_id.as_deref(),
-                    environment_id: cloud_args.environment_id.as_deref(),
-                    job_id: cloud_args.job_id.as_deref(),
-                    run_id: cloud_args.run_id.as_deref(),
-                    run_reason: cloud_args.run_reason.as_deref(),
-                    run_reason_category: cloud_args.run_reason_category.as_deref(),
-                    run_trigger_category: cloud_args.run_trigger_category.as_deref(),
-                    project_id: cloud_args.project_id.as_deref(),
-                    // Metrics
-                    total_errors: metrics.total_errors,
-                    total_warnings: metrics.total_warnings,
-                    autofix_suggestions: metrics.autofix_suggestions,
-                    event_type: TelemetryAttributesType::from(attr),
-                    ..Default::default()
-                }
-            }
-            TelemetryAttributes::Update(UpdateInfo {
-                version,
-                package,
-                exe_path,
-            }) => ArrowAttributes {
-                update_version: version.as_deref(),
-                update_package: package.as_deref(),
-                exe_path: exe_path.as_deref(),
-                event_type: TelemetryAttributesType::from(attr),
-                ..Default::default()
-            },
-            TelemetryAttributes::Phase(phase_info) => match phase_info {
-                BuildPhaseInfo::Loading {}
-                | BuildPhaseInfo::DependencyLoading {}
-                | BuildPhaseInfo::Parsing {}
-                | BuildPhaseInfo::Scheduling {}
-                | BuildPhaseInfo::FreshnessAnalysis {}
-                | BuildPhaseInfo::Lineage {} => ArrowAttributes {
-                    phase: Some(phase_info.into()),
-                    event_type: TelemetryAttributesType::from(attr),
-                    ..Default::default()
-                },
-                BuildPhaseInfo::Analyzing { node_count }
-                | BuildPhaseInfo::Hydrating { node_count }
-                | BuildPhaseInfo::Compiling { node_count }
-                | BuildPhaseInfo::Executing { node_count } => ArrowAttributes {
-                    phase: Some(phase_info.into()),
-                    node_count: Some(*node_count),
-                    event_type: TelemetryAttributesType::from(attr),
-                    ..Default::default()
-                },
-            },
-            TelemetryAttributes::Node(NodeInfo {
-                node_id,
-                phase,
-                status,
-                num_rows,
-            }) => ArrowAttributes {
-                unique_id: Some(&node_id.unique_id),
-                fqn: Some(&node_id.fqn),
-                phase: Some(*phase),
-                status: *status,
-                num_rows: *num_rows,
-                event_type: TelemetryAttributesType::from(attr),
-                ..Default::default()
-            },
-            TelemetryAttributes::DevInternal(DevInternalInfo {
-                name,
-                location,
-                extra: _, // never serialized
-            })
-            | TelemetryAttributes::Unknown(UnknownInfo { name, location }) => ArrowAttributes {
-                dev_name: Some(name),
-                file: location.file.as_deref(),
-                line: location.line,
-                module_path: location.module_path.as_deref(),
-                location_target: location.target.as_deref(),
-                event_type: TelemetryAttributesType::from(attr),
-                ..Default::default()
-            },
-            TelemetryAttributes::Log(LogEventInfo {
-                code,
-                dbt_core_code,
-                original_severity_number,
-                original_severity_text,
-                location,
-            }) => ArrowAttributes {
-                file: location.file.as_deref(),
-                line: location.line,
-                module_path: location.module_path.as_deref(),
-                location_target: location.target.as_deref(),
-                code: *code,
-                dbt_core_code: dbt_core_code.as_deref(),
-                original_severity_number: Some(*original_severity_number as u8),
-                original_severity_text: Some(original_severity_text.as_ref()),
-                event_type: TelemetryAttributesType::from(attr),
-                ..Default::default()
-            },
-            TelemetryAttributes::LegacyLog(LegacyLogEventInfo {
-                original_severity_number,
-                original_severity_text,
-                location,
-            }) => ArrowAttributes {
-                file: location.file.as_deref(),
-                line: location.line,
-                module_path: location.module_path.as_deref(),
-                location_target: location.target.as_deref(),
-                original_severity_number: Some(*original_severity_number as u8),
-                original_severity_text: Some(original_severity_text.as_ref()),
-                event_type: TelemetryAttributesType::from(attr),
-                ..Default::default()
-            },
-            TelemetryAttributes::WriteArtifact(WriteArtifactInfo {
-                relative_path,
-                duration_ms,
-            }) => ArrowAttributes {
-                relative_path: relative_path.as_deref(),
-                duration_ms: *duration_ms,
-                event_type: TelemetryAttributesType::from(attr),
-                ..Default::default()
-            },
-            TelemetryAttributes::Onboarding(info) => ArrowAttributes {
-                onboarding_step: Some(&info.step),
-                event_type: TelemetryAttributesType::from(attr),
-                ..Default::default()
-            },
-        }
-    }
-}
-
-impl TryFrom<ArrowTelemetryRecord<'_>> for TelemetryRecord {
+impl<'a> TryFrom<&'a TelemetryRecord> for ArrowTelemetryRecord<'a> {
     type Error = String;
 
-    fn try_from(arrow: ArrowTelemetryRecord) -> Result<Self, Self::Error> {
-        let trace_id = u128::from_str_radix(&arrow.trace_id, 16)
-            .map_err(|e| format!("Invalid trace_id: {e}"))?;
+    fn try_from(value: &'a TelemetryRecord) -> Result<Self, Self::Error> {
+        let event_type = value.attributes().event_type();
 
-        match arrow.record_type {
-            TelemetryRecordType::SpanStart => {
-                let span_id = arrow
-                    .span_id
-                    .ok_or("Missing span_id for SpanStart record")?;
-                let span_name = arrow
-                    .span_name
-                    .ok_or("Missing span_name for SpanStart record")?;
-                let start_time_unix_nano = arrow
-                    .start_time_unix_nano
-                    .ok_or("Missing start_time_unix_nano for SpanStart record")?;
+        let attributes =
+            value.attributes().inner().to_arrow().ok_or_else(|| {
+                format!("Missing arrow serializer for event type \"{event_type}\"")
+            })?;
 
-                Ok(TelemetryRecord::SpanStart(SpanStartInfo {
-                    trace_id,
-                    span_id,
-                    parent_span_id: arrow.parent_span_id,
-                    span_name: span_name.to_string(),
-                    start_time_unix_nano: nanos_to_system_time(start_time_unix_nano),
-                    attributes: deserialize_attrs_from_arrow(arrow.attributes, trace_id)?,
-                    severity_number: SeverityNumber::from_repr(arrow.severity_number)
-                        .ok_or("Invalid severity_number")?,
-                    severity_text: arrow.severity_text.to_string(),
-                }))
-            }
-            TelemetryRecordType::SpanEnd => {
-                let span_id = arrow.span_id.ok_or("Missing span_id for SpanEnd record")?;
-                let span_name = arrow
-                    .span_name
-                    .ok_or("Missing span_name for SpanEnd record")?;
-                let start_time_unix_nano = arrow
-                    .start_time_unix_nano
-                    .ok_or("Missing start_time_unix_nano for SpanEnd record")?;
-                let end_time_unix_nano = arrow
-                    .end_time_unix_nano
-                    .ok_or("Missing end_time_unix_nano for SpanEnd record")?;
-
-                let status = if arrow.status_code.is_some() || arrow.status_message.is_some() {
-                    Some(SpanStatus {
-                        code: StatusCode::from_repr(arrow.status_code.unwrap_or(0) as u8)
-                            .unwrap_or(StatusCode::Unset),
-                        message: arrow.status_message.map(str::to_string),
+        let arrow_record = match value {
+            TelemetryRecord::SpanStart(span) => ArrowTelemetryRecord {
+                record_type: value.into(),
+                trace_id: format!("{:032x}", span.trace_id),
+                span_id: Some(span.span_id),
+                event_id: None,
+                span_name: Some(Cow::Borrowed(span.span_name.as_str())),
+                parent_span_id: span.parent_span_id,
+                links: span
+                    .links
+                    .as_deref()
+                    .map(|links| {
+                        links
+                            .iter()
+                            .map(ArrowSpanLink::try_from)
+                            .collect::<Result<Vec<_>, _>>()
                     })
-                } else {
-                    None
-                };
+                    .transpose()?,
+                start_time_unix_nano: Some(to_nanos(&span.start_time_unix_nano)),
+                end_time_unix_nano: None,
+                time_unix_nano: None,
+                severity_number: span.severity_number as i32,
+                severity_text: Cow::Borrowed(span.severity_text.as_ref()),
+                body: None,
+                status_code: None,
+                status_message: None,
+                event_type: event_type.into(),
+                attributes,
+            },
+            TelemetryRecord::SpanEnd(span) => ArrowTelemetryRecord {
+                record_type: value.into(),
+                trace_id: format!("{:032x}", span.trace_id),
+                span_id: Some(span.span_id),
+                event_id: None,
+                span_name: Some(Cow::Borrowed(span.span_name.as_str())),
+                parent_span_id: span.parent_span_id,
+                links: span
+                    .links
+                    .as_deref()
+                    .map(|links| {
+                        links
+                            .iter()
+                            .map(ArrowSpanLink::try_from)
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .transpose()?,
+                start_time_unix_nano: Some(to_nanos(&span.start_time_unix_nano)),
+                end_time_unix_nano: Some(to_nanos(&span.end_time_unix_nano)),
+                time_unix_nano: None,
+                severity_number: span.severity_number as i32,
+                severity_text: Cow::Borrowed(span.severity_text.as_ref()),
+                body: None,
+                status_code: span.status.as_ref().map(|s| s.code as u32),
+                status_message: span
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.message.as_deref().map(Cow::Borrowed)),
+                event_type: event_type.into(),
+                attributes,
+            },
+            TelemetryRecord::LogRecord(log) => ArrowTelemetryRecord {
+                record_type: value.into(),
+                trace_id: format!("{:032x}", log.trace_id),
+                span_id: log.span_id,
+                event_id: Some(log.event_id.to_string().into()),
+                span_name: log.span_name.as_deref().map(Cow::Borrowed),
+                parent_span_id: None,
+                links: None,
+                start_time_unix_nano: None,
+                end_time_unix_nano: None,
+                time_unix_nano: Some(to_nanos(&log.time_unix_nano)),
+                severity_number: log.severity_number as i32,
+                severity_text: Cow::Borrowed(log.severity_text.as_ref()),
+                body: Some(Cow::Borrowed(log.body.as_str())),
+                status_code: None,
+                status_message: None,
+                event_type: event_type.into(),
+                attributes,
+            },
+        };
 
-                Ok(TelemetryRecord::SpanEnd(SpanEndInfo {
-                    trace_id,
-                    span_id,
-                    parent_span_id: arrow.parent_span_id,
-                    span_name: span_name.to_string(),
-                    start_time_unix_nano: nanos_to_system_time(start_time_unix_nano),
-                    end_time_unix_nano: nanos_to_system_time(end_time_unix_nano),
-                    attributes: deserialize_attrs_from_arrow(arrow.attributes, trace_id)?,
-                    status,
-                    severity_number: SeverityNumber::from_repr(arrow.severity_number)
-                        .ok_or("Invalid severity_number")?,
-                    severity_text: arrow.severity_text.to_string(),
-                }))
-            }
-            TelemetryRecordType::LogRecord => {
-                let time_unix_nano = arrow
-                    .time_unix_nano
-                    .ok_or("Missing time_unix_nano for LogRecord")?;
-                let body = arrow.body.ok_or("Missing body for LogRecord")?;
+        Ok(arrow_record)
+    }
+}
 
-                Ok(TelemetryRecord::LogRecord(LogRecordInfo {
-                    time_unix_nano: nanos_to_system_time(time_unix_nano),
-                    trace_id,
-                    span_id: arrow.span_id,
-                    span_name: arrow.span_name.map(str::to_string),
-                    severity_number: SeverityNumber::from_repr(arrow.severity_number)
-                        .ok_or("Invalid severity_number")?,
-                    severity_text: arrow.severity_text.to_string(),
-                    body: body.to_string(),
-                    attributes: deserialize_attrs_from_arrow(arrow.attributes, trace_id)?,
-                }))
-            }
+fn deserialize_record_from_arrow(
+    arrow: ArrowTelemetryRecord,
+    registry: &TelemetryEventTypeRegistry,
+) -> Result<TelemetryRecord, String> {
+    let trace_id =
+        u128::from_str_radix(&arrow.trace_id, 16).map_err(|e| format!("Invalid trace_id: {e}"))?;
+
+    let attributes_deserializer = registry
+        .get_arrow_deserializer(arrow.event_type.as_ref())
+        .ok_or_else(|| format!("Unknown event type\"{}\"", arrow.event_type))?;
+
+    let attributes = TelemetryAttributes::new(attributes_deserializer(&arrow.attributes)?);
+
+    let links = if let Some(arrow_links) = arrow.links {
+        let mut span_links = Vec::with_capacity(arrow_links.len());
+        for link in arrow_links {
+            let trace_id = u128::from_str_radix(&link.trace_id, 16)
+                .map_err(|e| format!("Invalid trace_id in SpanLink: {e}"))?;
+            span_links.push(SpanLinkInfo {
+                trace_id,
+                span_id: link.span_id,
+                attributes: serde_json::from_str(&link.json_payload).map_err(|e| {
+                    format!("Failed to deserialize SpanLink attributes from JSON: {e}")
+                })?,
+            });
+        }
+        Some(span_links)
+    } else {
+        None
+    };
+
+    match arrow.record_type {
+        TelemetryRecordType::SpanStart => {
+            let span_id = arrow
+                .span_id
+                .ok_or("Missing span_id for SpanStart record")?;
+            let span_name = arrow
+                .span_name
+                .ok_or("Missing span_name for SpanStart record")?
+                .into_owned();
+            let start_time_unix_nano = arrow
+                .start_time_unix_nano
+                .ok_or("Missing start_time_unix_nano for SpanStart record")?;
+            let severity_text = arrow.severity_text.into_owned();
+
+            Ok(TelemetryRecord::SpanStart(SpanStartInfo {
+                trace_id,
+                span_id,
+                parent_span_id: arrow.parent_span_id,
+                links,
+                span_name,
+                start_time_unix_nano: nanos_to_system_time(start_time_unix_nano),
+                attributes,
+                severity_number: SeverityNumber::try_from(arrow.severity_number)
+                    .map_err(|_| "Invalid severity_number")?,
+                severity_text,
+            }))
+        }
+        TelemetryRecordType::SpanEnd => {
+            let span_id = arrow.span_id.ok_or("Missing span_id for SpanEnd record")?;
+            let span_name = arrow
+                .span_name
+                .ok_or("Missing span_name for SpanEnd record")?
+                .into_owned();
+            let start_time_unix_nano = arrow
+                .start_time_unix_nano
+                .ok_or("Missing start_time_unix_nano for SpanEnd record")?;
+            let end_time_unix_nano = arrow
+                .end_time_unix_nano
+                .ok_or("Missing end_time_unix_nano for SpanEnd record")?;
+            let severity_text = arrow.severity_text.into_owned();
+
+            let status = if arrow.status_code.is_some() || arrow.status_message.is_some() {
+                Some(SpanStatus {
+                    code: StatusCode::from_repr(arrow.status_code.unwrap_or(0) as u8)
+                        .unwrap_or(StatusCode::Unset),
+                    message: arrow.status_message.map(Cow::into_owned),
+                })
+            } else {
+                None
+            };
+
+            Ok(TelemetryRecord::SpanEnd(SpanEndInfo {
+                trace_id,
+                span_id,
+                parent_span_id: arrow.parent_span_id,
+                links,
+                span_name,
+                start_time_unix_nano: nanos_to_system_time(start_time_unix_nano),
+                end_time_unix_nano: nanos_to_system_time(end_time_unix_nano),
+                attributes,
+                status,
+                severity_number: SeverityNumber::try_from(arrow.severity_number)
+                    .map_err(|_| "Invalid severity_number")?,
+                severity_text,
+            }))
+        }
+        TelemetryRecordType::LogRecord => {
+            let time_unix_nano = arrow
+                .time_unix_nano
+                .ok_or("Missing time_unix_nano for LogRecord")?;
+            let body = arrow.body.ok_or("Missing body for LogRecord")?.into_owned();
+            let severity_text = arrow.severity_text.into_owned();
+
+            Ok(TelemetryRecord::LogRecord(LogRecordInfo {
+                time_unix_nano: nanos_to_system_time(time_unix_nano),
+                trace_id,
+                span_id: arrow.span_id,
+                event_id: uuid::Uuid::from_str(arrow.event_id.ok_or("Missing event_id")?.as_ref())
+                    .map_err(|e| format!("Failed to deserialize `event_id` from JSON: {e}"))?,
+                span_name: arrow.span_name.map(|name| name.into_owned()),
+                severity_number: SeverityNumber::try_from(arrow.severity_number)
+                    .map_err(|_| "Invalid severity_number")?,
+                severity_text,
+                body,
+                attributes,
+            }))
         }
     }
 }
 
-/// Deserialize TelemetryAttributes from ArrowAttributes. This is a thin wrapper
-/// over `TryFrom` implementation to handle one special case of `Invocation`
-/// attribute type that needs `trace_id` to be passed separately as it is not
-/// available in `ArrowAttributes` itself.
-fn deserialize_attrs_from_arrow(
-    arrow: ArrowAttributes,
-    trace_id: u128,
-) -> Result<TelemetryAttributes, String> {
-    match arrow.event_type {
-        TelemetryAttributesType::Invocation => {
-            Ok(TelemetryAttributes::Invocation(Box::new(InvocationInfo {
-                invocation_id: uuid::Uuid::from_u128(trace_id),
-                raw_command: arrow
-                    .raw_command
-                    .ok_or("Missing raw_command for Invocation attributes")?
-                    .to_string(),
-                eval_args: InvocationEvalArgs::try_from(&arrow)?,
-                process_info: ProcessInfo::try_from(&arrow)?,
-                cloud_args: InvocationCloudAttributes::from(&arrow),
-                metrics: InvocationMetrics::from(&arrow),
-            })))
-        }
-        _ => TelemetryAttributes::try_from(arrow),
-    }
+fn large_utf8_field(name: &str, nullable: bool) -> Field {
+    Field::new(name, DataType::LargeUtf8, nullable)
 }
 
-impl TryFrom<&ArrowAttributes<'_>> for ProcessInfo {
-    type Error = String;
-
-    fn try_from(arrow: &ArrowAttributes) -> Result<Self, Self::Error> {
-        Ok(ProcessInfo {
-            schema_url: arrow
-                .schema_url
-                .map(str::to_string)
-                .ok_or("Missing schema_url for Process attributes")?,
-            schema_version: arrow
-                .schema_version
-                .ok_or("Missing schema_version for Process attributes")?,
-            package: arrow
-                .package
-                .map(str::to_string)
-                .ok_or("Missing package for Process attributes")?,
-            version: arrow
-                .version
-                .map(str::to_string)
-                .ok_or("Missing version for Process attributes")?,
-            host_os: arrow
-                .host_os
-                .map(str::to_string)
-                .ok_or("Missing host_os for Process attributes")?,
-            host_arch: arrow
-                .host_arch
-                .map(str::to_string)
-                .ok_or("Missing host_arch for Process attributes")?,
-        })
-    }
+fn dict_utf8_field(name: &str, nullable: bool) -> Field {
+    Field::new(
+        name,
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+        nullable,
+    )
 }
 
-impl TryFrom<&ArrowAttributes<'_>> for InvocationEvalArgs {
-    type Error = String;
-
-    fn try_from(arrow: &ArrowAttributes) -> Result<Self, Self::Error> {
-        let vars = serde_json::from_str(
-            arrow
-                .vars
-                .as_ref()
-                .ok_or("Missing vars for Invocation attributes")?,
-        )
-        .map_err(|e| format!("Failed to parse vars JSON: {e}"))?;
-
-        let warn_error_options = serde_json::from_str(
-            arrow
-                .warn_error_options
-                .as_ref()
-                .ok_or("Missing warn_error_options for Invocation attributes")?,
-        )
-        .map_err(|e| format!("Failed to parse warn_error_options JSON: {e}"))?;
-
-        Ok(InvocationEvalArgs {
-            command: arrow
-                .command
-                .map(str::to_string)
-                .ok_or("Missing command for Invocation attributes")?,
-            profiles_dir: arrow.profiles_dir.map(str::to_string),
-            packages_install_path: arrow.packages_install_path.map(str::to_string),
-            target: arrow.target.map(str::to_string),
-            profile: arrow.profile.map(str::to_string),
-            vars,
-            limit: arrow.limit,
-            num_threads: arrow.num_threads,
-            selector: arrow.selector.map(str::to_string),
-            select: arrow
-                .select
-                .as_deref()
-                .map(|s| s.into())
-                .ok_or("Missing select for Invocation attributes")?,
-            exclude: arrow
-                .exclude
-                .as_deref()
-                .map(|s| s.into())
-                .ok_or("Missing exclude for Invocation attributes")?,
-            indirect_selection: arrow.indirect_selection.map(str::to_string),
-            output_keys: arrow
-                .output_keys
-                .as_deref()
-                .map(|s| s.into())
-                .ok_or("Missing output_keys for Invocation attributes")?,
-            resource_types: arrow
-                .resource_types
-                .as_deref()
-                .map(|s| s.into())
-                .ok_or("Missing resource_types for Invocation attributes")?,
-            exclude_resource_types: arrow
-                .exclude_resource_types
-                .as_deref()
-                .map(|s| s.into())
-                .ok_or("Missing exclude_resource_types for Invocation attributes")?,
-            debug: arrow
-                .debug
-                .ok_or("Missing debug for Invocation attributes")?,
-            log_format: arrow
-                .log_format
-                .map(str::to_string)
-                .ok_or("Missing log_format for Invocation attributes")?,
-            log_level: arrow.log_level.map(str::to_string),
-            log_path: arrow.log_path.map(str::to_string),
-            target_path: arrow.target_path.map(str::to_string),
-            project_dir: arrow.project_dir.map(str::to_string),
-            quiet: arrow
-                .quiet
-                .ok_or("Missing quiet for Invocation attributes")?,
-            write_json: arrow
-                .write_json
-                .ok_or("Missing write_json for Invocation attributes")?,
-            write_catalog: arrow
-                .write_catalog
-                .ok_or("Missing write_catalog for Invocation attributes")?,
-            update_deps: arrow
-                .update_deps
-                .ok_or("Missing update_deps for Invocation attributes")?,
-            replay_mode: arrow.replay_mode.map(str::to_string),
-            replay_path: arrow.replay_path.map(str::to_string),
-            static_analysis: arrow
-                .static_analysis
-                .map(str::to_string)
-                .ok_or("Missing static_analysis for Invocation attributes")?,
-            interactive: arrow
-                .interactive
-                .ok_or("Missing interactive for Invocation attributes")?,
-            task_cache_url: arrow
-                .task_cache_url
-                .map(str::to_string)
-                .ok_or("Missing task_cache_url for Invocation attributes")?,
-            run_cache_mode: arrow
-                .run_cache_mode
-                .map(str::to_string)
-                .ok_or("Missing run_cache_mode for Invocation attributes")?,
-            show_scans: arrow
-                .show_scans
-                .ok_or("Missing run_cache_mode for Invocation attributes")?,
-            max_depth: arrow
-                .max_depth
-                .ok_or("Missing run_cache_mode for Invocation attributes")?,
-            use_fqtn: arrow
-                .use_fqtn
-                .ok_or("Missing run_cache_mode for Invocation attributes")?,
-            skip_unreferenced_table_check: arrow
-                .skip_unreferenced_table_check
-                .ok_or("Missing skip_unreferenced_table_check for Invocation attributes")?,
-            state: arrow.state.map(str::to_string),
-            defer_state: arrow.defer_state.map(str::to_string),
-            connection: arrow
-                .connection
-                .ok_or("Missing connection for Invocation attributes")?,
-            warn_error: arrow
-                .warn_error
-                .ok_or("Missing warn_error for Invocation attributes")?,
-            warn_error_options,
-            version_check: arrow
-                .version_check
-                .ok_or("Missing version_check for Invocation attributes")?,
-            defer: arrow.defer,
-            fail_fast: arrow
-                .fail_fast
-                .ok_or("Missing fail_fast for Invocation attributes")?,
-            empty: arrow
-                .empty
-                .ok_or("Missing empty for Invocation attributes")?,
-            sample: arrow.sample.map(str::to_string),
-            full_refresh: arrow
-                .full_refresh
-                .ok_or("Missing full_refresh for Invocation attributes")?,
-            favor_state: arrow
-                .favor_state
-                .ok_or("Missing favor_state for Invocation attributes")?,
-            refresh_sources: arrow
-                .refresh_sources
-                .ok_or("Missing refresh_sources for Invocation attributes")?,
-            send_anonymous_usage_stats: arrow
-                .send_anonymous_usage_stats
-                .ok_or("Missing send_anonymous_usage_stats for Invocation attributes")?,
-            check_all: arrow
-                .check_all
-                .ok_or("Missing check_all for Invocation attributes")?,
-        })
-    }
-}
-
-impl From<&ArrowAttributes<'_>> for InvocationCloudAttributes {
-    fn from(arrow: &ArrowAttributes) -> Self {
-        InvocationCloudAttributes {
-            account_id: arrow.account_id.map(str::to_string),
-            environment_id: arrow.environment_id.map(str::to_string),
-            job_id: arrow.job_id.map(str::to_string),
-            run_id: arrow.run_id.map(str::to_string),
-            run_reason: arrow.run_reason.map(str::to_string),
-            run_reason_category: arrow.run_reason_category.map(str::to_string),
-            run_trigger_category: arrow.run_trigger_category.map(str::to_string),
-            project_id: arrow.project_id.map(str::to_string),
-        }
-    }
-}
-
-impl From<&ArrowAttributes<'_>> for InvocationMetrics {
-    fn from(arrow: &ArrowAttributes) -> Self {
-        InvocationMetrics {
-            total_errors: arrow.total_errors,
-            total_warnings: arrow.total_warnings,
-            autofix_suggestions: arrow.autofix_suggestions,
-        }
-    }
-}
-
-impl TryFrom<ArrowAttributes<'_>> for TelemetryAttributes {
-    type Error = String;
-
-    fn try_from(arrow: ArrowAttributes) -> Result<Self, Self::Error> {
-        match arrow.event_type {
-            // Some attribute types should never end up as arrow, so we error here.
-            TelemetryAttributesType::InlineCompiledCode => {
-                Err("InlineCompiledCode attributes should not be serialized".to_string())
-            }
-            // Now, real mappings
-            TelemetryAttributesType::Process => {
-                Ok(TelemetryAttributes::Process(ProcessInfo::try_from(&arrow)?))
-            }
-            TelemetryAttributesType::Invocation => Err(
-                "`Invocation` attributes can't be deserialized from `ArrowAttributes` directly.\
-                    Use `deserialize_attrs_from_arrow` instead"
-                    .to_string(),
-            ),
-            TelemetryAttributesType::Update => Ok(TelemetryAttributes::Update(UpdateInfo {
-                version: arrow.update_version.map(str::to_string),
-                package: arrow.update_package.map(str::to_string),
-                exe_path: arrow.exe_path.map(str::to_string),
-            })),
-            TelemetryAttributesType::Phase => {
-                let phase = arrow.phase.ok_or("Missing phase for Phase attributes")?;
-                let phase_info = match phase {
-                    BuildPhase::Loading => BuildPhaseInfo::Loading {},
-                    BuildPhase::DependencyLoading => BuildPhaseInfo::DependencyLoading {},
-                    BuildPhase::Parsing => BuildPhaseInfo::Parsing {},
-                    BuildPhase::Scheduling => BuildPhaseInfo::Scheduling {},
-                    BuildPhase::FreshnessAnalysis => BuildPhaseInfo::FreshnessAnalysis {},
-                    BuildPhase::Lineage => BuildPhaseInfo::Lineage {},
-                    BuildPhase::Analyzing => BuildPhaseInfo::Analyzing {
-                        node_count: arrow.node_count.unwrap_or(0),
-                    },
-                    BuildPhase::Hydrating => BuildPhaseInfo::Hydrating {
-                        node_count: arrow.node_count.unwrap_or(0),
-                    },
-                    BuildPhase::Compiling => BuildPhaseInfo::Compiling {
-                        node_count: arrow.node_count.unwrap_or(0),
-                    },
-                    BuildPhase::Executing => BuildPhaseInfo::Executing {
-                        node_count: arrow.node_count.unwrap_or(0),
-                    },
-                };
-                Ok(TelemetryAttributes::Phase(phase_info))
-            }
-            TelemetryAttributesType::Node => {
-                let node_id = NodeIdentifier {
-                    unique_id: arrow
-                        .unique_id
-                        .ok_or("Missing unique_id for Node attributes")?
-                        .to_string(),
-                    fqn: arrow
-                        .fqn
-                        .ok_or("Missing fqn for Node attributes")?
-                        .to_string(),
-                };
-                let phase = arrow.phase.ok_or("Missing phase for Node attributes")?;
-                Ok(TelemetryAttributes::Node(NodeInfo {
-                    node_id,
-                    phase,
-                    status: arrow.status,
-                    num_rows: arrow.num_rows,
-                }))
-            }
-            TelemetryAttributesType::DevInternal => {
-                let location = arrow_to_location(&arrow);
-                Ok(TelemetryAttributes::DevInternal(DevInternalInfo {
-                    name: arrow
-                        .dev_name
-                        .ok_or("Missing dev_name for DevInternal attributes")?
-                        .to_string(),
-                    location,
-                    extra: None, // Arrow format doesn't store extra debug info
-                }))
-            }
-            TelemetryAttributesType::Unknown => {
-                let location = arrow_to_location(&arrow);
-                Ok(TelemetryAttributes::Unknown(UnknownInfo {
-                    name: arrow
-                        .dev_name
-                        .ok_or("Missing dev_name for Unknown attributes")?
-                        .to_string(),
-                    location,
-                }))
-            }
-            TelemetryAttributesType::Onboarding => {
-                Ok(TelemetryAttributes::Onboarding(crate::OnboardingInfo {
-                    step: arrow
-                        .onboarding_step
-                        .ok_or("Missing onboarding_step for Onboarding attributes")?
-                        .to_string(),
-                }))
-            }
-            TelemetryAttributesType::Log => {
-                let location = arrow_to_location(&arrow);
-                Ok(TelemetryAttributes::Log(LogEventInfo {
-                    code: arrow.code,
-                    dbt_core_code: arrow.dbt_core_code.map(str::to_string),
-                    original_severity_number: SeverityNumber::from_repr(
-                        arrow.original_severity_number.unwrap_or(1),
-                    )
-                    .unwrap_or_default(),
-                    original_severity_text: arrow
-                        .original_severity_text
-                        .unwrap_or("INFO")
-                        .to_string(),
-                    location,
-                }))
-            }
-            TelemetryAttributesType::LegacyLog => {
-                let location = arrow_to_location(&arrow);
-                Ok(TelemetryAttributes::LegacyLog(LegacyLogEventInfo {
-                    original_severity_number: SeverityNumber::from_repr(
-                        arrow.original_severity_number.unwrap_or(1),
-                    )
-                    .unwrap_or_default(),
-                    original_severity_text: arrow
-                        .original_severity_text
-                        .unwrap_or("INFO")
-                        .to_string(),
-                    location,
-                }))
-            }
-            TelemetryAttributesType::WriteArtifact => {
-                Ok(TelemetryAttributes::WriteArtifact(WriteArtifactInfo {
-                    relative_path: arrow.relative_path.map(str::to_string),
-                    duration_ms: arrow.duration_ms,
-                }))
-            }
-        }
-    }
+fn json_large_utf8_field(name: &str, nullable: bool) -> Field {
+    Field::new(name, DataType::LargeUtf8, nullable)
+        .with_extension_type(JsonExtensionType::default())
 }
 
 /// Creates an Arrow schema for telemetry records.
@@ -954,32 +372,103 @@ impl TryFrom<ArrowAttributes<'_>> for TelemetryAttributes {
 /// telemetry records to Parquet or other Arrow-compatible formats.
 ///
 /// It returns two schemas:
-/// 1. `serialisable_schema`: The initial schema used for serialization with timestamp fields as `u64`.
-///    This is a cyrrent limitation of the `serde_arrow` library.
+/// 1. `serialisable_schema`: Used to convert Vec<Struct> -> RecordBatch with timestamp fields as `u64`.
+///    This is a current limitation of the `serde_arrow` library, which doesn't support serializing
+///    `SystemTime` or `Timestamp` types directly. These RecordBatches are never returned or stored,
+///    they are only an intermediate step in the serialization process.
 /// 2. `schema_with_timestamps`: The final schema with timestamp fields converted to `Timestamp(NANOSECOND)`.
 ///
-/// This function is tighly coupled with `serialize_to_arrow` and `deserialize_from_arrow`.
+/// This function is used to generate lazy static schemas, that are then used  by `serialize_to_arrow` and `deserialize_from_arrow`.
 ///
 /// # Returns
 ///
 /// Returns two vectors of Arrow field references that define the schema structure,
 /// or an error if schema generation fails.
-///
-/// # Examples
-///
-/// ```rust
-/// use dbt_telemetry::serialize::arrow::create_arrow_schema;
-///
-/// let (serialisable_schema, schema_with_timestamps) = create_arrow_schema().expect("Failed to create schema");
-/// // Use schema for serialization...
-/// ```
-pub fn create_arrow_schema() -> Result<(Vec<FieldRef>, Vec<FieldRef>), serde_arrow::Error> {
-    let tracing_options = TracingOptions::default().enums_without_data_as_strings(true);
+fn create_arrow_schema() -> (Vec<FieldRef>, Vec<FieldRef>) {
+    // ArrowSpanLink struct fields
+    let span_link_fields = Fields::from(vec![
+        dict_utf8_field("trace_id", false),
+        Field::new("span_id", DataType::UInt64, false),
+        json_large_utf8_field("json_payload", true),
+    ]);
 
-    let serialisable_schema = Vec::<FieldRef>::from_type::<ArrowTelemetryRecord>(tracing_options)?;
+    // ArrowAttributes struct fields
+    let attributes_fields = Fields::from(vec![
+        // JSON blob for non well-known attributes
+        json_large_utf8_field("json_payload", true),
+        // Well-known common fields
+        dict_utf8_field("name", true),
+        dict_utf8_field("database", true),
+        dict_utf8_field("schema", true),
+        dict_utf8_field("identifier", true),
+        dict_utf8_field("dbt_core_event_code", true),
+        // Phase
+        dict_utf8_field("phase", true),
+        // Node fields
+        dict_utf8_field("unique_id", true),
+        dict_utf8_field("materialization", true),
+        dict_utf8_field("custom_materialization", true),
+        dict_utf8_field("node_type", true),
+        dict_utf8_field("node_outcome", true),
+        dict_utf8_field("node_error_type", true),
+        dict_utf8_field("node_cancel_reason", true),
+        dict_utf8_field("node_skip_reason", true),
+        // CallTrace/Unknown fields
+        dict_utf8_field("dev_name", true),
+        // Code location fields
+        dict_utf8_field("file", true),
+        Field::new("line", DataType::UInt32, true),
+        // Log fields
+        Field::new("code", DataType::UInt32, true),
+        Field::new("original_severity_number", DataType::Int32, true),
+        dict_utf8_field("original_severity_text", true),
+        // Artifact paths
+        large_utf8_field("relative_path", true),
+        dict_utf8_field("artifact_type", true),
+        // Query fields
+        large_utf8_field("query_id", true),
+        dict_utf8_field("query_outcome", true),
+        dict_utf8_field("adapter_type", true),
+        Field::new("query_error_vendor_code", DataType::Int32, true),
+        // Content hash (e.g. CAS hash for artifacts stored in CAS)
+        large_utf8_field("content_hash", true),
+    ]);
 
-    // Convert timestamp columns from u64 to Timestamp
-    let schema_with_timestamps = serialisable_schema
+    // Top-level fields for ArrowTelemetryRecord
+    let serialisable_schema: Vec<FieldRef> = vec![
+        dict_utf8_field("record_type", false).into(),
+        dict_utf8_field("trace_id", false).into(),
+        Arc::new(Field::new("span_id", DataType::UInt64, true)),
+        large_utf8_field("event_id", true).into(),
+        large_utf8_field("span_name", true).into(),
+        Arc::new(Field::new("parent_span_id", DataType::UInt64, true)),
+        Arc::new(Field::new(
+            "links",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Struct(span_link_fields),
+                false,
+            ))),
+            true,
+        )),
+        Arc::new(Field::new("start_time_unix_nano", DataType::UInt64, true)),
+        Arc::new(Field::new("end_time_unix_nano", DataType::UInt64, true)),
+        Arc::new(Field::new("time_unix_nano", DataType::UInt64, true)),
+        Arc::new(Field::new("severity_number", DataType::Int32, false)),
+        dict_utf8_field("severity_text", false).into(),
+        large_utf8_field("body", true).into(),
+        Arc::new(Field::new("status_code", DataType::UInt32, true)),
+        large_utf8_field("status_message", true).into(),
+        dict_utf8_field("event_type", false).into(),
+        Arc::new(Field::new(
+            "attributes",
+            DataType::Struct(attributes_fields),
+            false,
+        )),
+    ];
+
+    // Convert timestamp columns from u64 to Timestamp(NANOSECOND)
+    let schema_with_timestamps: Vec<FieldRef> = serialisable_schema
         .iter()
         .map(|f| {
             if f.name() == "start_time_unix_nano"
@@ -997,7 +486,17 @@ pub fn create_arrow_schema() -> Result<(Vec<FieldRef>, Vec<FieldRef>), serde_arr
         })
         .collect();
 
-    Ok((serialisable_schema, schema_with_timestamps))
+    (serialisable_schema, schema_with_timestamps)
+}
+
+static ARROW_SCHEMAS: LazyLock<(Vec<FieldRef>, Vec<FieldRef>)> = LazyLock::new(create_arrow_schema);
+
+fn get_serialisable_schema() -> &'static [FieldRef] {
+    &ARROW_SCHEMAS.0
+}
+
+pub fn get_telemetry_arrow_schema() -> &'static [FieldRef] {
+    &ARROW_SCHEMAS.1
 }
 
 /// Serializes telemetry records to an Arrow RecordBatch.
@@ -1010,8 +509,6 @@ pub fn create_arrow_schema() -> Result<(Vec<FieldRef>, Vec<FieldRef>), serde_arr
 /// # Arguments
 ///
 /// * `records` - Slice of telemetry records to serialize
-/// * `serialisable_schema` - Arrow schema definition without timestamps (created with [`create_arrow_schema`])
-/// * `schema_with_timestamps` - Arrow schema definition with timestamps converted to Timestamp(NANOSECOND)
 ///
 /// # Returns
 ///
@@ -1021,38 +518,62 @@ pub fn create_arrow_schema() -> Result<(Vec<FieldRef>, Vec<FieldRef>), serde_arr
 /// # Examples
 ///
 /// ```rust
-/// use dbt_telemetry::serialize::arrow::{create_arrow_schema, serialize_to_arrow};
+/// use dbt_telemetry::serialize::arrow::serialize_to_arrow;
 /// use dbt_telemetry::TelemetryRecord;
 ///
 /// let records: Vec<TelemetryRecord> = vec![/* ... */];
-/// let (serialisable_schema, schema_with_timestamps) = = create_arrow_schema().expect("Failed to create schema");
-/// let batch = serialize_to_arrow(&records, &&serialisable_schema, &schema_with_timestamps).expect("Failed to serialize");
+/// let batch = serialize_to_arrow(&records).expect("Failed to serialize");
 /// ```
 pub fn serialize_to_arrow(
     records: &[TelemetryRecord],
-    serialisable_schema: &[FieldRef],
-    schema_with_timestamps: &[FieldRef],
 ) -> Result<RecordBatch, Box<dyn std::error::Error>> {
-    let arrow_records: Vec<ArrowTelemetryRecord> =
-        records.iter().map(ArrowTelemetryRecord::from).collect();
+    let mut errors: Vec<String> = Vec::new();
 
-    // Serialize with the temporary schema
-    let batch = serde_arrow::to_record_batch(serialisable_schema, &arrow_records)?;
+    let arrow_records: Vec<ArrowTelemetryRecord> = records
+        .iter()
+        .filter(|r| {
+            // Only include records with serializable attributes
+            r.attributes()
+                .output_flags()
+                .contains(TelemetryOutputFlags::EXPORT_PARQUET)
+        })
+        .filter_map(|r| {
+            ArrowTelemetryRecord::try_from(r)
+                .map_err(|e| errors.push(e))
+                .ok()
+        })
+        .collect();
+
+    if !errors.is_empty() {
+        // As of today, this should never happen because we filter out records with non-serializable attributes
+        // above via export flags and this is the only realistic error case.
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Failed to serialize some records: {}", errors.join("; ")),
+        )));
+    }
+
+    // Serialize with the temporary schema (timestamp fields as u64),
+    // see `create_arrow_schema` for details.
+    let batch = serde_arrow::to_record_batch(get_serialisable_schema(), &arrow_records)?;
 
     let mut columns = batch.columns().to_vec();
 
+    // Convert timestamp columns from u64 to Timestamp(NANOSECOND),
+    // this is zero-copy, just metadata change.
+    let schema_with_timestamps = get_telemetry_arrow_schema();
     for (i, field) in schema_with_timestamps.iter().enumerate() {
-        if let DataType::Timestamp(TimeUnit::Nanosecond, None) = field.data_type() {
-            if let Some(column) = columns.get(i) {
-                columns[i] = cast_with_options(
-                    column,
-                    &DataType::Timestamp(TimeUnit::Nanosecond, None),
-                    &CastOptions {
-                        safe: false,
-                        format_options: FormatOptions::new().with_display_error(false),
-                    },
-                )?
-            }
+        if let DataType::Timestamp(TimeUnit::Nanosecond, None) = field.data_type()
+            && let Some(column) = columns.get(i)
+        {
+            columns[i] = cast_with_options(
+                column,
+                &DataType::Timestamp(TimeUnit::Nanosecond, None),
+                &CastOptions {
+                    safe: false,
+                    format_options: FormatOptions::new().with_display_error(false),
+                },
+            )?
         }
     }
 
@@ -1071,7 +592,7 @@ pub fn serialize_to_arrow(
 /// # Arguments
 ///
 /// * `batch` - Arrow RecordBatch to deserialize from
-/// * `serialisable_schema` - Arrow schema definition without timestamps (created with [`create_arrow_schema`])
+/// * `registry` - Registry of telemetry event types for deserialization
 ///
 /// # Returns
 ///
@@ -1085,39 +606,23 @@ pub fn serialize_to_arrow(
 /// - Required fields are missing (e.g., span_id for span records)
 /// - Field values are invalid (e.g., malformed trace_id hex strings)
 /// - Enum values are out of range (e.g., invalid severity numbers)
+/// - Unknown event types are encountered - means that the registry is missing an entry
 ///
 /// # Examples
 ///
 /// ```rust
-/// use dbt_telemetry::serialize::arrow::{deserialize_from_arrow, create_arrow_schema};
+/// use dbt_telemetry::serialize::arrow::deserialize_from_arrow;
+/// use dbt_telemetry::TelemetryEventTypeRegistry;
 /// use arrow::record_batch::RecordBatch;
 ///
 /// let batch: RecordBatch = /* read from file */;
-/// let (serialisable_schema, _) = create_arrow_schema().unwrap();
-/// let records = deserialize_from_arrow(&batch, &serialisable_schema).expect("Failed to deserialize");
+/// let records = deserialize_from_arrow(&batch, &TelemetryEventTypeRegistry::public()).expect("Failed to deserialize");
 /// ```
 pub fn deserialize_from_arrow(
     batch: &RecordBatch,
-    serialisable_schema: &[FieldRef],
+    registry: &TelemetryEventTypeRegistry,
 ) -> Result<Vec<TelemetryRecord>, Box<dyn std::error::Error>> {
-    // Convert timestamp columns back to u64 for serde_arrow deserialization
-    let mut columns = batch.columns().to_vec();
-
-    for col in columns.iter_mut() {
-        if let DataType::Timestamp(TimeUnit::Nanosecond, None) = col.data_type() {
-            *col = cast_with_options(
-                col,
-                &DataType::UInt64,
-                &CastOptions {
-                    safe: false,
-                    format_options: FormatOptions::new().with_display_error(false),
-                },
-            )?;
-        }
-    }
-
-    // Create temporary batch with u64 timestamp fields
-    let temp_batch = RecordBatch::try_new(Schema::new(serialisable_schema).into(), columns)?;
+    let temp_batch = normalize_batch(batch)?;
 
     let arrow_records: Vec<ArrowTelemetryRecord> = serde_arrow::from_record_batch(&temp_batch)
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
@@ -1125,7 +630,7 @@ pub fn deserialize_from_arrow(
     arrow_records
         .into_iter()
         .map(|record| {
-            TelemetryRecord::try_from(record).map_err(|e| {
+            deserialize_record_from_arrow(record, registry).map_err(|e| {
                 Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
                     as Box<dyn std::error::Error>
             })
@@ -1133,16 +638,377 @@ pub fn deserialize_from_arrow(
         .collect()
 }
 
+/// Normalizes incoming `RecordBatch` to make it compatible with the
+/// serde_arrow schema used by telemetry deserialization.
+///
+/// * Columns are matched by name.
+/// * Missing required columns and incompatible type conversions are accumulated
+///   and reported together.
+/// * Missing nullable columns are filled with nulls.
+/// * Extra columns present in the input batch are ignored.
+/// * String-like columns (plain or dictionary) are accepted without casting
+///   so long as both sides are string compatible.
+/// * other mismatches are cast to the expected type when possible.
+fn normalize_batch(batch: &RecordBatch) -> Result<RecordBatch, Box<dyn std::error::Error>> {
+    let serialisable_schema = get_serialisable_schema();
+    let batch_schema = batch.schema();
+
+    let mut missing_columns = Vec::new();
+    let mut type_errors = Vec::new();
+    let mut normalized_columns = Vec::with_capacity(serialisable_schema.len());
+
+    for expected_field in serialisable_schema.iter() {
+        let expected_field = expected_field.as_ref();
+        let Some((index, actual_field)) = batch_schema.column_with_name(expected_field.name())
+        else {
+            if expected_field.is_nullable() {
+                let array = new_null_array(expected_field.data_type(), batch.num_rows());
+                normalized_columns.push(Some(NormalizedColumn {
+                    field: Arc::new(expected_field.clone()),
+                    array,
+                    metadata_changed: true,
+                }));
+            } else {
+                missing_columns.push(expected_field.name().to_string());
+                normalized_columns.push(None);
+            }
+            continue;
+        };
+
+        let column = batch.column(index);
+        match normalize_column(expected_field.name(), column, expected_field, actual_field) {
+            Ok(normalized) => normalized_columns.push(Some(normalized)),
+            Err(mut errors) => {
+                type_errors.append(&mut errors);
+                normalized_columns.push(None);
+            }
+        }
+    }
+
+    if !missing_columns.is_empty() || !type_errors.is_empty() {
+        let mut parts = Vec::new();
+        if !missing_columns.is_empty() {
+            parts.push(format!("missing columns: {}", missing_columns.join(", ")));
+        }
+        if !type_errors.is_empty() {
+            parts.push(format!("incompatible columns: {}", type_errors.join("; ")));
+        }
+        return Err(Box::new(arrow::error::ArrowError::SchemaError(
+            parts.join("; "),
+        )));
+    }
+
+    let normalized: Vec<NormalizedColumn> = normalized_columns
+        .into_iter()
+        .map(|opt| opt.expect("errors handled above"))
+        .collect();
+
+    let fields: Vec<FieldRef> = normalized.iter().map(|col| col.field.clone()).collect();
+    let arrays: Vec<ArrayRef> = normalized.into_iter().map(|col| col.array).collect();
+
+    Ok(RecordBatch::try_new(Schema::new(fields).into(), arrays)?)
+}
+
+struct NormalizedColumn {
+    field: FieldRef,
+    array: ArrayRef,
+    metadata_changed: bool,
+}
+
+/// Validates and normalizes a single column (and any nested children) such that
+/// it can be safely deserialized by serde_arrow into the expected type.
+///
+/// * String-like columns (`Utf8`, `LargeUtf8`, or dictionaries of those types)
+///   are accepted without casting.
+/// * Non-nullable fields in the batch are allowed in place of nullable expected
+///   fields, but not vice versa.
+/// * Struct and list columns are normalized recursively on their children.
+/// * All other mismatches are cast to the expected type; failures return a
+///   descriptive error message.
+fn normalize_column(
+    path: &str,
+    array: &ArrayRef,
+    expected_field: &Field,
+    actual_field: &Field,
+) -> Result<NormalizedColumn, Vec<String>> {
+    let expected_type = expected_field.data_type();
+    let actual_type = actual_field.data_type();
+
+    if is_string_like(expected_type) && is_string_like(actual_type) {
+        let (field, metadata_changed) =
+            reconcile_field(expected_field, actual_field, actual_type.clone());
+        return Ok(NormalizedColumn {
+            field,
+            array: array.clone(),
+            metadata_changed,
+        });
+    }
+
+    match expected_type {
+        DataType::Struct(_) => normalize_struct_column(path, array, expected_field, actual_field),
+        DataType::List(expected_child_field) => normalize_list_column(
+            path,
+            array,
+            expected_field,
+            actual_field,
+            expected_child_field,
+        ),
+        _ => normalize_primitive_column(path, array, expected_field, actual_field),
+    }
+}
+
+fn normalize_struct_column(
+    path: &str,
+    array: &ArrayRef,
+    expected_field: &Field,
+    actual_field: &Field,
+) -> Result<NormalizedColumn, Vec<String>> {
+    let struct_array = array
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| {
+            vec![format!(
+                "field {path}: expected Struct but found {:?}",
+                array.data_type()
+            )]
+        })?;
+
+    let DataType::Struct(expected_fields) = expected_field.data_type() else {
+        unreachable!("expected_field should be Struct");
+    };
+
+    let DataType::Struct(actual_fields) = actual_field.data_type() else {
+        return Err(vec![format!(
+            "field {path}: expected Struct but found {:?}",
+            actual_field.data_type()
+        )]);
+    };
+
+    let mut child_arrays = Vec::with_capacity(expected_fields.len());
+    let mut child_fields = Vec::with_capacity(expected_fields.len());
+    let mut errors = Vec::new();
+    let mut needs_rebuild = false;
+
+    for expected_child in expected_fields.iter() {
+        let child_path = format!("{path}.{}", expected_child.name());
+        let Some((child_index, actual_child_field)) = actual_fields
+            .iter()
+            .enumerate()
+            .find(|(_, actual_child)| actual_child.name() == expected_child.name())
+        else {
+            if expected_child.is_nullable() {
+                child_arrays.push(new_null_array(
+                    expected_child.data_type(),
+                    struct_array.len(),
+                ));
+                child_fields.push(expected_child.clone());
+                needs_rebuild = true;
+            } else {
+                errors.push(format!("field {child_path}: missing required field"));
+            }
+            continue;
+        };
+
+        let child_array = struct_array.column(child_index);
+        match normalize_column(
+            &child_path,
+            child_array,
+            expected_child.as_ref(),
+            actual_child_field.as_ref(),
+        ) {
+            Ok(child_column) => {
+                if !Arc::ptr_eq(&child_column.array, child_array) || child_column.metadata_changed {
+                    needs_rebuild = true;
+                }
+                child_arrays.push(child_column.array);
+                child_fields.push(child_column.field);
+            }
+            Err(mut child_errors) => errors.append(&mut child_errors),
+        }
+    }
+
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+
+    if child_arrays.len() != expected_fields.len() {
+        return Err(vec![format!(
+            "field {path}: unable to normalize because some children were missing"
+        )]);
+    }
+
+    let child_fields_struct: Fields = child_fields.clone().into();
+    let (new_field, parent_metadata_changed) = reconcile_field(
+        expected_field,
+        actual_field,
+        DataType::Struct(child_fields_struct.clone()),
+    );
+
+    let array: ArrayRef = if needs_rebuild {
+        Arc::new(StructArray::new(
+            child_fields_struct,
+            child_arrays,
+            struct_array.logical_nulls(),
+        ))
+    } else {
+        array.clone()
+    };
+
+    Ok(NormalizedColumn {
+        field: new_field,
+        array,
+        metadata_changed: parent_metadata_changed || needs_rebuild,
+    })
+}
+
+fn normalize_list_column(
+    path: &str,
+    array: &ArrayRef,
+    expected_field: &Field,
+    actual_field: &Field,
+    expected_child_field: &FieldRef,
+) -> Result<NormalizedColumn, Vec<String>> {
+    let list_array = array.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+        vec![format!(
+            "field {path}: expected List but found {:?}",
+            array.data_type()
+        )]
+    })?;
+
+    let values = list_array.values();
+    let actual_child_field = match actual_field.data_type() {
+        DataType::List(field) => field.clone(),
+        other => {
+            return Err(vec![format!(
+                "field {path}: expected List but found {:?}",
+                other
+            )]);
+        }
+    };
+    let child_path = format!("{path}[]");
+    let child_column = normalize_column(
+        &child_path,
+        values,
+        expected_child_field.as_ref(),
+        actual_child_field.as_ref(),
+    )?;
+
+    let needs_rebuild = child_column.metadata_changed || !Arc::ptr_eq(&child_column.array, values);
+
+    let array: ArrayRef = if needs_rebuild {
+        Arc::new(ListArray::new(
+            child_column.field.clone(),
+            list_array.offsets().clone(),
+            child_column.array.clone(),
+            list_array.nulls().cloned(),
+        ))
+    } else {
+        array.clone()
+    };
+
+    let (new_field, parent_metadata_changed) = reconcile_field(
+        expected_field,
+        actual_field,
+        DataType::List(child_column.field),
+    );
+
+    Ok(NormalizedColumn {
+        field: new_field,
+        array,
+        metadata_changed: parent_metadata_changed || needs_rebuild,
+    })
+}
+
+fn normalize_primitive_column(
+    path: &str,
+    array: &ArrayRef,
+    expected_field: &Field,
+    actual_field: &Field,
+) -> Result<NormalizedColumn, Vec<String>> {
+    let expected_type = expected_field.data_type();
+    if array.data_type() == expected_type {
+        let (field, metadata_changed) =
+            reconcile_field(expected_field, actual_field, expected_type.clone());
+        return Ok(NormalizedColumn {
+            field,
+            array: array.clone(),
+            metadata_changed,
+        });
+    }
+
+    match cast_array(array, expected_type) {
+        Ok(casted) => {
+            let (field, _) = reconcile_field(expected_field, actual_field, expected_type.clone());
+            Ok(NormalizedColumn {
+                field,
+                array: casted,
+                metadata_changed: true,
+            })
+        }
+        Err(err) => Err(vec![format!(
+            "field {path}: cannot cast from {:?} to {:?}: {err}",
+            array.data_type(),
+            expected_type
+        )]),
+    }
+}
+
+fn reconcile_field(
+    expected_field: &Field,
+    actual_field: &Field,
+    data_type: DataType,
+) -> (FieldRef, bool) {
+    let updated = expected_field.clone().with_data_type(data_type);
+    let metadata_changed = updated != *actual_field;
+    (Arc::new(updated), metadata_changed)
+}
+
+fn is_string_like(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Utf8 | DataType::LargeUtf8 => true,
+        DataType::Dictionary(_, value) => is_string_like(value.as_ref()),
+        _ => false,
+    }
+}
+
+fn cast_array(
+    array: &ArrayRef,
+    data_type: &DataType,
+) -> Result<ArrayRef, Box<dyn std::error::Error>> {
+    Ok(cast_with_options(
+        array.as_ref(),
+        data_type,
+        &CastOptions {
+            safe: false,
+            format_options: FormatOptions::new().with_display_error(false),
+        },
+    )?)
+}
+
 #[cfg(test)]
 mod tests {
+    use arrow::{
+        array::{Array, DictionaryArray, Int32Builder, LargeStringArray, StructArray, UInt64Array},
+        datatypes::{DataType, Fields, Int32Type, Schema},
+    };
     use fake::rand::SeedableRng;
     use fake::rand::rngs::StdRng;
     use fake::{Fake, Faker};
-    use strum::IntoEnumIterator;
+    use parquet::{
+        arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder},
+        basic::Compression,
+        file::properties::WriterProperties,
+    };
+
+    use crate::TelemetryEventRecType;
 
     use super::*;
-    use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
+    use std::sync::Arc;
+    use std::{
+        collections::{HashMap, HashSet, hash_map::DefaultHasher},
+        rc::Rc,
+    };
 
     // Generate pseudo-random but deterministic values for testing
     fn hash_seed(seed: &str) -> u64 {
@@ -1151,90 +1017,28 @@ mod tests {
         hasher.finish()
     }
 
-    fn create_fake_attributes(
-        seed: &str,
-        event_type: TelemetryAttributesType,
-        phase: Option<BuildPhase>,
-    ) -> TelemetryAttributes {
-        let hashed_seed = hash_seed(seed);
-        let mut rng = StdRng::seed_from_u64(hashed_seed);
-        match event_type {
-            TelemetryAttributesType::Process => {
-                TelemetryAttributes::Process(Faker.fake_with_rng(&mut rng))
-            }
-            TelemetryAttributesType::Invocation => {
-                TelemetryAttributes::Invocation(Box::new(Faker.fake_with_rng(&mut rng)))
-            }
-            TelemetryAttributesType::Update => {
-                TelemetryAttributes::Update(Faker.fake_with_rng(&mut rng))
-            }
-            TelemetryAttributesType::Onboarding => {
-                TelemetryAttributes::Onboarding(Faker.fake_with_rng(&mut rng))
-            }
-            TelemetryAttributesType::Phase => {
-                let Some(phase) = phase else {
-                    return TelemetryAttributes::Phase(Faker.fake_with_rng(&mut rng));
-                };
+    fn create_fake_attributes(seed: &str, event_type: &'static str) -> TelemetryAttributes {
+        let faker = TelemetryEventTypeRegistry::public()
+            .get_faker(event_type)
+            .unwrap_or_else(|| panic!("No faker defined for event type \"{event_type}\""));
 
-                let phase_info = match phase {
-                    BuildPhase::Loading => BuildPhaseInfo::Loading {},
-                    BuildPhase::DependencyLoading => BuildPhaseInfo::DependencyLoading {},
-                    BuildPhase::Parsing => BuildPhaseInfo::Parsing {},
-                    BuildPhase::Scheduling => BuildPhaseInfo::Scheduling {},
-                    BuildPhase::FreshnessAnalysis => BuildPhaseInfo::FreshnessAnalysis {},
-                    BuildPhase::Lineage => BuildPhaseInfo::Lineage {},
-                    BuildPhase::Analyzing => BuildPhaseInfo::Analyzing {
-                        node_count: Faker.fake_with_rng(&mut rng),
-                    },
-                    BuildPhase::Hydrating => BuildPhaseInfo::Hydrating {
-                        node_count: Faker.fake_with_rng(&mut rng),
-                    },
-                    BuildPhase::Compiling => BuildPhaseInfo::Compiling {
-                        node_count: Faker.fake_with_rng(&mut rng),
-                    },
-                    BuildPhase::Executing => BuildPhaseInfo::Executing {
-                        node_count: Faker.fake_with_rng(&mut rng),
-                    },
-                };
-                TelemetryAttributes::Phase(phase_info)
-            }
-            TelemetryAttributesType::Node => {
-                TelemetryAttributes::Node(Faker.fake_with_rng(&mut rng))
-            }
-            TelemetryAttributesType::DevInternal => {
-                TelemetryAttributes::DevInternal(Faker.fake_with_rng(&mut rng))
-            }
-            TelemetryAttributesType::Unknown => {
-                TelemetryAttributes::Unknown(Faker.fake_with_rng(&mut rng))
-            }
-            TelemetryAttributesType::Log => TelemetryAttributes::Log(Faker.fake_with_rng(&mut rng)),
-            TelemetryAttributesType::LegacyLog => {
-                TelemetryAttributes::LegacyLog(Faker.fake_with_rng(&mut rng))
-            }
-            TelemetryAttributesType::WriteArtifact => {
-                TelemetryAttributes::WriteArtifact(Faker.fake_with_rng(&mut rng))
-            }
-            TelemetryAttributesType::InlineCompiledCode => {
-                panic!("InlineCompiledCode should not be created for testing")
-            }
-        }
+        TelemetryAttributes::new(faker(seed))
     }
 
     fn create_all_fake_attributes(seed: &str) -> Vec<TelemetryAttributes> {
         let mut attributes = Vec::new();
-        for event_type in TelemetryAttributesType::iter() {
+        for event_type in TelemetryEventTypeRegistry::public().iter() {
+            let attrs = create_fake_attributes(seed, event_type);
+
             // Skip variants that are known to not be serialized
-            if event_type == TelemetryAttributesType::InlineCompiledCode {
+            if !attrs
+                .output_flags()
+                .contains(TelemetryOutputFlags::EXPORT_PARQUET)
+            {
                 continue;
             }
 
-            if event_type == TelemetryAttributesType::Phase {
-                for phase in BuildPhase::iter() {
-                    attributes.push(create_fake_attributes(seed, event_type, Some(phase)));
-                }
-            } else {
-                attributes.push(create_fake_attributes(seed, event_type, None));
-            }
+            attributes.push(attrs);
         }
         attributes
     }
@@ -1251,7 +1055,8 @@ mod tests {
             trace_id,
             span_id,
             parent_span_id: Some(parent_span_id),
-            span_name: attributes.to_string(),
+            links: None,
+            span_name: attributes.event_display_name(),
             start_time_unix_nano: SystemTime::UNIX_EPOCH
                 + std::time::Duration::from_nanos(start_time),
             attributes,
@@ -1274,6 +1079,7 @@ mod tests {
             trace_id: span_start_info.trace_id,
             span_id: span_start_info.span_id,
             parent_span_id: span_start_info.parent_span_id,
+            links: span_start_info.links.clone(),
             span_name: span_start_info.span_name.clone(),
             start_time_unix_nano: span_start_info.start_time_unix_nano,
             end_time_unix_nano: span_start_info.start_time_unix_nano
@@ -1301,13 +1107,297 @@ mod tests {
             time_unix_nano: SystemTime::UNIX_EPOCH + std::time::Duration::from_nanos(log_time),
             trace_id,
             span_id: Some(span_id),
-            span_name: Some(attributes.to_string()),
+            event_id: Faker.fake_with_rng(&mut rng),
+            span_name: Some(attributes.event_display_name()),
             severity_number: Faker.fake_with_rng(&mut rng),
             severity_text: ["ERROR", "WARN", "INFO", "DEBUG"][(hashed_seed % 4) as usize]
                 .to_string(),
             body: format!("Log message {}", hashed_seed % 10000),
             attributes,
         })
+    }
+
+    fn batch_with_dictionary_large_utf8_column(
+        batch: &RecordBatch,
+        column_name: &str,
+    ) -> RecordBatch {
+        let column_index = batch
+            .schema()
+            .index_of(column_name)
+            .expect("column should exist");
+        let column = batch.column(column_index);
+        let large_utf8 =
+            cast_array(column, &DataType::LargeUtf8).expect("failed to cast column to LargeUtf8");
+        let string_array = large_utf8
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("expected LargeUtf8 column");
+
+        let mut builder = Int32Builder::with_capacity(string_array.len());
+        let mut dictionary = Vec::new();
+        let mut indices: HashMap<String, i32> = HashMap::new();
+
+        for value in string_array.iter() {
+            match value {
+                Some(value) => {
+                    let entry = indices.entry(value.to_string()).or_insert_with(|| {
+                        let idx = dictionary.len() as i32;
+                        dictionary.push(value.to_string());
+                        idx
+                    });
+                    builder.append_value(*entry);
+                }
+                None => builder.append_null(),
+            }
+        }
+
+        let keys = builder.finish();
+        let values = Arc::new(LargeStringArray::from(dictionary)) as ArrayRef;
+        let dictionary_array = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(keys, values)
+                .expect("failed to build dictionary"),
+        ) as ArrayRef;
+
+        replace_column(batch, column_index, dictionary_array)
+    }
+
+    fn batch_with_large_utf8_column(batch: &RecordBatch, column_name: &str) -> RecordBatch {
+        let column_index = batch
+            .schema()
+            .index_of(column_name)
+            .expect("column should exist");
+        let column = batch.column(column_index);
+        let large_utf8 =
+            cast_array(column, &DataType::LargeUtf8).expect("failed to cast to LargeUtf8");
+
+        replace_column(batch, column_index, large_utf8)
+    }
+
+    fn batch_with_extra_column(batch: &RecordBatch) -> RecordBatch {
+        let mut fields: Vec<FieldRef> = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| Arc::new(field.as_ref().clone()))
+            .collect();
+        fields.push(Arc::new(Field::new(
+            "__test_extra_column",
+            DataType::UInt64,
+            true,
+        )));
+
+        let extra_values = UInt64Array::from(vec![Some(42u64); batch.num_rows()]);
+        let mut columns = batch.columns().to_vec();
+        columns.push(Arc::new(extra_values) as ArrayRef);
+
+        let schema = Arc::new(Schema::new(fields));
+        RecordBatch::try_new(schema, columns).expect("failed to build batch with extra column")
+    }
+
+    fn batch_with_non_nullable_body(batch: &RecordBatch) -> RecordBatch {
+        let column_index = batch
+            .schema()
+            .index_of("body")
+            .expect("body column should exist");
+        assert!(
+            batch
+                .schema()
+                .field_with_name("body")
+                .expect("body column should exist")
+                .is_nullable(),
+            "Body field expected to be nullablefor this test"
+        );
+        let column = batch.column(column_index);
+        assert_eq!(
+            column.null_count(),
+            0,
+            "body column cannot be made non-nullable when it contains nulls"
+        );
+
+        let mut fields: Vec<FieldRef> = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| Arc::new(field.as_ref().clone()))
+            .collect();
+        fields[column_index] = Arc::new(
+            batch
+                .schema()
+                .field(column_index)
+                .clone()
+                .with_nullable(false),
+        );
+
+        let columns = batch.columns().to_vec();
+        let schema = Arc::new(Schema::new(fields));
+        RecordBatch::try_new(schema, columns).expect("failed to make body non-nullable")
+    }
+
+    fn batch_with_non_nullable_json_payload(batch: &RecordBatch) -> RecordBatch {
+        let attributes_index = batch
+            .schema()
+            .index_of("attributes")
+            .expect("attributes column should exist");
+
+        let attributes_column = batch.column(attributes_index).clone();
+        let struct_array = attributes_column
+            .as_ref()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("attributes column should be a StructArray");
+
+        let DataType::Struct(child_fields) = attributes_column.data_type() else {
+            panic!("attributes column should have struct data type");
+        };
+
+        let mut updated_fields: Vec<FieldRef> = child_fields
+            .iter()
+            .map(|field| Arc::new(field.as_ref().clone()))
+            .collect();
+
+        let json_index = updated_fields
+            .iter()
+            .position(|field| field.name() == "json_payload")
+            .expect("json_payload field should exist");
+
+        let json_column = struct_array.column(json_index);
+        let json_values = json_column
+            .as_ref()
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("json_payload should be LargeUtf8");
+
+        let cleaned_json_column: ArrayRef = Arc::new(LargeStringArray::from_iter_values(
+            json_values
+                .iter()
+                .map(|value| value.unwrap_or_default().to_owned()),
+        ));
+
+        let updated_json_field = updated_fields[json_index]
+            .as_ref()
+            .clone()
+            .with_nullable(false);
+        updated_fields[json_index] = Arc::new(updated_json_field);
+
+        let mut child_columns: Vec<ArrayRef> = (0..struct_array.num_columns())
+            .map(|idx| struct_array.column(idx).clone())
+            .collect();
+        child_columns[json_index] = cleaned_json_column;
+
+        let new_struct = Arc::new(StructArray::new(
+            Fields::from(updated_fields),
+            child_columns,
+            struct_array.logical_nulls(),
+        )) as ArrayRef;
+
+        replace_column(batch, attributes_index, new_struct)
+    }
+
+    fn batch_missing_column(batch: &RecordBatch, column_name: &str) -> RecordBatch {
+        let column_index = batch
+            .schema()
+            .index_of(column_name)
+            .expect("column should exist");
+
+        let fields: Vec<FieldRef> = batch
+            .schema()
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|&(idx, _)| (idx != column_index))
+            .map(|(_, field)| Arc::new(field.as_ref().clone()))
+            .collect();
+
+        let columns: Vec<ArrayRef> = batch
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|&(idx, _)| (idx != column_index))
+            .map(|(_, column)| column.clone())
+            .collect();
+
+        let schema = Arc::new(Schema::new(fields));
+        RecordBatch::try_new(schema, columns).expect("failed to remove column")
+    }
+
+    fn replace_column(
+        batch: &RecordBatch,
+        column_index: usize,
+        new_column: ArrayRef,
+    ) -> RecordBatch {
+        let mut fields: Vec<FieldRef> = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| Arc::new(field.as_ref().clone()))
+            .collect();
+
+        fields[column_index] = Arc::new(
+            batch
+                .schema()
+                .field(column_index)
+                .clone()
+                .with_data_type(new_column.data_type().clone()),
+        );
+
+        let mut columns = batch.columns().to_vec();
+        columns[column_index] = new_column;
+
+        let schema = Arc::new(Schema::new(fields));
+        RecordBatch::try_new(schema, columns).expect("failed to replace column")
+    }
+
+    #[test]
+    fn test_deserialize_from_arrow_schema_normalization() {
+        let attributes = create_all_fake_attributes("schema_norm_seed")
+            .into_iter()
+            .find(|attrs| matches!(attrs.record_category(), TelemetryEventRecType::Log))
+            .expect("expected at least one log attribute");
+
+        let log_record = create_test_log_record("schema_norm_seed", attributes);
+        let records = vec![log_record];
+        let base_batch = serialize_to_arrow(&records).expect("failed to serialize base batch");
+        let registry = TelemetryEventTypeRegistry::public();
+
+        let variations = vec![
+            (
+                "event_type_large_utf8_instead_of_dict_utf8",
+                batch_with_large_utf8_column(&base_batch, "event_type"),
+            ),
+            (
+                "event_type_dict_large_utf8_instead_of_dict_utf8",
+                batch_with_dictionary_large_utf8_column(&base_batch, "event_type"),
+            ),
+            (
+                "severity_text_large_utf8_instead_of_dict_utf8",
+                batch_with_large_utf8_column(&base_batch, "severity_text"),
+            ),
+            ("extra_column", batch_with_extra_column(&base_batch)),
+            (
+                "body_non_nullable",
+                batch_with_non_nullable_body(&base_batch),
+            ),
+            (
+                "attributes_json_payload_non_nullable",
+                batch_with_non_nullable_json_payload(&base_batch),
+            ),
+            (
+                "missing_nullable_column",
+                batch_missing_column(&base_batch, "links"),
+            ),
+        ];
+
+        for (name, variant) in variations {
+            let deserialized = deserialize_from_arrow(&variant, registry)
+                .unwrap_or_else(|e| panic!("expected success for {name}: {e}"));
+            assert_eq!(deserialized, records, "variation {name} mismatch");
+        }
+
+        let missing = batch_missing_column(&base_batch, "event_type");
+        assert!(
+            deserialize_from_arrow(&missing, registry).is_err(),
+            "missing required column should fail"
+        );
     }
 
     #[test]
@@ -1317,19 +1407,16 @@ mod tests {
         create_all_fake_attributes("test_seed")
             .iter()
             .for_each(|attributes| {
-                match attributes.record_type() {
+                match attributes.record_category() {
                     // Span types
-                    TelemetryRecordType::SpanEnd => {
+                    TelemetryEventRecType::Span => {
                         let span_start = create_test_span_start("test_seed", attributes.clone());
                         // Create a matching span end for the start
                         let span_end = create_test_span_end("test_seed", &span_start);
                         original_records.push(span_start);
                         original_records.push(span_end);
                     }
-                    TelemetryRecordType::SpanStart => {
-                        panic!("SpanStart should not be returned here")
-                    }
-                    TelemetryRecordType::LogRecord => {
+                    TelemetryEventRecType::Log => {
                         // Create a log record
                         let log_record = create_test_log_record("test_seed", attributes.clone());
                         original_records.push(log_record);
@@ -1337,14 +1424,9 @@ mod tests {
                 }
             });
 
-        let (serialisable_schema, schema_with_timestamps) = create_arrow_schema().unwrap();
-        let batch = serialize_to_arrow(
-            &original_records,
-            &serialisable_schema,
-            &schema_with_timestamps,
-        )
-        .unwrap();
-        let deserialized = deserialize_from_arrow(&batch, &serialisable_schema).unwrap();
+        let batch = serialize_to_arrow(&original_records).unwrap();
+        let mut deserialized =
+            deserialize_from_arrow(&batch, TelemetryEventTypeRegistry::public()).unwrap();
 
         // Use PartialEq to compare entire records
         for (original, deserialized) in original_records.iter().zip(deserialized.iter()) {
@@ -1353,11 +1435,56 @@ mod tests {
                 "Record roundtrip failed for: {original:?}"
             );
         }
+
+        // Now through parquet
+        let mut buffer = Rc::new(Vec::new());
+        {
+            let cursor = std::io::Cursor::new(Rc::get_mut(&mut buffer).unwrap());
+
+            let mut parquet_writer = ArrowWriter::try_new(
+                cursor,
+                arrow::datatypes::Schema::new(get_telemetry_arrow_schema()).into(),
+                Some(
+                    WriterProperties::builder()
+                        .set_compression(Compression::SNAPPY)
+                        .build(),
+                ),
+            )
+            .expect("Failed to create Parquet writer");
+            parquet_writer.write(&batch).expect("Failed to write batch");
+            parquet_writer.close().expect("Failed to close writer");
+        }
+
+        let parquet_reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from_owner(
+            Rc::into_inner(buffer).unwrap(),
+        ))
+        .unwrap()
+        .build()
+        .unwrap();
+
+        deserialized.clear();
+        for batch_result in parquet_reader {
+            let records = deserialize_from_arrow(
+                &batch_result.unwrap(),
+                TelemetryEventTypeRegistry::public(),
+            )
+            .unwrap();
+            deserialized.extend(records);
+        }
+
+        // Use PartialEq to compare entire records
+        for (original, deserialized) in original_records.iter().zip(deserialized.iter()) {
+            assert_eq!(
+                original, deserialized,
+                "Record roundtrip via parquet failed for: {original:?}"
+            );
+        }
     }
 
     #[test]
     fn test_schema_creation() {
-        let (serialisable_schema, schema_with_timestamps) = create_arrow_schema().unwrap();
+        let serialisable_schema = get_serialisable_schema();
+        let schema_with_timestamps = get_telemetry_arrow_schema();
         assert!(!serialisable_schema.is_empty());
         assert!(!schema_with_timestamps.is_empty());
 
@@ -1366,8 +1493,10 @@ mod tests {
             "record_type",
             "trace_id",
             "span_id",
+            "event_id",
             "span_name",
             "parent_span_id",
+            "links",
             "start_time_unix_nano",
             "end_time_unix_nano",
             "time_unix_nano",
@@ -1412,5 +1541,48 @@ mod tests {
                 );
             }
         });
+
+        // Test attributes struct schema has all keys from ArrowAttributes
+        let attributes_field = serialisable_schema
+            .iter()
+            .find(|f| f.name() == "attributes")
+            .expect("Missing attributes field");
+        let DataType::Struct(attribute_fields) = attributes_field.data_type() else {
+            panic!("Attributes field should be a Struct");
+        };
+        let attribute_field_names: HashSet<&str> =
+            attribute_fields.iter().map(|f| f.name().as_str()).collect();
+
+        let fake_attrs = serde_json::to_value(ArrowAttributes::default())
+            .expect("Failed to serialize ArrowAttributes");
+        let expected_field_names = fake_attrs
+            .as_object()
+            .expect("ArrowAttributes should serialize to a JSON object")
+            .keys()
+            .map(|s| s.as_str())
+            .collect::<HashSet<&str>>();
+
+        let missing_fields: Vec<&str> = expected_field_names
+            .difference(&attribute_field_names)
+            .copied()
+            .collect();
+
+        let extra_fields: Vec<&str> = attribute_field_names
+            .difference(&expected_field_names)
+            .copied()
+            .collect();
+
+        let mut err_msg = String::new();
+        if !missing_fields.is_empty() {
+            err_msg.push_str(&format!("Missing fields: {}.\n", missing_fields.join(", ")));
+        }
+        if !extra_fields.is_empty() {
+            err_msg.push_str(&format!("Extra fields: {}.", extra_fields.join(", ")));
+        }
+
+        assert!(
+            err_msg.is_empty(),
+            "Attribute schema vs. struct fields mismatch: {err_msg}"
+        );
     }
 }

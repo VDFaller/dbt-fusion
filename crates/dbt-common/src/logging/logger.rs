@@ -11,9 +11,7 @@ use std::fmt::Display;
 use std::io::{IsTerminal as _, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use tracing_log::LogTracer;
 
-const QUERY_LOG_SQL: &str = "query_log.sql";
 const CACHE_LOG_FILE: &str = "beta_cache.log";
 
 /// Predicate to check if a key in a log [Record] is an internal logging key.
@@ -97,7 +95,6 @@ enum LogTarget {
     Stdout,
     Stderr,
     Writer(Arc<Mutex<Box<dyn Write + Send>>>),
-    TracingBridge(LogTracer),
 }
 
 // Individual logger that can be customized
@@ -135,9 +132,6 @@ macro_rules! locked_writeln {
                     writeln!(writer, $($arg)*).ok();
                 }
             }
-            LogTarget::TracingBridge(_) => {
-                // TracingBridge doesn't use writeln, handled separately in log() method
-            }
         }
     };
 }
@@ -153,7 +147,6 @@ impl Logger {
             LogTarget::Stdout => !std::io::stdout().is_terminal(),
             LogTarget::Stderr => !std::io::stderr().is_terminal(),
             LogTarget::Writer(_) => true, // Always remove ANSI codes for file writers
-            LogTarget::TracingBridge(_) => true, // Always remove ANSI codes for tracing bridge
         };
         Self {
             target: writer,
@@ -171,15 +164,15 @@ impl Logger {
             return false;
         }
         // Counter intuitively, the lower the level, the more verbose the logging
-        if let Some(min_level) = self.config.min_level {
-            if current_level < min_level {
-                return false;
-            }
+        if let Some(min_level) = self.config.min_level
+            && current_level < min_level
+        {
+            return false;
         }
-        if let Some(max_level) = self.config.max_level {
-            if current_level > max_level {
-                return false;
-            }
+        if let Some(max_level) = self.config.max_level
+            && current_level > max_level
+        {
+            return false;
         }
 
         // filter based on target
@@ -188,16 +181,16 @@ impl Logger {
         }
 
         // Reject if not in includes (when set)
-        if let Some(ref includes) = self.config.includes {
-            if !includes.contains(&metadata.target().to_string()) {
-                return false;
-            }
+        if let Some(ref includes) = self.config.includes
+            && !includes.contains(&metadata.target().to_string())
+        {
+            return false;
         }
         // Reject if in excludes (when set)
-        if let Some(ref excludes) = self.config.excludes {
-            if excludes.contains(&metadata.target().to_string()) {
-                return false;
-            }
+        if let Some(ref excludes) = self.config.excludes
+            && excludes.contains(&metadata.target().to_string())
+        {
+            return false;
         }
         true
     }
@@ -220,9 +213,9 @@ impl Logger {
         // Start with the base JSON structure
         let mut info_json = json!({
             "category": "",
-            "code": kvs.get("code").unwrap_or(&"".to_string()).to_string(),
+            "code": kvs.get("code").map(|s| s.as_str()).unwrap_or("").to_string(),
             "invocation_id": invocation_id,
-            "name": kvs.get("name").unwrap_or(&"Generic".to_string()).to_string(),
+            "name": kvs.get("name").map(|s| s.as_str()).unwrap_or("Generic").to_string(),
             "pid": std::process::id(),
             "thread": std::thread::current().name().unwrap_or("main").to_string(),
             // drop the timezone offset and format as microseconds to conform to python logging timestamp parsing
@@ -242,15 +235,13 @@ impl Logger {
             }
         }
         let mut data = json!({ "log_version": 3, "version": env!("CARGO_PKG_VERSION")});
-        if let Some(data_str) = kvs.get("data") {
-            if let Ok(serde_json::Value::Object(ref data_obj)) =
+        if let Some(data_str) = kvs.get("data")
+            && let Ok(serde_json::Value::Object(ref data_obj)) =
                 serde_json::from_str::<serde_json::Value>(data_str)
-            {
-                if let serde_json::Value::Object(ref mut map) = data {
-                    for (key, value) in data_obj {
-                        map.insert(key.clone(), value.clone());
-                    }
-                }
+            && let serde_json::Value::Object(ref mut map) = data
+        {
+            for (key, value) in data_obj {
+                map.insert(key.clone(), value.clone());
             }
         }
         json!({ "info": info_json, "data": data}).to_string()
@@ -265,71 +256,51 @@ impl log::Log for Logger {
             return false;
         }
         // Counter intuitively, the lower the level, the more verbose the logging
-        if let Some(min_level) = self.config.min_level {
-            if current_level < min_level {
-                return false;
-            }
+        if let Some(min_level) = self.config.min_level
+            && current_level < min_level
+        {
+            return false;
         }
-        if let Some(max_level) = self.config.max_level {
-            if current_level > max_level {
-                return false;
-            }
+        if let Some(max_level) = self.config.max_level
+            && current_level > max_level
+        {
+            return false;
         }
         // Reject if not in includes (when set)
-        if let Some(ref includes) = self.config.includes {
-            if !includes.contains(&metadata.target().to_string()) {
-                return false;
-            }
+        if let Some(ref includes) = self.config.includes
+            && !includes.contains(&metadata.target().to_string())
+        {
+            return false;
         }
         // Reject if in excludes (when set)
-        if let Some(ref excludes) = self.config.excludes {
-            if excludes.contains(&metadata.target().to_string()) {
-                return false;
-            }
+        if let Some(ref excludes) = self.config.excludes
+            && excludes.contains(&metadata.target().to_string())
+        {
+            return false;
         }
         true
     }
 
     fn log(&self, record: &Record) {
         if self.enabled(record.metadata()) && !super::term::is_term_control_only(record) {
-            match &self.target {
-                LogTarget::TracingBridge(tracer) => {
-                    // Check if this record is already handled by new tracing logic
-                    if record
-                        .key_values()
-                        .get(log::kv::Key::from_str("_TRACING_HANDLED_"))
-                        .is_some()
-                    {
-                        // This record is already handled by the new tracing logic, skip it
-                        return;
+            match self.config.format {
+                LogFormat::Text | LogFormat::Default => {
+                    let mut text = record.args().to_string();
+                    if self.remove_ansi_codes {
+                        text = remove_ansi_codes(&text);
                     }
-
-                    // For tracing bridge, we need to strip ANSI codes and pass through
-                    // the log level filtering logic, then delegate to the tracer
-                    let text = remove_ansi_codes(&record.args().to_string());
-
-                    // Pass a new record with stripped ANSI codes
-                    tracer.log(&record.to_builder().args(format_args!("{text}")).build());
+                    locked_writeln!(self, "{}", text);
                 }
-                _ => match self.config.format {
-                    LogFormat::Text | LogFormat::Default => {
-                        let mut text = record.args().to_string();
-                        if self.remove_ansi_codes {
-                            text = remove_ansi_codes(&text);
-                        }
-                        locked_writeln!(self, "{}", text);
-                    }
-                    LogFormat::Json => {
-                        let json = Self::format_json(
-                            record,
-                            &self.invocation_id.to_string(),
-                            self.remove_ansi_codes,
-                        );
-                        locked_writeln!(self, "{}", json);
-                    }
-                    // This is handled in new tracing infra
-                    LogFormat::Otel => {}
-                },
+                LogFormat::Json => {
+                    let json = Self::format_json(
+                        record,
+                        &self.invocation_id.to_string(),
+                        self.remove_ansi_codes,
+                    );
+                    locked_writeln!(self, "{}", json);
+                }
+                // This is handled in new tracing infra
+                LogFormat::Otel => {}
             }
         }
     }
@@ -346,9 +317,6 @@ impl log::Log for Logger {
                 if let Ok(mut writer) = path.lock() {
                     let _ = writer.flush();
                 }
-            }
-            LogTarget::TracingBridge(ref tracer) => {
-                tracer.flush();
             }
         }
     }
@@ -451,27 +419,6 @@ impl MultiLoggerBuilder {
             config,
             self.invocation_id,
         )));
-        self
-    }
-
-    fn add_tracing_bridge_logger(mut self, log_config: &FsLogConfig) -> Self {
-        let config = LoggerConfig {
-            level_filter: log_config.log_level,
-            format: LogFormat::Text, // Format doesn't matter for tracing bridge
-            min_level: None,
-            max_level: Some(LevelFilter::Debug),
-            includes: None,
-            excludes: None,
-        };
-
-        let logger = Logger::new(
-            "tracing_bridge",
-            LogTarget::TracingBridge(LogTracer::new()),
-            config,
-            self.invocation_id,
-        );
-
-        self.loggers.push(Box::new(logger));
         self
     }
 
@@ -586,35 +533,6 @@ pub fn init_logger(log_config: FsLogConfig) -> FsResult<()> {
     ) as Box<dyn Write + Send>));
     builder = builder.add_logger("file", file, file_config);
 
-    // Add logger of sql queries executed through adapters
-    let query_file_config = LoggerConfig {
-        level_filter: LevelFilter::Debug,
-        format: LogFormat::Text,
-        min_level: None,
-        max_level: None,
-        includes: Some(vec![EXECUTING.to_string()]),
-        excludes: None,
-    };
-    let query_log_path = log_config
-        .file_log_path
-        .parent()
-        .unwrap_or_else(|| {
-            panic!(
-                "Failed to obtain parent from {:?}, invalid log file path specified",
-                log_config.file_log_path
-            )
-        })
-        .join(QUERY_LOG_SQL);
-    let file = Arc::new(Mutex::new(Box::new(
-        std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&query_log_path)
-            .unwrap_or_else(|_| panic!("Failed to open log file {query_log_path:?}, do you have sufficient disk space or permissions?")),
-    ) as Box<dyn Write + Send>));
-    builder = builder.add_logger("queries", file, query_file_config);
-
     // Add logger for caching (relation cache)
     let cache_log_config = LoggerConfig {
         level_filter: LevelFilter::Debug,
@@ -643,9 +561,6 @@ pub fn init_logger(log_config: FsLogConfig) -> FsResult<()> {
             .unwrap_or_else(|_| panic!("Failed to open log file {cache_log_path:?}, does you have sufficient disk space or permissions?")),
     ) as Box<dyn Write + Send>));
     builder = builder.add_logger("cache_stats", file, cache_log_config);
-
-    // Add tracing bridge logger
-    builder = builder.add_tracing_bridge_logger(&log_config);
 
     // Build the logger
     let logger = builder.build();
@@ -684,7 +599,7 @@ mod tests {
             format: LogFormat::Text,
             min_level: None,
             max_level: None,
-            includes: Some(vec![EXECUTING.to_string()]),
+            includes: Some(vec!["fake_target".to_string()]),
             excludes: None,
         };
 
@@ -705,7 +620,7 @@ mod tests {
             format: LogFormat::Text,
             min_level: None,
             max_level: None,
-            includes: Some(vec![EXECUTING.to_string()]),
+            includes: Some(vec!["test_target".to_string()]),
             excludes: None,
         };
 
@@ -717,7 +632,7 @@ mod tests {
         );
         let metadata: Metadata<'_> = MetadataBuilder::new()
             .level(Level::Info)
-            .target(EXECUTING)
+            .target("test_target")
             .build();
         assert!(logger.enabled(&metadata));
     }
@@ -754,7 +669,7 @@ mod tests {
             min_level: None,
             max_level: None,
             includes: None,
-            excludes: Some(vec![EXECUTING.to_string()]),
+            excludes: Some(vec!["test_target".to_string()]),
         };
 
         let logger = Logger::new(
@@ -765,7 +680,7 @@ mod tests {
         );
         let metadata = MetadataBuilder::new()
             .level(Level::Info)
-            .target(EXECUTING)
+            .target("test_target")
             .build();
         assert!(!logger.enabled(&metadata));
     }

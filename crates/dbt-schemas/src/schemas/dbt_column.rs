@@ -1,23 +1,42 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use dbt_common::FsResult;
-use dbt_serde_yaml::JsonSchema;
-use serde::{Deserialize, Serialize};
+use dbt_serde_yaml::{JsonSchema, UntaggedEnumDeserialize};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_with::skip_serializing_none;
+use strum::Display;
 
 // Type aliases for clarity
 type YmlValue = dbt_serde_yaml::Value;
 
-use crate::schemas::serde::StringOrArrayOfStrings;
+use crate::schemas::{
+    common::DimensionValidityParams, semantic_layer::semantic_manifest::SemanticLayerElementConfig,
+    serde::StringOrArrayOfStrings,
+};
 
 use super::{common::Constraint, data_tests::DataTests};
 
+/// The BaseColumn as implemented by dbt Core.
+///
+/// This is used to deserialize columns from Jinja that produces them, for example
+/// the public API macros for `get_columns_in_relation()`
+#[derive(Deserialize, Debug)]
+pub struct DbtCoreBaseColumn {
+    pub name: String,
+    pub dtype: String,
+    pub char_size: Option<u32>,
+    pub numeric_precision: Option<u64>,
+    pub numeric_scale: Option<u64>,
+}
+
 #[skip_serializing_none]
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Default, Clone)]
 #[serde(rename_all = "snake_case")]
 pub struct DbtColumn {
     pub name: String,
     pub data_type: Option<String>,
+    #[serialize_always]
+    #[serde(serialize_with = "serialize_dbt_column_desc")]
     pub description: Option<String>,
     pub constraints: Vec<Constraint>,
     pub meta: BTreeMap<String, YmlValue>,
@@ -28,10 +47,17 @@ pub struct DbtColumn {
     pub deprecated_config: ColumnConfig,
 }
 
+fn serialize_dbt_column_desc<S>(description: &Option<String>, s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    s.serialize_str(description.as_deref().unwrap_or(""))
+}
+
 pub type DbtColumnRef = Arc<DbtColumn>;
 
 #[skip_serializing_none]
-#[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
+#[derive(Default, Deserialize, Serialize, Debug, Clone, JsonSchema)]
 pub struct ColumnProperties {
     pub name: String,
     pub data_type: Option<String>,
@@ -39,18 +65,18 @@ pub struct ColumnProperties {
     pub constraints: Option<Vec<Constraint>>,
     pub tests: Option<Vec<DataTests>>,
     pub data_tests: Option<Vec<DataTests>>,
-    pub granularity: Option<ColumnPropertiesGranularity>,
+    pub granularity: Option<Granularity>,
     pub policy_tags: Option<Vec<String>>,
     pub quote: Option<bool>,
     pub config: Option<ColumnConfig>,
 
     pub entity: Option<Entity>,
-    pub dimension: Option<Dimension>,
+    pub dimension: Option<ColumnPropertiesDimension>,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone, Default, JsonSchema, Eq, PartialEq)]
+#[derive(Deserialize, Serialize, Debug, Clone, Default, JsonSchema, Eq, PartialEq, Display)]
 #[allow(non_camel_case_types)]
-pub enum ColumnPropertiesGranularity {
+pub enum Granularity {
     #[default]
     nanosecond,
     microsecond,
@@ -167,10 +193,11 @@ pub fn process_columns(
                         data_type: cp.data_type.clone(),
                         description: cp.description.clone(),
                         constraints: cp.constraints.clone().unwrap_or_default(),
-                        meta: cp_meta.unwrap_or(meta.clone().unwrap_or_default()),
+                        meta: cp_meta.or_else(|| meta.clone()).unwrap_or_default(),
                         tags: cp_tags
                             .map(|t| t.into())
-                            .unwrap_or(tags.clone().unwrap_or_default()),
+                            .or_else(|| tags.clone())
+                            .unwrap_or_default(),
                         policy_tags: cp.policy_tags.clone(),
                         quote: cp.quote,
                         deprecated_config: cp.config.clone().unwrap_or_default(),
@@ -187,10 +214,10 @@ pub fn process_columns(
         .unwrap_or_default())
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone, JsonSchema, Eq, PartialEq)]
+#[derive(UntaggedEnumDeserialize, Serialize, Debug, Clone, JsonSchema, Eq, PartialEq)]
 #[serde(untagged)]
-pub enum Dimension {
-    DimensionConfig(DimensionConfig),
+pub enum ColumnPropertiesDimension {
+    DimensionConfig(ColumnPropertiesDimensionConfig),
     DimensionType(ColumnPropertiesDimensionType),
 }
 
@@ -202,15 +229,18 @@ pub enum ColumnPropertiesDimensionType {
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, JsonSchema, Eq, PartialEq)]
-pub struct DimensionConfig {
+pub struct ColumnPropertiesDimensionConfig {
     #[serde(rename = "type")]
     pub type_: ColumnPropertiesDimensionType,
-    pub granularity: Option<ColumnPropertiesGranularity>,
     pub is_partition: Option<bool>,
     pub label: Option<String>,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub config: Option<SemanticLayerElementConfig>,
+    pub validity_params: Option<DimensionValidityParams>,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
+#[derive(UntaggedEnumDeserialize, Serialize, Debug, Clone, JsonSchema)]
 #[serde(untagged)]
 pub enum Entity {
     EntityConfig(EntityConfig),
@@ -231,4 +261,7 @@ pub struct EntityConfig {
     #[serde(rename = "type")]
     pub type_: ColumnPropertiesEntityType,
     pub name: Option<String>,
+    pub description: Option<String>,
+    pub label: Option<String>,
+    pub config: Option<SemanticLayerElementConfig>,
 }

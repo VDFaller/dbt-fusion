@@ -1,4 +1,4 @@
-use crate::schemas::common::TimeGranularity;
+use crate::schemas::dbt_column::Granularity;
 use crate::schemas::project::MetricConfig;
 use dbt_serde_yaml::JsonSchema;
 use dbt_serde_yaml::UntaggedEnumDeserialize;
@@ -8,7 +8,7 @@ use serde_with::skip_serializing_none;
 use std::collections::BTreeMap;
 
 #[skip_serializing_none]
-#[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
+#[derive(Deserialize, Serialize, Debug, Clone, JsonSchema, Default)]
 pub struct MetricsProperties {
     pub name: String,
     pub description: Option<String>,
@@ -19,28 +19,31 @@ pub struct MetricsProperties {
     pub percentile: Option<f32>,
     pub percentile_type: Option<PercentileType>,
     pub join_to_timespine: Option<bool>,
-    pub fill_nulls_with: Option<f32>,
+    pub fill_nulls_with: Option<i32>,
     pub expr: Option<MetricExpr>,
     // TODO: can we add a macro to this field for it to be ignored during jinja transformation?
     pub filter: Option<String>,
-    pub config: Option<MetricConfig>, // TODO -- does MetricConfig only allow meta? What about group, tags, etc.?
-    pub non_additive_dimension: Option<NonAdditiveDimension>,
+    pub config: Option<MetricConfig>,
+    pub non_additive_dimension: Option<MetricPropertiesNonAdditiveDimension>,
     pub agg_time_dimension: Option<String>,
     pub window: Option<String>,
-    pub grain_to_date: Option<TimeGranularity>,
+    pub grain_to_date: Option<Granularity>,
     pub period_agg: Option<PeriodAggregationType>,
-    pub input_metric: Option<StringOrMetricReference>,
-    pub numerator: Option<StringOrMetricReference>,
-    pub denominator: Option<StringOrMetricReference>,
-    pub metrics: Option<Vec<StringOrMetricReference>>,
-    pub metric_aliases: Option<Vec<MetricReference>>,
+    pub input_metric: Option<StringOrMetricPropertiesMetricInput>,
+    pub numerator: Option<StringOrMetricPropertiesMetricInput>,
+    pub denominator: Option<StringOrMetricPropertiesMetricInput>,
+    pub metrics: Option<Vec<StringOrMetricPropertiesMetricInput>>,
+    pub metric_aliases: Option<Vec<MetricPropertiesMetricInput>>,
     pub entity: Option<String>,
     pub calculation: Option<ConversionCalculationType>,
-    pub base_metric: Option<StringOrMetricReference>,
-    pub conversion_metric: Option<StringOrMetricReference>,
+    pub base_metric: Option<StringOrMetricPropertiesMetricInput>,
+    pub conversion_metric: Option<StringOrMetricPropertiesMetricInput>,
     pub constant_properties: Option<Vec<ConstantProperty>>,
 
     // Flattened field:
+    // TODO: remove this if you want to show yaml errors such as unexpected keys
+    // or you can keep this __unused__ and choose not to report yaml errors when
+    // parsing metrics yaml
     pub __unused__: Verbatim<BTreeMap<String, dbt_serde_yaml::Value>>,
 }
 
@@ -83,8 +86,17 @@ pub enum MetricExpr {
     Integer(i32),
 }
 
+impl From<MetricExpr> for String {
+    fn from(val: MetricExpr) -> Self {
+        match val {
+            MetricExpr::String(s) => s,
+            MetricExpr::Integer(i) => i.to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-pub struct NonAdditiveDimension {
+pub struct MetricPropertiesNonAdditiveDimension {
     pub name: String,
     pub window_agg: WindowChoice,
     pub group_by: Option<Vec<String>>,
@@ -97,9 +109,9 @@ pub enum WindowChoice {
     Max,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-pub struct MetricReference {
-    pub metric: Option<String>,
+#[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct MetricPropertiesMetricInput {
+    pub name: String,
     pub filter: Option<String>,
     pub alias: Option<String>,
     pub offset_window: Option<String>,
@@ -107,25 +119,26 @@ pub struct MetricReference {
 
 #[derive(UntaggedEnumDeserialize, Serialize, Debug, Clone, JsonSchema)]
 #[serde(untagged)]
-pub enum StringOrMetricReference {
+pub enum StringOrMetricPropertiesMetricInput {
     String(String),
-    MetricReference(MetricReference),
+    MetricPropertiesMetricInput(MetricPropertiesMetricInput),
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, JsonSchema)]
+#[derive(Serialize, Deserialize, Default, Debug, Clone, JsonSchema, PartialEq, Eq)]
 #[allow(non_camel_case_types)]
 pub enum ConversionCalculationType {
     conversions,
+    #[default]
     conversion_rate,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct ConstantProperty {
     pub base_property: String,
     pub conversion_property: String,
 }
 
-#[derive(Default, Deserialize, Serialize, Debug, Clone, JsonSchema)]
+#[derive(Default, Deserialize, Serialize, Debug, Clone, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum PeriodAggregationType {
     #[default]

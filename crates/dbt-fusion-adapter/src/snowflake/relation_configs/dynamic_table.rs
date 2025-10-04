@@ -28,7 +28,7 @@ impl TryFrom<&Value> for DescribeDynamicTableResults {
             .get_item(&Value::from_safe_string("dynamic_table".into()))
             .map_err(|e| format!("Expected key `dynamic_table`: {e}"))?
             .downcast_object::<AgateTable>()
-            .ok_or("Failed to convert dynamic_table to AgateTable".to_string())?
+            .ok_or("Failed to convert dynamic_table to AgateTable")?
             .original_record_batch();
 
         let catalog_value = value
@@ -40,7 +40,7 @@ impl TryFrom<&Value> for DescribeDynamicTableResults {
             Some(
                 catalog_value
                     .downcast_object::<AgateTable>()
-                    .ok_or("Failed to convert catalog to AgateTable".to_string())?
+                    .ok_or("Failed to convert catalog to AgateTable")?
                     .original_record_batch(),
             )
         };
@@ -125,10 +125,10 @@ impl TryFrom<&str> for TargetLag {
                     .and_then(|interval_str| TargetLagInterval::try_from(interval_str).ok())
                     .map(|interval| Self::TimeBased(num, interval))
             });
-        if let Some(target_lag) = opt {
-            if parts.next().is_none() {
-                return Ok(target_lag);
-            }
+        if let Some(target_lag) = opt
+            && parts.next().is_none()
+        {
+            return Ok(target_lag);
         }
         Err(format!("Unsupported target lag: {value}"))
     }
@@ -364,7 +364,7 @@ impl TryFrom<&DbtModel> for SnowflakeDynamicTableConfig {
             .__adapter_attr__
             .snowflake_attr
             .as_ref()
-            .ok_or("Snowflake attributes not found.".to_string())?;
+            .ok_or("Snowflake attributes not found.")?;
 
         // The following two fields are required.
         let target_lag = TargetLagConfig::try_from(
@@ -383,13 +383,13 @@ impl TryFrom<&DbtModel> for SnowflakeDynamicTableConfig {
         let refresh_mode = snowflake_config
             .refresh_mode
             .clone()
-            .map_or(RefreshModeConfig::default(), |value: String| {
+            .map_or_else(RefreshModeConfig::default, |value: String| {
                 RefreshModeConfig::try_from(value.as_str()).unwrap_or_default()
             });
         let initialize = snowflake_config
             .initialize
             .clone()
-            .map_or(InitializeConfig::default(), |value: String| {
+            .map_or_else(InitializeConfig::default, |value: String| {
                 InitializeConfig::try_from(value.as_str()).unwrap_or_default()
             });
         let row_access_policy = snowflake_config.row_access_policy.clone();

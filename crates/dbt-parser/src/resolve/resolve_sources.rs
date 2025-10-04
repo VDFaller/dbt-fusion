@@ -4,7 +4,7 @@ use crate::dbt_project_config::{RootProjectConfigs, init_project_config};
 use crate::utils::get_node_fqn;
 
 use dbt_common::adapter::AdapterType;
-use dbt_common::io_args::StaticAnalysisKind;
+use dbt_common::io_args::{StaticAnalysisKind, StaticAnalysisOffReason};
 use dbt_common::{ErrorCode, FsResult, err, show_error};
 use dbt_jinja_utils::jinja_environment::JinjaEnv;
 use dbt_jinja_utils::refs_and_sources::RefsAndSources;
@@ -78,6 +78,7 @@ pub fn resolve_sources(
             base_ctx,
             &[],
             dependency_package_name,
+            true,
         )?;
 
         let table: Tables = into_typed_with_jinja(
@@ -88,13 +89,14 @@ pub fn resolve_sources(
             base_ctx,
             &[],
             dependency_package_name,
+            true,
         )?;
         let database: String = source
             .database
             .clone()
             .or_else(|| source.catalog.clone())
-            .unwrap_or(database.to_owned());
-        let schema = source.schema.clone().unwrap_or(source.name.clone());
+            .unwrap_or_else(|| database.to_owned());
+        let schema = source.schema.clone().unwrap_or_else(|| source.name.clone());
 
         let fqn = get_node_fqn(
             package_name,
@@ -111,7 +113,7 @@ pub fn resolve_sources(
             .clone();
         project_config.default_to(global_config);
 
-        let source_properties_config = if let Some(properties) = &source.config {
+        let mut source_properties_config = if let Some(properties) = &source.config {
             let mut properties_config: SourceConfig = properties.clone();
             properties_config.default_to(&project_config);
             properties_config
@@ -123,7 +125,8 @@ pub fn resolve_sources(
 
         let is_enabled = table_config
             .enabled
-            .unwrap_or(source_properties_config.get_enabled().unwrap_or(true));
+            .or_else(|| source_properties_config.get_enabled())
+            .unwrap_or(true);
 
         let normalized_table_name = special_chars.replace_all(&table_name, "__");
         let unique_id = format!(
@@ -132,20 +135,18 @@ pub fn resolve_sources(
         );
 
         let merged_loaded_at_field = Some(
-            table_config.loaded_at_field.clone().unwrap_or(
-                source_properties_config
-                    .loaded_at_field
-                    .clone()
-                    .unwrap_or("".to_string()),
-            ),
+            table_config
+                .loaded_at_field
+                .clone()
+                .or_else(|| source_properties_config.loaded_at_field.clone())
+                .unwrap_or_default(),
         );
         let merged_loaded_at_query = Some(
-            table_config.loaded_at_query.clone().unwrap_or(
-                source_properties_config
-                    .loaded_at_query
-                    .clone()
-                    .unwrap_or("".to_string()),
-            ),
+            table_config
+                .loaded_at_query
+                .clone()
+                .or_else(|| source_properties_config.loaded_at_query.clone())
+                .unwrap_or_default(),
         );
         if !merged_loaded_at_field.as_ref().unwrap().is_empty()
             && !merged_loaded_at_query.as_ref().unwrap().is_empty()
@@ -159,6 +160,7 @@ pub fn resolve_sources(
             source_properties_config.freshness.as_ref(),
             &table_config.freshness,
         );
+        source_properties_config.freshness = merged_freshness.clone();
 
         // This should be set due to propagation from the resolved root project
         let properties_quoting = source_properties_config
@@ -177,7 +179,10 @@ pub fn resolve_sources(
             adapter_type,
             &database,
             &schema,
-            &table.identifier.clone().unwrap_or(table_name.to_owned()),
+            &table
+                .identifier
+                .clone()
+                .unwrap_or_else(|| table_name.to_owned()),
         );
 
         let parse_adapter = jinja_env
@@ -228,6 +233,10 @@ pub fn resolve_sources(
             Some(external) => BTreeMap::from([("external".to_owned(), external.clone())]),
         };
 
+        let static_analysis = source_properties_config
+            .static_analysis
+            .unwrap_or(StaticAnalysisKind::On);
+
         let dbt_source = DbtSource {
             __common_attr__: CommonAttributes {
                 name: table_name.to_owned(),
@@ -262,9 +271,9 @@ pub fn resolve_sources(
                 extended_model: false,
                 persist_docs: None,
                 materialized: DbtMaterialization::External,
-                static_analysis: source_properties_config
-                    .static_analysis
-                    .unwrap_or(StaticAnalysisKind::On),
+                static_analysis_off_reason: matches!(static_analysis, StaticAnalysisKind::Off)
+                    .then(|| StaticAnalysisOffReason::ConfiguredOff),
+                static_analysis,
                 columns,
                 refs: vec![],
                 sources: vec![],
@@ -275,8 +284,8 @@ pub fn resolve_sources(
                 freshness: merged_freshness.clone(),
                 identifier,
                 source_name: source_name.to_owned(),
-                source_description: source.description.clone().unwrap_or("".to_string()), // needs to be some or empty string per dbt spec
-                loader: source.loader.clone().unwrap_or("".to_string()),
+                source_description: source.description.clone().unwrap_or_default(), // needs to be some or empty string per dbt spec
+                loader: source.loader.clone().unwrap_or_default(),
                 loaded_at_field: merged_loaded_at_field.clone(),
                 loaded_at_query: merged_loaded_at_query.clone(),
             },
@@ -333,7 +342,9 @@ fn merge_freshness(
             .as_ref()
             .and_then(|update| merge_freshness_unwrapped(base, Some(update))),
         // If there is no freshness present in the update then it is inherited (merged) from the base.
-        Omissible::Omitted => merge_freshness_unwrapped(base, None),
+        Omissible::Omitted => {
+            merge_freshness_unwrapped(base, Some(&FreshnessDefinition::default()))
+        }
     }
 }
 

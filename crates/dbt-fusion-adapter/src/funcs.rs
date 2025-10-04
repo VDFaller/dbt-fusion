@@ -3,7 +3,9 @@ use crate::base_adapter::BaseAdapter;
 use crate::databricks::relation::DEFAULT_DATABRICKS_DATABASE;
 use crate::errors::AdapterResult;
 use crate::errors::{AdapterError, AdapterErrorKind};
+use crate::factory::create_static_relation;
 use crate::formatter::SqlLiteralFormatter;
+use crate::relation_object::RelationObject;
 use crate::response::ResultObject;
 
 use arrow::array::RecordBatch;
@@ -105,19 +107,91 @@ pub fn dispatch_adapter_calls(
 
             adapter.get_relation(state, database, schema, identifier)
         }
-        "get_columns_in_relation" => adapter.get_columns_in_relation(state, args),
+        "get_columns_in_relation" => {
+            // relation: BaseRelation
+            let iter = ArgsIter::new(name, &["relation"], args);
+            let relation = iter.next_arg::<&Value>()?;
+            let relation = relation
+                .downcast_object::<RelationObject>()
+                .ok_or_else(|| {
+                    MinijinjaError::new(
+                        MinijinjaErrorKind::InvalidOperation,
+                        "relation must be a BaseRelation object",
+                    )
+                })?
+                .inner();
+            iter.finish()?;
+
+            adapter.get_columns_in_relation(state, relation)
+        }
         "type" => Ok(Value::from(adapter.adapter_type().to_string())),
         "get_hard_deletes_behavior" => adapter.get_hard_deletes_behavior(state, args),
         "cache_added" => adapter.cache_added(state, args),
         "cache_dropped" => adapter.cache_dropped(state, args),
         "cache_renamed" => adapter.cache_renamed(state, args),
-        "quote" => adapter.quote(state, args),
-        "quote_as_configured" => adapter.quote_as_configured(state, args),
-        "quote_seed_column" => adapter.quote_seed_column(state, args),
+        "quote" => {
+            // identifier: str
+            let iter = ArgsIter::new(name, &["identifier"], args);
+
+            let identifier = iter.next_arg::<&str>()?;
+            iter.finish()?;
+
+            adapter.quote(state, identifier)
+        }
+        "quote_as_configured" => {
+            // identifier: str
+            // quote_key: str
+            let iter = ArgsIter::new(name, &["identifier", "quote_key"], args);
+
+            let identifier = iter.next_arg::<&str>()?;
+            let quote_key = iter.next_arg::<&str>()?;
+
+            iter.finish()?;
+
+            adapter.quote_as_configured(state, identifier, quote_key)
+        }
+        "quote_seed_column" => {
+            // column: str
+            // quote_config: Optional[bool]
+            let iter = ArgsIter::new(name, &["column", "quote_config"], args);
+
+            let column = iter.next_arg::<&str>()?;
+            let quote_config = iter.next_kwarg::<Option<bool>>("quote_config")?;
+
+            iter.finish()?;
+
+            adapter.quote_seed_column(state, column, quote_config)
+        }
         "drop_relation" => adapter.drop_relation(state, args),
         "truncate_relation" => adapter.truncate_relation(state, args),
         "rename_relation" => adapter.rename_relation(state, args),
-        "expand_target_column_types" => adapter.expand_target_column_types(state, args),
+        "expand_target_column_types" => {
+            // from_relation: BaseRelation, to_relation: BaseRelation
+            let iter = ArgsIter::new(name, &["from_relation", "to_relation"], args);
+            let from_relation = iter.next_arg::<&Value>()?;
+            let from_relation = from_relation
+                .downcast_object::<RelationObject>()
+                .ok_or_else(|| {
+                    MinijinjaError::new(
+                        MinijinjaErrorKind::InvalidOperation,
+                        "from_relation must be a BaseRelation object",
+                    )
+                })?
+                .inner();
+            let to_relation = iter.next_arg::<&Value>()?;
+            let to_relation = to_relation
+                .downcast_object::<RelationObject>()
+                .ok_or_else(|| {
+                    MinijinjaError::new(
+                        MinijinjaErrorKind::InvalidOperation,
+                        "to_relation must be a BaseRelation object",
+                    )
+                })?
+                .inner();
+            iter.finish()?;
+
+            adapter.expand_target_column_types(state, from_relation, to_relation)
+        }
         "list_schemas" => adapter.list_schemas(state, args),
         "create_schema" => adapter.create_schema(state, args),
         "drop_schema" => adapter.drop_schema(state, args),
@@ -147,10 +221,64 @@ pub fn dispatch_adapter_calls(
         "update_columns" => adapter.update_columns(state, args),
         "update_table_description" => adapter.update_table_description(state, args),
         "alter_table_add_columns" => adapter.alter_table_add_columns(state, args),
-        "load_dataframe" => adapter.load_dataframe(state, args),
+        "load_dataframe" => {
+            let iter = ArgsIter::new(
+                name,
+                &[
+                    "database",
+                    "schema",
+                    "table_name",
+                    "field_path",
+                    "agate_table",
+                    "field_delimiter",
+                ],
+                args,
+            );
+            let database = iter.next_arg::<&str>()?;
+            let schema = iter.next_arg::<&str>()?;
+            let table_name = iter.next_arg::<&str>()?;
+            let file_path = iter.next_arg::<&str>()?;
+            let agate_table = iter
+                .next_arg::<&Value>()?
+                .downcast_object::<AgateTable>()
+                .ok_or_else(|| {
+                    MinijinjaError::new(
+                        MinijinjaErrorKind::InvalidOperation,
+                        "agate_table must be an agate.Table",
+                    )
+                })?;
+            let field_delimiter = iter.next_arg::<&str>()?;
+            iter.finish()?;
+
+            adapter.load_dataframe(
+                state,
+                database,
+                schema,
+                table_name,
+                agate_table,
+                file_path,
+                field_delimiter,
+            )
+        }
         "upload_file" => adapter.upload_file(state, args),
         "get_bq_table" => adapter.get_bq_table(state, args),
-        "describe_relation" => adapter.describe_relation(state, args),
+        "describe_relation" => {
+            // relation: BaseRelation
+            let iter = ArgsIter::new(name, &["relation"], args);
+            let relation = iter.next_arg::<&Value>()?;
+            let relation = relation
+                .downcast_object::<RelationObject>()
+                .ok_or_else(|| {
+                    MinijinjaError::new(
+                        MinijinjaErrorKind::InvalidOperation,
+                        "relation must be a BaseRelation object",
+                    )
+                })?
+                .inner();
+            iter.finish()?;
+
+            adapter.describe_relation(state, relation)
+        }
         "grant_access_to" => adapter.grant_access_to(state, args),
         "get_dataset_location" => adapter.get_dataset_location(state, args),
         "get_column_schema_from_query" => adapter.get_column_schema_from_query(state, args),
@@ -185,6 +313,9 @@ pub fn dispatch_adapter_calls(
 pub fn dispatch_adapter_get_value(adapter: &dyn BaseAdapter, key: &Value) -> Option<Value> {
     match key.as_str() {
         Some("behavior") => Some(adapter.behavior()),
+        // NOTE(serramatutu): BigQuery adapter calls `Relation` from `adapter.Relation`
+        // instead of `api.Relation` when executing materialized views
+        Some("Relation") => create_static_relation(adapter.adapter_type(), adapter.quoting()),
         _ => None,
     }
 }
@@ -267,7 +398,7 @@ pub fn execute_macro_with_package(
     package: &str,
 ) -> Result<Value, AdapterError> {
     let template_name = format!("{package}.{macro_name}");
-    let template = state.env().get_template(&template_name, &[])?;
+    let template = state.env().get_template(&template_name)?;
     let base_ctx = state.get_base_context();
     let state = template.eval_to_state(base_ctx, &[])?;
     let func = state

@@ -3,7 +3,7 @@
 //! scheduler understands.
 //
 
-use std::{collections::BTreeMap, str::FromStr};
+use std::{collections::BTreeMap, slice, str::FromStr};
 
 use dbt_common::{
     ErrorCode, FsResult, err, fs_err,
@@ -40,7 +40,7 @@ impl<'a> SelectorParser<'a> {
 
     pub fn parse_definition(&self, def: &SelectorDefinitionValue) -> FsResult<SelectExpression> {
         match def {
-            SelectorDefinitionValue::String(s) => Ok(parse_model_specifiers(&[s.clone()])?),
+            SelectorDefinitionValue::String(s) => Ok(parse_model_specifiers(slice::from_ref(s))?),
             SelectorDefinitionValue::Full(expr) => self.parse_expr(expr),
         }
     }
@@ -289,9 +289,9 @@ impl<'a> SelectorParser<'a> {
 
 #[cfg(test)]
 mod tests {
-    use dbt_schemas::schemas::selectors::ExcludeAtomExpr;
-
     use super::*;
+    use dbt_schemas::schemas::selectors::ExcludeAtomExpr;
+    use dbt_test_primitives::assert_contains;
 
     #[test]
     fn test_string_selector() -> FsResult<()> {
@@ -351,9 +351,9 @@ mod tests {
         assert!(result.is_err());
         if let Err(e) = result {
             assert_eq!(e.code, ErrorCode::SelectorError);
-            assert!(
-                e.to_string()
-                    .contains("MethodKey must have exactly one key-value pair")
+            assert_contains!(
+                e.to_string(),
+                "MethodKey must have exactly one key-value pair"
             );
         }
     }
@@ -457,9 +457,9 @@ mod tests {
         assert!(result.is_err());
         if let Err(e) = result {
             assert_eq!(e.code, ErrorCode::SelectorError);
-            assert!(
-                e.to_string()
-                    .contains("Top level exclude not allowed in YAML selectors")
+            assert_contains!(
+                e.to_string(),
+                "Top level exclude not allowed in YAML selectors"
             );
         }
     }
@@ -742,7 +742,7 @@ mod tests {
         assert!(result.is_err());
         if let Err(e) = result {
             assert_eq!(e.code, ErrorCode::SelectorError);
-            assert!(e.to_string().contains("Unknown selector"));
+            assert_contains!(e.to_string(), "Unknown selector");
         }
 
         // Test unknown selector in inheritance

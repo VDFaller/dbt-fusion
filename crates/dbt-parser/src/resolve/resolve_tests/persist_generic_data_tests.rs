@@ -408,7 +408,7 @@ fn extract_kwargs_and_jinja_vars_and_dep_kwarg_and_configs(
     if !config_from_deprecated.is_empty() {
         // Convert existing config to JSON if it exists
         let existing_config_json = if let Some(ref existing) = final_config {
-            serde_json::to_value(existing).unwrap_or(Value::Object(serde_json::Map::new()))
+            serde_json::to_value(existing).unwrap_or_else(|_| Value::Object(serde_json::Map::new()))
         } else {
             Value::Object(serde_json::Map::new())
         };
@@ -561,6 +561,11 @@ fn generate_test_name(
     package_name: Option<&String>,
     jinja_set_vars: &BTreeMap<String, String>,
 ) -> String {
+    // If a custom test name is provided, use it directly for the display name
+    if let Some(custom_test_name) = custom_test_name {
+        return custom_test_name;
+    }
+
     // Flatten args (excluding 'model' and config args)
     let mut flat_args = Vec::new();
     for (arg_name, arg_val) in kwargs.iter().sorted_by(|a, b| a.0.cmp(b.0)) {
@@ -588,11 +593,6 @@ fn generate_test_name(
         };
 
         flat_args.extend(parts);
-    }
-
-    // Include custom_test_name as suffix if provided
-    if let Some(custom_test_name) = custom_test_name {
-        flat_args.push(custom_test_name);
     }
 
     // Clean args to only allow alphanumeric and underscore
@@ -787,10 +787,9 @@ fn collect_versioned_model_tests(
             .__additional_properties__
             .get("tests")
             .or_else(|| version.__additional_properties__.get("data_tests"))
+            && let Ok(version_tests) = dbt_serde_yaml::from_value::<Vec<DataTests>>(tests.clone())
         {
-            if let Ok(version_tests) = dbt_serde_yaml::from_value::<Vec<DataTests>>(tests.clone()) {
-                version_config.model_tests = Some(version_tests);
-            }
+            version_config.model_tests = Some(version_tests);
         }
 
         // Handle version-specific column tests and inheritance
@@ -900,7 +899,7 @@ pub trait TestableNodeTrait {
         None
     }
 
-    fn as_testable(&self) -> TestableNode<Self>
+    fn as_testable(&self) -> TestableNode<'_, Self>
     where
         Self: Sized,
     {
@@ -1312,9 +1311,9 @@ mod tests {
             &BTreeMap::new(),
         );
 
-        assert!(
-            test_name_no_vars.contains(custom_test_name),
-            "Test name should contain the custom test name when provided"
+        assert_eq!(
+            test_name_no_vars, custom_test_name,
+            "Test name should exactly match the custom test name when provided"
         );
     }
 

@@ -34,7 +34,9 @@ use crate::schemas::project::dbt_project::DefaultTo;
 use crate::schemas::project::dbt_project::IterChildren;
 use crate::schemas::properties::ModelFreshness;
 use crate::schemas::serde::StringOrArrayOfStrings;
-use crate::schemas::serde::{bool_or_string_bool, default_type, u64_or_string_u64};
+use crate::schemas::serde::{
+    bool_or_string_bool, default_type, f64_or_string_f64, u64_or_string_u64,
+};
 use dbt_serde_yaml::ShouldBe;
 
 #[skip_serializing_none]
@@ -102,7 +104,7 @@ pub struct ProjectModelConfig {
         deserialize_with = "bool_or_string_bool"
     )]
     pub copy_grants: Option<bool>,
-    #[serde(rename = "+database", alias = "+project")]
+    #[serde(rename = "+database", alias = "+project", alias = "+data_space")]
     pub database: Omissible<Option<String>>,
     #[serde(rename = "+databricks_compute")]
     pub databricks_compute: Option<String>,
@@ -243,9 +245,9 @@ pub struct ProjectModelConfig {
     #[serde(
         default,
         rename = "+refresh_interval_minutes",
-        deserialize_with = "u64_or_string_u64"
+        deserialize_with = "f64_or_string_f64"
     )]
-    pub refresh_interval_minutes: Option<u64>,
+    pub refresh_interval_minutes: Option<f64>,
     #[serde(
         default,
         rename = "+require_partition_filter",
@@ -322,7 +324,7 @@ pub struct ProjectModelConfig {
     pub __additional_properties__: BTreeMap<String, ShouldBe<ProjectModelConfig>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 #[serde(rename_all = "PascalCase")]
 /// See `category` from https://developer.salesforce.com/docs/data/connectapi/references/spec?meta=postDataLakeObject
 pub enum DataLakeObjectCategory {
@@ -335,18 +337,20 @@ pub enum DataLakeObjectCategory {
 }
 
 impl IterChildren<ProjectModelConfig> for ProjectModelConfig {
-    fn iter_children(&self) -> Iter<String, ShouldBe<Self>> {
+    fn iter_children(&self) -> Iter<'_, String, ShouldBe<Self>> {
         self.__additional_properties__.iter()
     }
 }
 
-#[derive(Deserialize, Serialize, Debug, Default, Clone, PartialEq, Eq, JsonSchema)]
+#[derive(Deserialize, Serialize, Debug, Default, Clone, PartialEq, JsonSchema)]
 pub struct ModelConfig {
     #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub enabled: Option<bool>,
     pub alias: Option<String>,
-    pub schema: Omissible<Option<String>>,
+    #[serde(alias = "project", alias = "data_space")]
     pub database: Omissible<Option<String>>,
+    #[serde(alias = "dataset")]
+    pub schema: Omissible<Option<String>>,
     pub tags: Option<StringOrArrayOfStrings>,
     pub catalog_name: Option<String>,
     // need default to ensure None if field is not set
@@ -773,5 +777,240 @@ impl DefaultTo<ModelConfig> for ModelConfig {
 
     fn get_post_hook(&self) -> Option<&Hooks> {
         (*self.post_hook).as_ref()
+    }
+}
+
+impl ModelConfig {
+    /// Custom comparison that treats Omitted and Present(None) as equivalent for schema/database fields
+    pub fn same_config(&self, other: &ModelConfig) -> bool {
+        // Compare all fields,
+        self.enabled == other.enabled
+            && omissible_option_eq(&self.schema, &other.schema)
+            && omissible_option_eq(&self.database, &other.database)
+            && self.catalog_name == other.catalog_name
+            && meta_eq(&self.meta, &other.meta)  // Custom comparison for meta
+            && self.materialized == other.materialized
+            && self.incremental_strategy == other.incremental_strategy
+            && self.incremental_predicates == other.incremental_predicates
+            && self.batch_size == other.batch_size
+            && lookback_eq(&self.lookback, &other.lookback)  // Custom comparison for lookback
+            && self.begin == other.begin
+            && persist_docs_eq(&self.persist_docs, &other.persist_docs)  // Custom comparison for persist_docs
+            && self.post_hook == other.post_hook
+            && self.pre_hook == other.pre_hook
+            // && self.quoting == other.quoting // TODO: re-enable when no longer using mantle/core manifests in IA
+            && column_types_eq(&self.column_types, &other.column_types)  // Custom comparison for column_types
+            && self.full_refresh == other.full_refresh
+            && self.unique_key == other.unique_key
+            && on_schema_change_eq(&self.on_schema_change, &other.on_schema_change)  // Custom comparison for on_schema_change
+            && on_configuration_change_eq(&self.on_configuration_change, &other.on_configuration_change)  // Custom comparison for on_configuration_change
+            && grants_eq(&self.grants, &other.grants)  // Custom comparison for grants
+            && packages_eq(&self.packages, &other.packages)  // Custom comparison for packages
+            && docs_eq(&self.docs, &other.docs)  // Custom comparison for docs
+            && self.event_time == other.event_time
+            && self.concurrent_batches == other.concurrent_batches
+            && self.merge_update_columns == other.merge_update_columns
+            && self.merge_exclude_columns == other.merge_exclude_columns
+            && access_eq(&self.access, &other.access)  // Custom comparison for access
+            && self.table_format == other.table_format
+            && self.static_analysis == other.static_analysis
+            && self.freshness == other.freshness
+            && self.sql_header == other.sql_header
+            && self.location == other.location
+            && self.predicates == other.predicates
+            && self.description == other.description
+            && self.__warehouse_specific_config__ == other.__warehouse_specific_config__
+    }
+}
+// Helper function to compare Omissible<Option<T>> fields
+fn omissible_option_eq<T: PartialEq>(a: &Omissible<Option<T>>, b: &Omissible<Option<T>>) -> bool {
+    match (a, b) {
+        // Both omitted
+        (Omissible::Omitted, Omissible::Omitted) => true,
+        // Both present
+        (Omissible::Present(a_val), Omissible::Present(b_val)) => a_val == b_val,
+        // One omitted, one present with None - treat as equivalent
+        (Omissible::Omitted, Omissible::Present(None)) => true,
+        (Omissible::Present(None), Omissible::Omitted) => true,
+        // Any other combination is not equal
+        _ => false,
+    }
+}
+
+// Helper function to compare docs fields, treating None and default DocsConfig as equivalent
+fn docs_eq(a: &Option<DocsConfig>, b: &Option<DocsConfig>) -> bool {
+    use crate::schemas::common::DocsConfig;
+    // Default value in dbt-core
+    // See https://github.com/dbt-labs/dbt-core/blob/b75d5e701ef4dc2d7a98c5301ef63ecfc02eae15/core/dbt/artifacts/resources/base.py#L65
+    let default_docs = DocsConfig {
+        show: true,
+        node_color: None,
+    };
+
+    match (a, b) {
+        // Both None
+        (None, None) => true,
+        // Both Some - direct comparison
+        (Some(a_docs), Some(b_docs)) => a_docs == b_docs,
+        // One None, one Some - check if the Some value equals default
+        (None, Some(b_docs)) => b_docs == &default_docs,
+        (Some(a_docs), None) => a_docs == &default_docs,
+    }
+}
+
+// Helper function to compare on_schema_change fields, treating None and default OnSchemaChange as equivalent
+fn on_schema_change_eq(a: &Option<OnSchemaChange>, b: &Option<OnSchemaChange>) -> bool {
+    use crate::schemas::common::OnSchemaChange;
+    // Default value in dbt-core is "ignore"
+    // See https://github.com/dbt-labs/dbt-core/blob/main/core/dbt/artifacts/resources/v1/config.py#L109
+    let default_on_schema_change = OnSchemaChange::Ignore;
+
+    match (a, b) {
+        // Both None
+        (None, None) => true,
+        // Both Some - direct comparison
+        (Some(a_val), Some(b_val)) => a_val == b_val,
+        // One None, one Some - check if the Some value equals default
+        (None, Some(b_val)) => b_val == &default_on_schema_change,
+        (Some(a_val), None) => a_val == &default_on_schema_change,
+    }
+}
+
+// Helper function to compare access fields, treating None and default Access as equivalent
+fn access_eq(a: &Option<Access>, b: &Option<Access>) -> bool {
+    use crate::schemas::common::Access;
+    // Default value in dbt-core is "protected"
+    // See https://github.com/dbt-labs/dbt-core/blob/main/core/dbt/artifacts/resources/v1/model.py#L72-L75
+    let default_access = Access::Protected;
+
+    match (a, b) {
+        // Both None
+        (None, None) => true,
+        // Both Some - direct comparison
+        (Some(a_val), Some(b_val)) => a_val == b_val,
+        // One None, one Some - check if the Some value equals default
+        (None, Some(b_val)) => b_val == &default_access,
+        (Some(a_val), None) => a_val == &default_access,
+    }
+}
+// Helper function to compare persist_docs fields, treating None and default PersistDocsConfig as equivalent
+fn persist_docs_eq(a: &Option<PersistDocsConfig>, b: &Option<PersistDocsConfig>) -> bool {
+    use crate::schemas::common::PersistDocsConfig;
+    // Default value in dbt-core is empty dict {}
+    // See https://github.com/dbt-labs/dbt-core/blob/main/core/dbt/artifacts/resources/v1/config.py#L86
+    let default_persist_docs = PersistDocsConfig {
+        columns: None,
+        relation: None,
+    };
+
+    match (a, b) {
+        // Both None
+        (None, None) => true,
+        // Both Some - direct comparison
+        (Some(a_val), Some(b_val)) => a_val == b_val,
+        // One None, one Some - check if the Some value equals default
+        (None, Some(b_val)) => b_val == &default_persist_docs,
+        (Some(a_val), None) => a_val == &default_persist_docs,
+    }
+}
+
+// Helper function to compare lookback fields, treating None and default lookback as equivalent
+fn lookback_eq(a: &Option<i32>, b: &Option<i32>) -> bool {
+    // Default value in dbt-core is 1
+    // See https://github.com/dbt-labs/dbt-core/blob/main/core/dbt/artifacts/resources/v1/config.py#L84
+    let default_lookback = 1;
+
+    match (a, b) {
+        // Both None
+        (None, None) => true,
+        // Both Some - direct comparison
+        (Some(a_val), Some(b_val)) => a_val == b_val,
+        // One None, one Some - check if the Some value equals default
+        (None, Some(b_val)) => b_val == &default_lookback,
+        (Some(a_val), None) => a_val == &default_lookback,
+    }
+}
+
+// Helper function to compare meta fields, treating None and empty BTreeMap as equivalent
+fn meta_eq(a: &Option<BTreeMap<String, YmlValue>>, b: &Option<BTreeMap<String, YmlValue>>) -> bool {
+    match (a, b) {
+        // Both None
+        (None, None) => true,
+        // Both Some - direct comparison
+        (Some(a_val), Some(b_val)) => a_val == b_val,
+        // One None, one Some - check if the Some value is empty (equals default)
+        (None, Some(b_val)) => b_val.is_empty(),
+        (Some(a_val), None) => a_val.is_empty(),
+    }
+}
+
+// Helper function to compare column_types fields, treating None and empty BTreeMap as equivalent
+fn column_types_eq(
+    a: &Option<BTreeMap<String, String>>,
+    b: &Option<BTreeMap<String, String>>,
+) -> bool {
+    match (a, b) {
+        // Both None
+        (None, None) => true,
+        // Both Some - direct comparison
+        (Some(a_val), Some(b_val)) => a_val == b_val,
+        // One None, one Some - check if the Some value is empty (equals default)
+        (None, Some(b_val)) => b_val.is_empty(),
+        (Some(a_val), None) => a_val.is_empty(),
+    }
+}
+
+// Helper function to compare grants fields, treating None and empty BTreeMap as equivalent
+fn grants_eq(
+    a: &Option<BTreeMap<String, StringOrArrayOfStrings>>,
+    b: &Option<BTreeMap<String, StringOrArrayOfStrings>>,
+) -> bool {
+    match (a, b) {
+        // Both None
+        (None, None) => true,
+        // Both Some - direct comparison
+        (Some(a_val), Some(b_val)) => a_val == b_val,
+        // One None, one Some - check if the Some value is empty (equals default)
+        (None, Some(b_val)) => b_val.is_empty(),
+        (Some(a_val), None) => a_val.is_empty(),
+    }
+}
+
+// Helper function to compare packages fields, treating None and empty ArrayOfStrings as equivalent
+fn packages_eq(a: &Option<StringOrArrayOfStrings>, b: &Option<StringOrArrayOfStrings>) -> bool {
+    use crate::schemas::serde::StringOrArrayOfStrings;
+
+    match (a, b) {
+        // Both None
+        (None, None) => true,
+        // Both Some - direct comparison
+        (Some(a_val), Some(b_val)) => a_val == b_val,
+        // One None, one Some - check if the Some value is an empty ArrayOfStrings
+        (None, Some(StringOrArrayOfStrings::ArrayOfStrings(b_vec))) => b_vec.is_empty(),
+        (Some(StringOrArrayOfStrings::ArrayOfStrings(a_vec)), None) => a_vec.is_empty(),
+        // If one is None and the other is Some(String), they are not equal
+        (None, Some(StringOrArrayOfStrings::String(_))) => false,
+        (Some(StringOrArrayOfStrings::String(_)), None) => false,
+    }
+}
+// Helper function to compare on_configuration_change fields, treating None and default OnConfigurationChange as equivalent
+fn on_configuration_change_eq(
+    a: &Option<OnConfigurationChange>,
+    b: &Option<OnConfigurationChange>,
+) -> bool {
+    use crate::schemas::common::OnConfigurationChange;
+    // Default value in dbt-core is "apply"
+    // See https://github.com/dbt-labs/dbt-core/blob/main/core/dbt/artifacts/resources/v1/config.py#L110-L112
+    // and https://github.com/dbt-labs/dbt-common/blob/eb6b6f4a155f94d4863d8f503f8eb997ab6226d3/dbt_common/contracts/config/materialization.py#L4-L11
+    let default_on_configuration_change = OnConfigurationChange::Apply;
+
+    match (a, b) {
+        // Both None
+        (None, None) => true,
+        // Both Some - direct comparison
+        (Some(a_val), Some(b_val)) => a_val == b_val,
+        // One None, one Some - check if the Some value equals default
+        (None, Some(b_val)) => b_val == &default_on_configuration_change,
+        (Some(a_val), None) => a_val == &default_on_configuration_change,
     }
 }

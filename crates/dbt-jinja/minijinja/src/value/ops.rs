@@ -1,5 +1,6 @@
 use sprintf::parser::ConversionType;
 use sprintf::{vsprintf, ConversionSpecifier, Printf, PrintfError};
+use std::slice;
 
 use crate::error::{Error, ErrorKind};
 use crate::value::{DynObject, ObjectRepr, Value, ValueKind, ValueRepr};
@@ -266,11 +267,17 @@ pub fn add(lhs: &Value, rhs: &Value) -> Result<Value, Error> {
     {
         let lhs = lhs.clone();
         let rhs = rhs.clone();
+        let are_both_tuples = !lhs.is_mutable() && !rhs.is_mutable();
 
         if let Ok(lhs) = lhs.try_iter() {
             if let Ok(rhs) = rhs.try_iter() {
-                let res = mutable_vec::MutableVec::from(lhs.chain(rhs).collect::<Vec<_>>());
-                return Ok(Value::from(res));
+                if are_both_tuples {
+                    let res = lhs.chain(rhs).collect::<Vec<_>>();
+                    return Ok(Value::from(res));
+                } else {
+                    let res = mutable_vec::MutableVec::from(lhs.chain(rhs).collect::<Vec<_>>());
+                    return Ok(Value::from(res));
+                }
             }
         }
 
@@ -491,7 +498,7 @@ pub fn rem(lhs: &Value, rhs: &Value) -> Result<Value, Error> {
                     .collect::<Vec<_>>();
                 format_string(lhs.as_str().unwrap(), &seq)
             }
-            _ => format_string(lhs.as_str().unwrap(), &[rhs.clone()]),
+            _ => format_string(lhs.as_str().unwrap(), slice::from_ref(rhs)),
         }
     } else {
         math_rem(lhs, rhs)

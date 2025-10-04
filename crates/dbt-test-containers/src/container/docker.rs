@@ -261,8 +261,8 @@ pub async fn initialize_container(config: ContainerConfig) -> Result<Container, 
                 let user_string = if bind_user {
                     #[cfg(not(windows))]
                     {
-                        let uid = users::get_current_uid();
-                        let gid = users::get_current_gid();
+                        let uid = uzers::get_current_uid();
+                        let gid = uzers::get_current_gid();
                         Some(format!("{uid}:{gid}"))
                     }
                     #[cfg(windows)]
@@ -357,11 +357,11 @@ pub async fn wait_for_container_stop(container_name: &str) -> Result<(), Contain
     let docker = Docker::connect_with_local_defaults().unwrap();
     // Check if container is running first
     let container_inspect = docker.inspect_container(container_name, None).await?;
-    if let Some(state) = container_inspect.state {
-        if !state.running.unwrap_or(false) {
-            // Container is not running
-            return Ok(());
-        }
+    if let Some(state) = container_inspect.state
+        && !state.running.unwrap_or(false)
+    {
+        // Container is not running
+        return Ok(());
     }
     let options = Some(WaitContainerOptions {
         condition: "not-running",

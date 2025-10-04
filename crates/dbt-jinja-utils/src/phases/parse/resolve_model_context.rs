@@ -217,6 +217,7 @@ pub fn build_resolve_model_context<T: DefaultTo<T> + 'static>(
             relation_name: None,
             materialized: DbtMaterialization::View,
             static_analysis: StaticAnalysisKind::On,
+            static_analysis_off_reason: None,
             enabled: true,
             extended_model: false,
             persist_docs: None,
@@ -592,7 +593,7 @@ impl<T: DefaultTo<T>> Object for ParseConfig<T> {
         // Get or insert enabled
         let enabled = result
             .remove("enabled")
-            .unwrap_or(MinijinjaValue::from(self.enabled));
+            .unwrap_or_else(|| MinijinjaValue::from(self.enabled));
         result.insert("enabled".to_string(), enabled.clone());
 
         let yaml_value = dbt_serde_yaml::to_value(result).map_err(|e| {
@@ -664,9 +665,9 @@ impl<T: DefaultTo<T>> Object for ParseConfig<T> {
 
 #[cfg(test)]
 mod test {
-    use dbt_schemas::schemas::relations::DEFAULT_DBT_QUOTING;
-
     use super::*;
+    use dbt_schemas::schemas::relations::DEFAULT_DBT_QUOTING;
+    use dbt_test_primitives::assert_contains;
     #[test]
     fn test_resolve_source_function_rendering() {
         let sql_resources = Arc::new(Mutex::new(Vec::new()));
@@ -686,14 +687,14 @@ mod test {
 
         // Create a template that uses the source function
         let template = env
-            .template_from_str("{{ source('my_source', 'my_table').render() }}", &[])
+            .template_from_str("{{ source('my_source', 'my_table').render() }}")
             .unwrap();
 
         // Render the template
         let result = template.render(minijinja::context!(), &[]).unwrap();
 
-        assert!(result.contains("test_db"));
-        assert!(result.contains("test_schema"));
-        assert!(result.contains("my_table"));
+        assert_contains!(result, "test_db");
+        assert_contains!(result, "test_schema");
+        assert_contains!(result, "my_table");
     }
 }

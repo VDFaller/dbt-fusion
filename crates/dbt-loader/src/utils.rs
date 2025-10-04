@@ -5,6 +5,7 @@ use dbt_common::{
     err, fs_err, stdfs,
 };
 use dbt_jinja_utils::serde::{value_from_file, yaml_to_fs_error};
+use pathdiff::diff_paths;
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Read,
@@ -29,11 +30,12 @@ use walkdir::WalkDir;
 // ------------------------------------------------------------------------------------------------
 // path, directory, and file stuff
 
-pub fn collect_file_info<P: AsRef<Path>>(
+pub fn collect_file_info<P: AsRef<Path>, T: Fn(&Path) -> bool>(
     base_path: P,
     relative_paths: &[String],
     info_paths: &mut Vec<(PathBuf, SystemTime)>,
     dbtignore: Option<&Gitignore>,
+    filter: T,
 ) -> io::Result<()> {
     if !base_path.as_ref().exists() {
         return Ok(());
@@ -44,10 +46,15 @@ pub fn collect_file_info<P: AsRef<Path>>(
             continue;
         }
         // Configure WalkDir to respect gitignore patterns at the directory level
-        let walker = WalkDir::new(full_path);
+        let walker = WalkDir::new(full_path.clone());
 
         // Process files as normal, but use a filter function to skip directories that match gitignore
         for entry_result in walker.into_iter().filter_entry(|e| {
+            let diff_path = diff_paths(e.path(), &full_path).unwrap();
+            if !filter(diff_path.as_path()) {
+                return false;
+            }
+
             // If there's no gitignore or if this is not a directory, always process it
             if dbtignore.is_none() || !e.file_type().is_dir() {
                 return true;
@@ -57,7 +64,7 @@ pub fn collect_file_info<P: AsRef<Path>>(
             let rel_path = e
                 .path()
                 .strip_prefix(base_path.as_ref())
-                .unwrap_or(e.path());
+                .unwrap_or_else(|_| e.path());
             !dbtignore.unwrap().matched(rel_path, true).is_ignore()
         }) {
             let entry = entry_result?;
@@ -98,13 +105,15 @@ pub fn get_db_config(
     db_targets: DbTargets,
     maybe_target: Option<String>,
 ) -> FsResult<DbConfig> {
-    let target_name = maybe_target.unwrap_or(db_targets.default_target.clone());
+    let target_name = maybe_target.unwrap_or_else(|| db_targets.default_target.clone());
     // 6. Find the desired target
-    let db_config_yml = db_targets.outputs.get(&target_name).ok_or(fs_err!(
-        ErrorCode::InvalidConfig,
-        "Could not find target {} in profiles.yml",
-        target_name,
-    ))?;
+    let db_config_yml = db_targets.outputs.get(&target_name).ok_or_else(|| {
+        fs_err!(
+            ErrorCode::InvalidConfig,
+            "Could not find target {} in profiles.yml",
+            target_name,
+        )
+    })?;
     let db_config: DbConfig = dbt_serde_yaml::from_value(db_config_yml.clone()).map_err(|e| {
         fs_err!(
             ErrorCode::InvalidConfig,
@@ -152,11 +161,13 @@ pub fn read_profiles_and_extract_db_config<S: Serialize>(
 
     // get the profile value
     let profile_val: &dbt_serde_yaml::Value =
-        dbt_profiles.__profiles__.get(profile_str).ok_or(fs_err!(
-            ErrorCode::IoError,
-            "Profile '{}' not found in profiles.yml",
-            profile_str
-        ))?;
+        dbt_profiles.__profiles__.get(profile_str).ok_or_else(|| {
+            fs_err!(
+                ErrorCode::IoError,
+                "Profile '{}' not found in profiles.yml",
+                profile_str
+            )
+        })?;
 
     // if dbt_target_override is None, render the target name in case the user uses an an env_var jinja expression here
     let rendered_target = if let Some(dbt_target_override) = target_override {
@@ -167,12 +178,14 @@ pub fn read_profiles_and_extract_db_config<S: Serialize>(
             .and_then(|v| v.as_str())
             .map(|s| jinja_env.render_str(s, ctx, &[]))
             .transpose()?
-            .unwrap_or("default".to_string())
+            .unwrap_or_else(|| "default".to_string())
     };
-    let unrendered_outputs = profile_val.get("outputs").ok_or(fs_err!(
-        ErrorCode::InvalidConfig,
-        "No 'outputs' key found in dbt profiles.yml"
-    ))?;
+    let unrendered_outputs = profile_val.get("outputs").ok_or_else(|| {
+        fs_err!(
+            ErrorCode::InvalidConfig,
+            "No 'outputs' key found in dbt profiles.yml"
+        )
+    })?;
 
     // filter the db_targets to only include the target we want to use
     let unrendered_outputs_filtered: BTreeMap<String, dbt_serde_yaml::Value> = unrendered_outputs
@@ -209,6 +222,7 @@ pub fn read_profiles_and_extract_db_config<S: Serialize>(
         ctx,
         &[],
         None,
+        true,
     )?;
     let db_config = get_db_config(io_args, rendered_db_target, Some(rendered_target.clone()))?;
 

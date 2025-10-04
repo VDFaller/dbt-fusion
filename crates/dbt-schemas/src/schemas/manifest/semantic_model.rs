@@ -1,8 +1,13 @@
 use crate::schemas::{
     CommonAttributes,
     common::{Dimension, NodeDependsOn},
-    manifest::common::SourceFileMetadata,
+    dbt_column::ColumnPropertiesEntityType,
+    manifest::{
+        common::SourceFileMetadata,
+        metric::{MeasureAggregationParameters, NonAdditiveDimension},
+    },
     project::SemanticModelConfig,
+    properties::metrics_properties::AggregationType,
     ref_and_source::DbtRef,
     semantic_layer::semantic_manifest::SemanticLayerElementConfig,
 };
@@ -14,12 +19,13 @@ use std::collections::BTreeMap;
 type YmlValue = dbt_serde_yaml::Value;
 
 #[skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub struct DbtSemanticModel {
     pub __common_attr__: CommonAttributes,
     pub __semantic_model_attr__: DbtSemanticModelAttr,
 
+    // yaml path is `models.$.semantic_model`
     pub deprecated_config: SemanticModelConfig,
 
     pub __other__: BTreeMap<String, YmlValue>,
@@ -33,10 +39,16 @@ pub struct DbtSemanticModelAttr {
     pub label: Option<String>,
     pub defaults: Option<SemanticModelDefaults>,
     pub entities: Vec<SemanticEntity>,
-    pub measures: Vec<SemanticMeasure>,
     pub dimensions: Vec<Dimension>,
     pub metadata: Option<SourceFileMetadata>,
     pub primary_entity: Option<String>,
+
+    // measures is not a concept in the Fusion compatible Semantic Layer yaml spec
+    // but it is still needed for manifest.json
+    //
+    // this was hydrated by `.semantic_models.$.measures` but it will now be
+    // hydrated by `.models.$.metrics`
+    pub measures: Vec<SemanticMeasure>,
 
     // Node dependencies and references
     pub depends_on: NodeDependsOn,
@@ -46,7 +58,7 @@ pub struct DbtSemanticModelAttr {
     pub group: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NodeRelation {
     pub alias: String,
     pub schema_name: String,
@@ -59,28 +71,20 @@ pub struct SemanticModelDefaults {
     pub agg_time_dimension: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SemanticEntity {
     pub name: String,
     #[serde(rename = "type")]
-    pub entity_type: EntityType,
+    pub entity_type: ColumnPropertiesEntityType,
     pub description: Option<String>,
     pub label: Option<String>,
     pub role: Option<String>,
     pub expr: Option<String>,
     pub config: Option<SemanticLayerElementConfig>,
+    pub metadata: Option<SourceFileMetadata>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum EntityType {
-    Foreign,
-    Natural,
-    Primary,
-    Unique,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SemanticMeasure {
     pub name: String,
     pub agg: AggregationType,
@@ -92,32 +96,4 @@ pub struct SemanticMeasure {
     pub non_additive_dimension: Option<NonAdditiveDimension>,
     pub agg_time_dimension: Option<String>,
     pub config: Option<SemanticLayerElementConfig>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum AggregationType {
-    Sum,
-    Min,
-    Max,
-    CountDistinct,
-    SumBoolean,
-    Average,
-    Percentile,
-    Median,
-    Count,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MeasureAggregationParameters {
-    pub percentile: Option<f64>,
-    pub use_discrete_percentile: Option<bool>,
-    pub use_approximate_percentile: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NonAdditiveDimension {
-    pub name: String,
-    pub window_choice: AggregationType,
-    pub window_groupings: Vec<String>,
 }

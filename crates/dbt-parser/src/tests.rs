@@ -13,7 +13,8 @@ mod tests {
     use dbt_common::cancellation::never_cancels;
     use dbt_common::{FsResult, io_args::IoArgs};
     use dbt_frontend_common::error::CodeLocation;
-    use dbt_fusion_adapter::parse::adapter::create_parse_adapter;
+    use dbt_fusion_adapter::sql_types::NaiveTypeFormatterImpl;
+    use dbt_fusion_adapter::{BaseAdapter, ParseAdapter};
     use dbt_jinja_utils::invocation_args::InvocationArgs;
     use dbt_jinja_utils::jinja_environment::JinjaEnv;
     use dbt_jinja_utils::listener::DefaultRenderingEventListenerFactory;
@@ -26,6 +27,7 @@ mod tests {
     use dbt_schemas::schemas::relations::DEFAULT_DBT_QUOTING;
     use dbt_schemas::schemas::serde::StringOrInteger;
     use dbt_schemas::state::DbtRuntimeConfig;
+    use dbt_test_primitives::assert_contains;
     use minijinja::constants::TARGET_PACKAGE_NAME;
     use minijinja::machinery::Span;
     use minijinja::{AutoEscape, Error};
@@ -289,9 +291,13 @@ mod tests {
             ctx: S,
         ) -> Result<String, Error> {
             let mut env = Environment::new();
-            let adapter =
-                create_parse_adapter(AdapterType::Postgres, DEFAULT_DBT_QUOTING, never_cancels())
-                    .unwrap();
+            let adapter = Arc::new(ParseAdapter::new(
+                AdapterType::Postgres,
+                dbt_serde_yaml::Mapping::default(),
+                DEFAULT_DBT_QUOTING,
+                Box::new(NaiveTypeFormatterImpl::new(AdapterType::Postgres)),
+                never_cancels(),
+            )) as Arc<dyn BaseAdapter>;
             env.add_global("adapter", adapter.as_value());
             let empty_blocks = BTreeMap::new();
             let vm = Vm::new(&env);
@@ -444,8 +450,8 @@ mod tests {
         .unwrap();
 
         let trimmed = rendered.trim().replace('\n', " ").replace('\r', "");
-        assert!(trimmed.contains("abc: 123"));
-        assert!(trimmed.contains("def: 456"));
+        assert_contains!(trimmed, "abc: 123");
+        assert_contains!(trimmed, "def: 456");
     }
 
     #[tokio::test]

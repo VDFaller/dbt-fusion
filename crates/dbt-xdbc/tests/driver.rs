@@ -8,9 +8,6 @@
 //!
 
 mod tests {
-    use std::collections::HashSet;
-    use std::env;
-
     use adbc_core::{
         error::{Error, Result},
         options::{AdbcVersion, OptionConnection},
@@ -18,11 +15,15 @@ mod tests {
     #[cfg(feature = "odbc")]
     use arrow_array::Array as _;
     use arrow_array::{cast::AsArray, types::*};
+    #[cfg(feature = "odbc")]
+    use dbt_test_primitives::assert_contains;
     use dbt_xdbc::{
         Backend, Connection, Database, Driver, QueryCtx, Statement, bigquery, connection,
         database::{self, LogLevel},
         databricks, driver, redshift, salesforce, snowflake,
     };
+    use std::collections::HashSet;
+    use std::env;
 
     const ADBC_VERSION: AdbcVersion = AdbcVersion::V110;
 
@@ -60,8 +61,9 @@ mod tests {
                 //     GRANT ALL PRIVILEGES ON DATABASE adbc_test TO username;
                 // Shell:
                 //     export ADBC_POSTGRES_URI="postgres://username:an_secure_password@localhost/adbc_test"
-                let uri = env::var("ADBC_POSTGRES_URI")
-                    .unwrap_or("postgres://username:rocks_password@localhost/adbc_test".to_owned());
+                let uri = env::var("ADBC_POSTGRES_URI").unwrap_or_else(|_| {
+                    "postgres://username:rocks_password@localhost/adbc_test".to_owned()
+                });
                 let mut builder = database::Builder::new(backend);
                 builder.with_parse_uri(uri)?;
                 Ok(builder)
@@ -74,7 +76,7 @@ mod tests {
                 let mut builder = database::Builder::new(backend);
 
                 let host = env::var("REDSHIFT_HOST").unwrap();
-                let port = env::var("REDSHIFT_PORT").unwrap_or("5439".to_string());
+                let port = env::var("REDSHIFT_PORT").unwrap_or_else(|_| "5439".to_string());
                 let database = env::var("REDSHIFT_DATABASE").unwrap();
                 let user = env::var("REDSHIFT_USER").unwrap();
                 let password = env::var("REDSHIFT_PASSWORD").unwrap();
@@ -127,7 +129,7 @@ mod tests {
                 let token = env::var("DATABRICKS_TOKEN").unwrap();
                 let host = env::var("DATABRICKS_HOST").unwrap();
                 let http_path = env::var("DATABRICKS_HTTP_PATH").unwrap();
-                let port = env::var("DATABRICKS_PORT").unwrap_or(DEFAULT_PORT.to_string());
+                let port = env::var("DATABRICKS_PORT").unwrap_or_else(|_| DEFAULT_PORT.to_string());
 
                 // optional
                 if let Ok(catalog) = env::var("DATABRICKS_CATALOG") {
@@ -542,10 +544,10 @@ mod tests {
         let conn_res = connection::Builder::default().build(&mut database);
         assert!(conn_res.is_err());
         let err = conn_res.unwrap_err();
-        assert!(err.message.contains("nonexistent_driver"));
-        assert!(
-            err.message
-                .contains("The Databricks ODBC driver can be downloaded from")
+        assert_contains!(err.message, "nonexistent_driver");
+        assert_contains!(
+            err.message,
+            "The Databricks ODBC driver can be downloaded from"
         );
         Ok(())
     }

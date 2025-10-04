@@ -146,10 +146,10 @@ pub fn get_profile_name_from_project() -> FsResult<String> {
     let project: serde_json::Value = dbt_serde_yaml::from_str(&content)
         .map_err(|e| fs_err!(ErrorCode::IoError, "Failed to parse dbt_project.yml: {}", e))?;
 
-    if let Some(profile_value) = project.get("profile") {
-        if let Some(profile_str) = profile_value.as_str() {
-            return Ok(profile_str.to_string());
-        }
+    if let Some(profile_value) = project.get("profile")
+        && let Some(profile_str) = profile_value.as_str()
+    {
+        return Ok(profile_str.to_string());
     }
 
     // No profile found in dbt_project.yml, ask user to provide one
@@ -185,7 +185,7 @@ fn update_dbt_project_profile(profile_name: &str) -> FsResult<()> {
     let mut profile_added = false;
 
     for line in lines.iter() {
-        new_lines.push(line.to_string());
+        new_lines.push((*line).to_string());
 
         // If we find the 'name:' field, add the profile field right after it
         if !profile_added && line.trim_start().starts_with("name:") {
@@ -204,7 +204,7 @@ fn update_dbt_project_profile(profile_name: &str) -> FsResult<()> {
             // Insert profile before this line
             new_lines.pop(); // Remove the current line
             new_lines.push(format!("profile: {profile_name}"));
-            new_lines.push(line.to_string());
+            new_lines.push((*line).to_string());
             profile_added = true;
         }
     }
@@ -304,14 +304,14 @@ pub async fn run_init_workflow(
         }
 
         // Validate profile if specified
-        if let Some(ref profile_name) = existing_profile {
-            if !check_if_profile_exists(profile_name, &profiles_dir)? {
-                return Err(fs_err!(
-                    ErrorCode::InvalidArgument,
-                    "Could not find profile named '{}'",
-                    profile_name
-                ));
-            }
+        if let Some(ref profile_name) = existing_profile
+            && !check_if_profile_exists(profile_name, &profiles_dir)?
+        {
+            return Err(fs_err!(
+                ErrorCode::InvalidArgument,
+                "Could not find profile named '{}'",
+                profile_name
+            ));
         }
 
         // Create the project

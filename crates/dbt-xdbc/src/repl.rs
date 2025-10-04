@@ -1,4 +1,5 @@
-use std::{env, sync::Arc};
+use std::sync::Arc;
+use std::{env, slice};
 
 use adbc_core::{
     error::{Error, Result},
@@ -75,8 +76,9 @@ impl ReplState {
                 //     GRANT ALL PRIVILEGES ON DATABASE adbc_test TO username;
                 // Shell:
                 //     export ADBC_POSTGRES_URI="postgres://username:an_secure_password@localhost/adbc_test"
-                let uri = env::var("ADBC_POSTGRES_URI")
-                    .unwrap_or("postgres://username:rocks_password@localhost/adbc_test".to_owned());
+                let uri = env::var("ADBC_POSTGRES_URI").unwrap_or_else(|_| {
+                    "postgres://username:rocks_password@localhost/adbc_test".to_owned()
+                });
                 let mut builder = database::Builder::new(backend);
                 builder.with_parse_uri(uri)?;
                 Ok(builder)
@@ -348,7 +350,7 @@ pub async fn run_repl(backend_str: &str) -> Result<()> {
                         "Query Results",
                         "",
                         &column_names,
-                        &[batch.clone()],
+                        slice::from_ref(&batch),
                         &DisplayFormat::Table,
                         Some(10),
                         true,

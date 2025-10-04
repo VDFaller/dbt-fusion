@@ -104,6 +104,7 @@ pub fn resolve_seeds(
                     base_ctx,
                     &[],
                     dependency_package_name,
+                    true,
                 )?,
                 Some(mpe.relative_path.clone()),
             )
@@ -121,29 +122,29 @@ pub fn resolve_seeds(
         };
 
         // XXX: normalize column_types to uppercase if it is snowflake
-        if matches!(adapter_type, AdapterType::Snowflake) {
-            if let Some(column_types) = &properties_config.column_types {
-                let column_types = column_types
-                    .iter()
-                    .map(|(k, v)| {
-                        Ok((
-                            Dialect::Snowflake
-                                .parse_identifier(k)
-                                .map_err(|e| {
-                                    fs_err!(
-                                        ErrorCode::InvalidColumnReference,
-                                        "Invalid identifier: {}",
-                                        e
-                                    )
-                                })?
-                                .to_value(),
-                            v.to_owned(),
-                        ))
-                    })
-                    .collect::<FsResult<_>>()?;
+        if matches!(adapter_type, AdapterType::Snowflake)
+            && let Some(column_types) = &properties_config.column_types
+        {
+            let column_types = column_types
+                .iter()
+                .map(|(k, v)| {
+                    Ok((
+                        Dialect::Snowflake
+                            .parse_identifier(k)
+                            .map_err(|e| {
+                                fs_err!(
+                                    ErrorCode::InvalidColumnReference,
+                                    "Invalid identifier: {}",
+                                    e
+                                )
+                            })?
+                            .to_value(),
+                        v.to_owned(),
+                    ))
+                })
+                .collect::<FsResult<_>>()?;
 
-                properties_config.column_types = Some(column_types);
-            }
+            properties_config.column_types = Some(column_types);
         }
 
         if package_name != root_project.name {
@@ -162,6 +163,11 @@ pub fn resolve_seeds(
 
         validate_delimeter(&properties_config.delimiter)?;
 
+        // Calculate original file path first so we can use it for the checksum
+        // if necessary for large seeds
+        let original_file_path =
+            stdfs::diff_paths(seed_file.base_path.join(&path), &io_args.in_dir)?;
+
         // Create initial seed with default values
         let mut dbt_seed = DbtSeed {
             __common_attr__: CommonAttributes {
@@ -169,16 +175,14 @@ pub fn resolve_seeds(
                 package_name: package_name.to_owned(),
                 path: path.to_owned(),
                 name_span: dbt_common::Span::default(),
-                original_file_path: stdfs::diff_paths(
-                    seed_file.base_path.join(&path),
-                    &io_args.in_dir,
-                )?,
-                checksum: DbtChecksum::hash(
+                original_file_path: original_file_path.clone(),
+                checksum: DbtChecksum::seed_file_hash(
                     std::fs::read(seed_file.base_path.join(&path))
                         .map_err(|e| {
                             fs_err!(ErrorCode::IoError, "Failed to read seed file: {}", e)
                         })?
                         .as_slice(),
+                    &original_file_path.to_string_lossy(),
                 ),
                 patch_path: patch_path.clone(),
                 unique_id: unique_id.clone(),

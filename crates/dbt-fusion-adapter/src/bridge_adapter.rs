@@ -1,13 +1,14 @@
 use crate::base_adapter::{AdapterType, AdapterTyping};
 use crate::cache::RelationCache;
-use crate::cast_util::{downcast_value_to_dyn_base_relation, dyn_base_columns_to_value};
+use crate::cast_util::downcast_value_to_dyn_base_relation;
+use crate::columns::StdColumn;
 use crate::funcs::{
     dispatch_adapter_calls, dispatch_adapter_get_value, execute_macro, execute_macro_wrapper,
     none_value,
 };
 use crate::funcs::{execute_macro_wrapper_with_package, format_sql_with_bindings};
 use crate::information_schema::InformationSchema;
-use crate::metadata::{CatalogAndSchema, MetadataAdapter, RelationVec};
+use crate::metadata::*;
 use crate::query_ctx::{node_id_from_state, query_ctx_from_state, query_ctx_from_state_with_sql};
 use crate::record_batch_utils::extract_first_value_as_i64;
 use crate::relation_object::RelationObject;
@@ -22,7 +23,6 @@ use dbt_common::behavior_flags::{Behavior, BehaviorFlag};
 use dbt_common::cancellation::CancellationToken;
 use dbt_common::{FsError, FsResult, current_function_name};
 use dbt_schemas::schemas::InternalDbtNodeWrapper;
-use dbt_schemas::schemas::columns::base::StdColumn;
 use dbt_schemas::schemas::common::{DbtIncrementalStrategy, ResolvedQuoting};
 use dbt_schemas::schemas::dbt_column::{DbtColumn, DbtColumnRef};
 use dbt_schemas::schemas::manifest::{
@@ -165,12 +165,13 @@ impl BridgeAdapter {
     /// normal.
     pub(crate) fn borrow_tlocal_connection(
         &self,
+        state: Option<&State>,
         node_id: Option<String>,
     ) -> Result<ConnectionGuard<'_>, MinijinjaError> {
         let _span = span!("BridgeAdapter::borrow_thread_local_connection");
         let mut conn = CONNECTION.with(|c| c.take());
         if conn.is_none() {
-            self.new_connection(node_id)
+            self.new_connection(state, node_id)
                 .map(|new_conn| conn.replace(new_conn))?;
         }
         let guard = ConnectionGuard::new(conn.unwrap());
@@ -200,7 +201,7 @@ impl AdapterTyping for BridgeAdapter {
         self.typed_adapter.column_type()
     }
 
-    fn engine(&self) -> Option<&Arc<SqlEngine>> {
+    fn engine(&self) -> &Arc<SqlEngine> {
         self.typed_adapter.engine()
     }
 
@@ -220,10 +221,11 @@ impl BaseAdapter for BridgeAdapter {
 
     fn new_connection(
         &self,
+        state: Option<&State>,
         node_id: Option<String>,
     ) -> Result<Box<dyn Connection>, MinijinjaError> {
         let _span = span!("BrideAdapter::new_connection");
-        let conn = self.typed_adapter.new_connection(node_id)?;
+        let conn = self.typed_adapter.new_connection(state, node_id)?;
         Ok(conn)
     }
 
@@ -299,36 +301,18 @@ impl BaseAdapter for BridgeAdapter {
     }
 
     #[tracing::instrument(skip_all, level = "trace")]
-    fn quote(&self, state: &State, args: &[Value]) -> Result<Value, MinijinjaError> {
-        let parser = ArgParser::new(args, None);
-        check_num_args(current_function_name!(), &parser, 1, 1)?;
-
-        let identifier = args
-            .first()
-            .expect("quote requires exactly one argument")
-            .to_string();
-
-        let quoted_identifier = self.typed_adapter.quote(state, &identifier)?;
+    fn quote(&self, state: &State, identifier: &str) -> Result<Value, MinijinjaError> {
+        let quoted_identifier = self.typed_adapter.quote(state, identifier)?;
         Ok(Value::from(quoted_identifier))
     }
 
     #[tracing::instrument(skip_all, level = "trace")]
-    fn quote_as_configured(&self, state: &State, args: &[Value]) -> Result<Value, MinijinjaError> {
-        let parser = ArgParser::new(args, None);
-        check_num_args(current_function_name!(), &parser, 2, 2)?;
-
-        let identifier = args
-            .first()
-            .expect("quote_as_configured requires two arguments")
-            .as_str()
-            .unwrap();
-
-        let quote_key = args
-            .last()
-            .expect("quote_as_configured requires two arguments")
-            .as_str()
-            .unwrap();
-
+    fn quote_as_configured(
+        &self,
+        state: &State,
+        identifier: &str,
+        quote_key: &str,
+    ) -> Result<Value, MinijinjaError> {
         let quote_key = quote_key.parse::<ComponentName>().map_err(|_| {
             MinijinjaError::new(
                 MinijinjaErrorKind::InvalidArgument,
@@ -344,17 +328,15 @@ impl BaseAdapter for BridgeAdapter {
     }
 
     #[tracing::instrument(skip_all, level = "trace")]
-    fn quote_seed_column(&self, state: &State, args: &[Value]) -> Result<Value, MinijinjaError> {
-        // column: str, quote_config: Optional[bool]
-        let mut parser = ArgParser::new(args, None);
-        check_num_args(current_function_name!(), &parser, 1, 2)?;
-
-        let column = parser.get::<String>("column")?;
-        let quote_config = parser.get_optional::<bool>("quote_config");
-
+    fn quote_seed_column(
+        &self,
+        state: &State,
+        column: &str,
+        quote_config: Option<bool>,
+    ) -> Result<Value, MinijinjaError> {
         let result = self
             .typed_adapter
-            .quote_seed_column(state, &column, quote_config)?;
+            .quote_seed_column(state, column, quote_config)?;
         Ok(Value::from(result))
     }
 
@@ -431,10 +413,11 @@ impl BaseAdapter for BridgeAdapter {
         limit: Option<i64>,
         options: Option<HashMap<String, String>>,
     ) -> AdapterResult<(AdapterResponse, AgateTable)> {
-        let mut conn = self.borrow_tlocal_connection(node_id_from_state(state))?;
+        let mut conn = self.borrow_tlocal_connection(Some(state), node_id_from_state(state))?;
         let query_ctx =
             query_ctx_from_state_with_sql(state, sql)?.with_desc("execute adapter call");
         let (response, table) = self.typed_adapter.execute(
+            Some(state),
             conn.as_mut(),
             &query_ctx,
             auto_begin,
@@ -461,7 +444,7 @@ impl BaseAdapter for BridgeAdapter {
             sql.to_string()
         };
 
-        let mut conn = self.borrow_tlocal_connection(node_id_from_state(state))?;
+        let mut conn = self.borrow_tlocal_connection(Some(state), node_id_from_state(state))?;
         let query_ctx = query_ctx_from_state_with_sql(state, formatted_sql)?
             .with_desc("add_query adapter call");
 
@@ -499,7 +482,8 @@ impl BaseAdapter for BridgeAdapter {
     #[tracing::instrument(skip(self, state), level = "trace")]
     fn rename_relation(&self, state: &State, args: &[Value]) -> Result<Value, MinijinjaError> {
         self.cache_renamed(state, args)?;
-        if self.typed_adapter.is_replay() {
+        if self.typed_adapter.as_replay().is_some() {
+            // TODO: move this logic to the [ReplayAdapter]
             let iter = ArgsIter::new(
                 current_function_name!(),
                 &["from_relation", "to_relation"],
@@ -510,7 +494,7 @@ impl BaseAdapter for BridgeAdapter {
             let from_relation = from_relation_obj.inner();
             let to_relation = to_relation_obj.inner();
             iter.finish()?;
-            let mut conn = self.borrow_tlocal_connection(node_id_from_state(state))?;
+            let mut conn = self.borrow_tlocal_connection(Some(state), node_id_from_state(state))?;
             self.typed_adapter
                 .rename_relation(conn.as_mut(), from_relation, to_relation)?;
         }
@@ -524,16 +508,9 @@ impl BaseAdapter for BridgeAdapter {
     fn expand_target_column_types(
         &self,
         state: &State,
-        args: &[Value],
+        from_relation: Arc<dyn BaseRelation>,
+        to_relation: Arc<dyn BaseRelation>,
     ) -> Result<Value, MinijinjaError> {
-        let mut parser = ArgParser::new(args, None);
-        check_num_args(current_function_name!(), &parser, 2, 2)?;
-
-        let from_relation = parser.get::<Value>("from_relation")?;
-        let to_relation = parser.get::<Value>("to_relation")?;
-
-        let from_relation = downcast_value_to_dyn_base_relation(&from_relation)?;
-        let to_relation = downcast_value_to_dyn_base_relation(&to_relation)?;
         let result =
             self.typed_adapter
                 .expand_target_column_types(state, from_relation, to_relation)?;
@@ -602,7 +579,7 @@ impl BaseAdapter for BridgeAdapter {
                 .typed_adapter
                 .valid_incremental_strategies()
                 .contains(&strategy_)
-                && !builtin_incremental_strategies(false).contains(&strategy_)
+                && builtin_incremental_strategies(false).contains(&strategy_)
             {
                 return invalid_argument!(
                     "The incremental strategy '{}' is not valid for this adapter",
@@ -685,18 +662,18 @@ impl BaseAdapter for BridgeAdapter {
             .ok();
 
         let mut config = BTreeMap::<String, Value>::new();
-        if let Some(hard_deletes) = hard_deletes {
-            if !hard_deletes.is_undefined() {
-                config.insert("hard_deletes".to_string(), hard_deletes);
-            }
+        if let Some(hard_deletes) = hard_deletes
+            && !hard_deletes.is_undefined()
+        {
+            config.insert("hard_deletes".to_string(), hard_deletes);
         }
-        if let Some(invalidate_hard_deletes) = invalidate_hard_deletes {
-            if !invalidate_hard_deletes.is_undefined() {
-                config.insert(
-                    "invalidate_hard_deletes".to_string(),
-                    invalidate_hard_deletes,
-                );
-            }
+        if let Some(invalidate_hard_deletes) = invalidate_hard_deletes
+            && !invalidate_hard_deletes.is_undefined()
+        {
+            config.insert(
+                "invalidate_hard_deletes".to_string(),
+                invalidate_hard_deletes,
+            );
         }
 
         Ok(Value::from(
@@ -713,14 +690,15 @@ impl BaseAdapter for BridgeAdapter {
         identifier: &str,
     ) -> Result<Value, MinijinjaError> {
         // Skip cache in replay mode
-        if !self.typed_adapter.is_replay() {
+        let is_replay = self.typed_adapter.as_replay().is_some();
+        if !is_replay {
             let temp_relation = relation_object::create_relation(
                 self.typed_adapter.adapter_type(),
                 database.to_string(),
                 schema.to_string(),
                 Some(identifier.to_string()),
                 None,
-                self.typed_adapter().get_resolved_quoting(),
+                self.typed_adapter().quoting(),
             )?;
 
             if let Some(cached_entry) = self.relation_cache.get_relation(&temp_relation) {
@@ -734,12 +712,35 @@ impl BaseAdapter for BridgeAdapter {
             {
                 return Ok(none_value());
             }
+
+            let mut conn = self.borrow_tlocal_connection(Some(state), node_id_from_state(state))?;
+            let db_schema = CatalogAndSchema::from(&temp_relation);
+            let query_ctx =
+                query_ctx_from_state(state)?.with_desc("get_relation > list_relations call");
+            let maybe_relations_list =
+                self.typed_adapter
+                    .list_relations(&query_ctx, conn.as_mut(), &db_schema);
+
+            // TODO(jason): We are ignoring this optimization in the logging
+            // this needs to be reported somewhere
+            if let Ok(relations_list) = maybe_relations_list {
+                let _ = self.update_relation_cache(BTreeMap::from([(db_schema, relations_list)]));
+
+                // After calling list_relations_without_caching, the cache should be populated
+                // with the full schema.
+                if let Some(cached_entry) = self.relation_cache.get_relation(&temp_relation) {
+                    return Ok(cached_entry.relation().as_value());
+                } else {
+                    return Ok(none_value());
+                }
+            }
         }
 
+        // TODO(jason): Adjust replay mode to be integrated with the cache
         // Move on to query against the remote when we have:
-        // 1. A cache miss
+        // 1. A cache miss and we failed to execute list_relations
         // 2. The schema was not previously cached
-        let mut conn = self.borrow_tlocal_connection(node_id_from_state(state))?;
+        let mut conn = self.borrow_tlocal_connection(Some(state), node_id_from_state(state))?;
         let query_ctx = query_ctx_from_state(state)?.with_desc("get_relation adapter call");
         let relation = self.typed_adapter.get_relation(
             state,
@@ -772,33 +773,16 @@ impl BaseAdapter for BridgeAdapter {
         let result = self
             .typed_adapter
             .get_missing_columns(state, from_relation, to_relation)?;
-
-        Ok(result)
+        Ok(Value::from_object(result))
     }
 
     #[tracing::instrument(skip(self, state), level = "trace")]
     fn get_columns_in_relation(
         &self,
         state: &State,
-        args: &[Value],
+        relation: Arc<dyn BaseRelation>,
     ) -> Result<Value, MinijinjaError> {
-        let mut parser = ArgParser::new(args, None);
-        check_num_args(current_function_name!(), &parser, 1, 1)?;
-
-        let relation = parser.get::<Value>("relation")?;
-        let relation = downcast_value_to_dyn_base_relation(&relation)?;
-
-        if self.typed_adapter.is_replay() {
-            return match self.typed_adapter.get_columns_in_relation(state, relation) {
-                Ok(result) => Ok(Value::from_iter(result.iter().map(|c| c.as_value()))),
-                Err(e) => Err(MinijinjaError::new(
-                    MinijinjaErrorKind::SerdeDeserializeError,
-                    e.to_string(),
-                )),
-            };
-        }
-
-        if let Some(db) = &self.db {
+        let maybe_from_local = if let Some(db) = &self.db {
             // skip local compilation results if it's invoked upon a snapshot
             // as we considered risk is too high to trust the types to be consistent with the remote
             if !state.is_relation_snapshot(&relation.render_self_as_str())
@@ -808,8 +792,8 @@ impl BaseAdapter for BridgeAdapter {
                 && !state.is_run_incremental()
             {
                 let schema = db.get_schema(&relation.get_fqn().unwrap_or_default());
-                if let Some(schema) = schema {
-                    let from_local = self.typed_adapter.arrow_schema_to_dbt_columns(schema)?;
+                if let Some(schema) = &schema {
+                    let from_local = self.typed_adapter.schema_to_columns(schema)?;
 
                     #[cfg(debug_assertions)]
                     {
@@ -819,10 +803,10 @@ impl BaseAdapter for BridgeAdapter {
                                 .get_columns_in_relation(state, relation.clone())
                             {
                                 Ok(mut from_remote) => {
-                                    from_remote.sort_by_key(|c| c.name());
+                                    from_remote.sort_by(|a, b| a.name().cmp(b.name()));
 
                                     let mut from_local = from_local.clone();
-                                    from_local.sort_by_key(|c| c.name());
+                                    from_local.sort_by(|a, b| a.name().cmp(b.name()));
 
                                     println!("local  remote mismatches");
                                     if !from_remote.is_empty() {
@@ -830,8 +814,7 @@ impl BaseAdapter for BridgeAdapter {
                                         for (local, remote) in
                                             from_local.iter().zip(from_remote.iter())
                                         {
-                                            let mismatch = (local.data_type()
-                                                != remote.data_type())
+                                            let mismatch = (local.dtype() != remote.dtype())
                                                 || (local.name() != remote.name());
                                             if mismatch {
                                                 println!(
@@ -841,9 +824,9 @@ impl BaseAdapter for BridgeAdapter {
                                                 println!(
                                                     "{}:{}  {}:{}",
                                                     local.name(),
-                                                    local.data_type(),
+                                                    local.dtype(),
                                                     remote.name(),
-                                                    remote.data_type()
+                                                    remote.dtype()
                                                 );
                                             }
                                         }
@@ -857,16 +840,33 @@ impl BaseAdapter for BridgeAdapter {
                             }
                         }
                     }
-                    return Ok(Value::from_iter(from_local.iter().map(|c| c.as_value())));
+                    Some(from_local)
+                } else {
+                    None
                 }
+            } else {
+                None
             }
+        } else {
+            None
+        };
+
+        if let Some(replay_adapter) = self.typed_adapter.as_replay() {
+            return replay_adapter.replay_get_columns_in_relation(
+                state,
+                relation,
+                maybe_from_local,
+            );
+        }
+
+        if let Some(from_local) = maybe_from_local {
+            return Ok(Value::from(from_local));
         }
 
         let from_remote = self
             .typed_adapter
             .get_columns_in_relation(state, relation)?;
-        let result = dyn_base_columns_to_value(from_remote)?;
-        Ok(result)
+        Ok(Value::from(from_remote))
     }
 
     #[tracing::instrument(skip_all, level = "trace")]
@@ -876,6 +876,17 @@ impl BaseAdapter for BridgeAdapter {
 
         let database = parser.get::<String>("database")?;
         let schema = parser.get::<String>("schema")?;
+
+        // Replay fast-path: consult trace-derived cache if available
+        if self.typed_adapter.as_replay().is_some() {
+            // TODO: move this logic to the [ReplayAdapter]
+            if let Some(exists) = self
+                .typed_adapter
+                .schema_exists_from_trace(&database, &schema)
+            {
+                return Ok(Value::from(exists));
+            }
+        }
 
         let information_schema = InformationSchema {
             database: Some(database),
@@ -919,7 +930,7 @@ impl BaseAdapter for BridgeAdapter {
             .unwrap_or_default();
         let excluded_schemas = parser
             .get_optional::<Value>("excluded_schemas")
-            .unwrap_or(Value::from_iter::<Vec<String>>(vec![]));
+            .unwrap_or_else(|| Value::from_iter::<Vec<String>>(vec![]));
         let _ = minijinja_value_to_typed_struct::<Vec<String>>(excluded_schemas).map_err(|e| {
             MinijinjaError::new(MinijinjaErrorKind::SerdeDeserializeError, e.to_string())
         })?;
@@ -940,12 +951,11 @@ impl BaseAdapter for BridgeAdapter {
 
         let query_ctx = query_ctx_from_state_with_sql(state, sql)?
             .with_desc("get_column_schema_from_query adapter call");
-        let mut conn = self.borrow_tlocal_connection(node_id_from_state(state))?;
-        let result = self
-            .typed_adapter
-            .get_column_schema_from_query(conn.as_mut(), &query_ctx)?;
-        let result = dyn_base_columns_to_value(result)?;
-        Ok(result)
+        let mut conn = self.borrow_tlocal_connection(Some(state), node_id_from_state(state))?;
+        let result =
+            self.typed_adapter
+                .get_column_schema_from_query(state, conn.as_mut(), &query_ctx)?;
+        Ok(Value::from(result))
     }
 
     /// reference: https://github.com/dbt-labs/dbt-adapters/blob/main/dbt-bigquery/src/dbt/adapters/bigquery/impl.py#L443-L444
@@ -1042,7 +1052,7 @@ impl BaseAdapter for BridgeAdapter {
             )
         };
 
-        let mut conn = self.borrow_tlocal_connection(node_id_from_state(state))?;
+        let mut conn = self.borrow_tlocal_connection(Some(state), node_id_from_state(state))?;
         let result =
             self.typed_adapter
                 .is_replaceable(conn.as_mut(), relation, partition_by, cluster_by)?;
@@ -1065,8 +1075,8 @@ impl BaseAdapter for BridgeAdapter {
         Ok(result)
     }
 
-    #[tracing::instrument(skip(self, _state), level = "trace")]
-    fn get_table_options(&self, _state: &State, args: &[Value]) -> Result<Value, MinijinjaError> {
+    #[tracing::instrument(skip(self, state), level = "trace")]
+    fn get_table_options(&self, state: &State, args: &[Value]) -> Result<Value, MinijinjaError> {
         let mut parser = ArgParser::new(args, None);
         parser.check_num_args(current_function_name!(), 2, 3)?;
         let config = parser.get::<Value>("config")?;
@@ -1092,14 +1102,14 @@ impl BaseAdapter for BridgeAdapter {
             })?;
         let node = node_wrapper.as_internal_node();
 
-        let options = self
-            .typed_adapter
-            .get_table_options(config, node.common(), temporary)?;
+        let options =
+            self.typed_adapter
+                .get_table_options(state, config, node.common(), temporary)?;
         Ok(Value::from_serialize(options))
     }
 
-    #[tracing::instrument(skip(self, _state), level = "trace")]
-    fn get_view_options(&self, _state: &State, args: &[Value]) -> Result<Value, MinijinjaError> {
+    #[tracing::instrument(skip(self, state), level = "trace")]
+    fn get_view_options(&self, state: &State, args: &[Value]) -> Result<Value, MinijinjaError> {
         let mut parser = ArgParser::new(args, None);
         parser.check_num_args(current_function_name!(), 2, 3)?;
 
@@ -1122,7 +1132,9 @@ impl BaseAdapter for BridgeAdapter {
             })?;
         let node = node_wrapper.as_internal_node();
 
-        let options = self.typed_adapter.get_view_options(config, node.common())?;
+        let options = self
+            .typed_adapter
+            .get_view_options(state, config, node.common())?;
         Ok(Value::from_serialize(options))
     }
 
@@ -1146,9 +1158,15 @@ impl BaseAdapter for BridgeAdapter {
                 )
             })?;
 
-        let result = self
-            .typed_adapter
-            .add_time_ingestion_partition_column(columns, partition_by.validate()?)?;
+        let result = self.typed_adapter.add_time_ingestion_partition_column(
+            columns,
+            partition_by.into_bigquery().ok_or_else(|| {
+                MinijinjaError::new(
+                    MinijinjaErrorKind::InvalidArgument,
+                    "Expect a BigqueryPartitionConfigStruct",
+                )
+            })?,
+        )?;
         Ok(result)
     }
 
@@ -1168,18 +1186,12 @@ impl BaseAdapter for BridgeAdapter {
         })?;
 
         let (database, schema) = (
-            grant_target
-                .project
-                .as_deref()
-                .ok_or(invalid_argument_inner!(
-                    "project in a GrantAccessToTarget cannot be empty"
-                ))?,
-            grant_target
-                .dataset
-                .as_deref()
-                .ok_or(invalid_argument_inner!(
-                    "dataset in a GrantAccessToTarget cannot be empty"
-                ))?,
+            grant_target.project.as_deref().ok_or_else(|| {
+                invalid_argument_inner!("project in a GrantAccessToTarget cannot be empty")
+            })?,
+            grant_target.dataset.as_deref().ok_or_else(|| {
+                invalid_argument_inner!("dataset in a GrantAccessToTarget cannot be empty")
+            })?,
         );
 
         let role = if role.is_none() {
@@ -1187,10 +1199,10 @@ impl BaseAdapter for BridgeAdapter {
         } else {
             Some(
                 role.as_str()
-                    .ok_or(invalid_argument_inner!("role must be a string"))?,
+                    .ok_or_else(|| invalid_argument_inner!("role must be a string"))?,
             )
         };
-        let mut conn = self.borrow_tlocal_connection(node_id_from_state(state))?;
+        let mut conn = self.borrow_tlocal_connection(Some(state), node_id_from_state(state))?;
         let relation = downcast_value_to_dyn_base_relation(&entity)?;
         let result = self.typed_adapter.grant_access_to(
             state,
@@ -1210,7 +1222,7 @@ impl BaseAdapter for BridgeAdapter {
         check_num_args(current_function_name!(), &parser, 1, 1)?;
 
         let relation = parser.get::<Value>("relation")?;
-        let mut conn = self.borrow_tlocal_connection(node_id_from_state(state))?;
+        let mut conn = self.borrow_tlocal_connection(Some(state), node_id_from_state(state))?;
         let result = self
             .typed_adapter
             .get_dataset_location(state, conn.as_mut(), relation)?;
@@ -1231,7 +1243,7 @@ impl BaseAdapter for BridgeAdapter {
         let identifier = parser.get::<String>("identifier")?;
         let description = parser.get::<String>("description")?;
 
-        let mut conn = self.borrow_tlocal_connection(node_id_from_state(state))?;
+        let mut conn = self.borrow_tlocal_connection(Some(state), node_id_from_state(state))?;
         let result = self.typed_adapter.update_table_description(
             state,
             conn.as_mut(),
@@ -1255,7 +1267,7 @@ impl BaseAdapter for BridgeAdapter {
         let relation = parser.get::<Value>("relation")?;
         let columns = parser.get::<Value>("columns")?;
 
-        let mut conn = self.borrow_tlocal_connection(node_id_from_state(state))?;
+        let mut conn = self.borrow_tlocal_connection(Some(state), node_id_from_state(state))?;
         let result =
             self.typed_adapter
                 .alter_table_add_columns(state, conn.as_mut(), relation, columns)?;
@@ -1274,7 +1286,7 @@ impl BaseAdapter for BridgeAdapter {
             MinijinjaError::new(MinijinjaErrorKind::SerdeDeserializeError, e.to_string())
         })?;
 
-        let mut conn = self.borrow_tlocal_connection(node_id_from_state(state))?;
+        let mut conn = self.borrow_tlocal_connection(Some(state), node_id_from_state(state))?;
         let result = self.typed_adapter.update_columns_descriptions(
             state,
             conn.as_mut(),
@@ -1305,12 +1317,23 @@ impl BaseAdapter for BridgeAdapter {
         check_num_args(current_function_name!(), &parser, 1, 1)?;
 
         let relation = parser.get::<Value>("schema_relation")?;
+        let relation = downcast_value_to_dyn_base_relation(&relation)?;
 
-        let mut conn = self.borrow_tlocal_connection(node_id_from_state(state))?;
-        let result =
-            self.typed_adapter
-                .list_relations_without_caching(state, conn.as_mut(), relation)?;
-        Ok(result)
+        let query_ctx =
+            query_ctx_from_state(state)?.with_desc("list_relations_without_caching adapter call");
+        let mut conn = self.borrow_tlocal_connection(Some(state), node_id_from_state(state))?;
+        let result = self.typed_adapter.list_relations(
+            &query_ctx,
+            conn.as_mut(),
+            &CatalogAndSchema::from(&relation),
+        )?;
+
+        Ok(Value::from_object(
+            result
+                .into_iter()
+                .map(|r| RelationObject::new(r).into_value())
+                .collect::<Vec<_>>(),
+        ))
     }
 
     #[tracing::instrument(skip(self, state), level = "trace")]
@@ -1321,7 +1344,7 @@ impl BaseAdapter for BridgeAdapter {
         let major = parser.get::<i64>("major")?;
         let minor = parser.get::<i64>("minor")?;
 
-        let mut conn = self.borrow_tlocal_connection(node_id_from_state(state))?;
+        let mut conn = self.borrow_tlocal_connection(Some(state), node_id_from_state(state))?;
         let result = self
             .typed_adapter
             .compare_dbr_version(state, conn.as_mut(), major, minor)?;
@@ -1389,7 +1412,7 @@ impl BaseAdapter for BridgeAdapter {
             _ => BTreeMap::new(),
         };
 
-        let mut conn = self.borrow_tlocal_connection(node_id_from_state(state))?;
+        let mut conn = self.borrow_tlocal_connection(Some(state), node_id_from_state(state))?;
         self.typed_adapter.update_tblproperties_for_iceberg(
             state,
             conn.as_mut(),
@@ -1414,7 +1437,7 @@ impl BaseAdapter for BridgeAdapter {
 
         self.relation_cache.insert_relation(dest.clone(), None);
 
-        let mut conn = self.borrow_tlocal_connection(node_id_from_state(state))?;
+        let mut conn = self.borrow_tlocal_connection(Some(state), node_id_from_state(state))?;
         self.typed_adapter
             .copy_table(state, conn.as_mut(), source, dest, materialization)?;
 
@@ -1422,18 +1445,16 @@ impl BaseAdapter for BridgeAdapter {
     }
 
     #[tracing::instrument(skip(self), level = "trace")]
-    fn describe_relation(&self, state: &State, args: &[Value]) -> Result<Value, MinijinjaError> {
-        let mut parser = ArgParser::new(args, None);
-        check_num_args(current_function_name!(), &parser, 1, 1)?;
-
-        let relation = parser.get::<Value>("relation")?;
-        let relation = downcast_value_to_dyn_base_relation(&relation)?;
-
-        let mut conn = self.borrow_tlocal_connection(node_id_from_state(state))?;
+    fn describe_relation(
+        &self,
+        state: &State,
+        relation: Arc<dyn BaseRelation>,
+    ) -> Result<Value, MinijinjaError> {
+        let mut conn = self.borrow_tlocal_connection(Some(state), node_id_from_state(state))?;
         let result = self
             .typed_adapter
             .describe_relation(conn.as_mut(), relation)?;
-        Ok(result.map_or(none_value(), Value::from_serialize))
+        Ok(result.map_or_else(none_value, Value::from_serialize))
     }
 
     #[tracing::instrument(skip(self, _state), level = "trace")]
@@ -1497,10 +1518,10 @@ impl BaseAdapter for BridgeAdapter {
 
         let model_columns = parser.get::<Value>("model_columns")?;
 
-        let existing_columns = minijinja_value_to_typed_struct::<Vec<StdColumn>>(existing_columns)
-            .map_err(|e| {
-                MinijinjaError::new(MinijinjaErrorKind::SerdeDeserializeError, e.to_string())
-            })?;
+        let existing_columns =
+            StdColumn::vec_from_jinja_value(AdapterType::Databricks, existing_columns).map_err(
+                |e| MinijinjaError::new(MinijinjaErrorKind::SerdeDeserializeError, e.to_string()),
+            )?;
         let model_columns =
             minijinja_value_to_typed_struct::<BTreeMap<String, DbtColumnRef>>(model_columns)
                 .map_err(|e| {
@@ -1521,9 +1542,10 @@ impl BaseAdapter for BridgeAdapter {
         let relation = parser.get::<Value>("relation")?;
         let relation = downcast_value_to_dyn_base_relation(&relation)?;
 
-        let config = self
-            .typed_adapter
-            .get_relation_config(state, relation.clone())?;
+        let mut conn = self.borrow_tlocal_connection(Some(state), node_id_from_state(state))?;
+        let config =
+            self.typed_adapter
+                .get_relation_config(state, conn.as_mut(), relation.clone())?;
         let value = config.to_value();
         Ok(value)
     }
@@ -1585,7 +1607,7 @@ impl BaseAdapter for BridgeAdapter {
         }
 
         let mut conn = self
-            .borrow_tlocal_connection(Some(node_id.to_string()))
+            .borrow_tlocal_connection(None, Some(node_id.to_string()))
             .map_err(|e| FsError::from_jinja_err(e, "Failed to create a connection"))?;
         self.typed_adapter
             .use_warehouse(conn.as_mut(), warehouse.unwrap(), node_id)?;
@@ -1595,7 +1617,7 @@ impl BaseAdapter for BridgeAdapter {
     #[tracing::instrument(skip(self), level = "trace")]
     fn restore_warehouse(&self, node_id: &str) -> FsResult<()> {
         let mut conn = self
-            .borrow_tlocal_connection(Some(node_id.to_string()))
+            .borrow_tlocal_connection(None, Some(node_id.to_string()))
             .map_err(|e| FsError::from_jinja_err(e, "Failed to create a connection"))?;
         self.typed_adapter
             .restore_warehouse(conn.as_mut(), node_id)?;
@@ -1603,12 +1625,28 @@ impl BaseAdapter for BridgeAdapter {
     }
 
     #[tracing::instrument(skip(self, state), level = "trace")]
-    fn load_dataframe(&self, state: &State, args: &[Value]) -> Result<Value, MinijinjaError> {
-        let mut conn = self.borrow_tlocal_connection(node_id_from_state(state))?;
+    fn load_dataframe(
+        &self,
+        state: &State,
+        database: &str,
+        schema: &str,
+        table_name: &str,
+        agate_table: Arc<AgateTable>,
+        file_path: &str,
+        field_delimiter: &str,
+    ) -> Result<Value, MinijinjaError> {
+        let mut conn = self.borrow_tlocal_connection(Some(state), node_id_from_state(state))?;
         let query_ctx = query_ctx_from_state(state)?.with_desc("load_dataframe");
-        let result = self
-            .typed_adapter
-            .load_dataframe(&query_ctx, conn.as_mut(), args)?;
+        let result = self.typed_adapter.load_dataframe(
+            &query_ctx,
+            conn.as_mut(),
+            database,
+            schema,
+            table_name,
+            agate_table,
+            file_path,
+            field_delimiter,
+        )?;
         Ok(result)
     }
 }

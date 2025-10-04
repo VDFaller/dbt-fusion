@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::str::FromStr;
 
-use dbt_common::{CodeLocation, ErrorCode, FsError, FsResult};
+use dbt_common::{CodeLocation, ErrorCode, FsError, FsResult, stdfs};
 use dbt_serde_yaml::{JsonSchema, Spanned, UntaggedEnumDeserialize};
 use serde::{
     self, Deserialize, Deserializer, Serialize,
@@ -17,24 +17,11 @@ pub fn typed_struct_from_json_file<T>(path: &Path) -> FsResult<T>
 where
     T: DeserializeOwned,
 {
-    // TODO: use the file path for error reporting.
-    // Open the file and parse as JSON directly using serde_json::from_reader
-    let file = std::fs::File::open(path).map_err(|e| {
-        FsError::new(
-            ErrorCode::SerializationError,
-            format!("Failed to open file: {e}"),
-        )
-        .with_location(CodeLocation::from(path.to_path_buf()))
-    })?;
+    // Note: Do **NOT** open the file and parse as JSON directly using
+    // `serde_json::from_reader`! That will be ~30x slower.
+    let json_str = stdfs::read_to_string(path)?;
 
-    let yml_val: YmlValue = serde_json::from_reader(file).map_err(|e| {
-        FsError::new(
-            ErrorCode::SerializationError,
-            format!("Failed to parse JSON: {e}"),
-        )
-    })?;
-
-    T::deserialize(yml_val).map_err(|e| yaml_to_fs_error(e, Some(path)))
+    typed_struct_from_json_str(&json_str, Some(path))
 }
 
 pub fn typed_struct_to_pretty_json_file<T>(path: &Path, value: &T) -> FsResult<()>
@@ -63,7 +50,7 @@ where
 }
 
 /// Deserializes a JSON string into a `T`.
-pub fn typed_struct_from_json_str<T>(json_str: &str) -> FsResult<T>
+pub fn typed_struct_from_json_str<T>(json_str: &str, source: Option<&Path>) -> FsResult<T>
 where
     T: DeserializeOwned,
 {
@@ -74,7 +61,7 @@ where
         )
     })?;
 
-    T::deserialize(yml_val).map_err(|e| yaml_to_fs_error(e, None))
+    T::deserialize(yml_val).map_err(|e| yaml_to_fs_error(e, source))
 }
 
 /// Converts a `dbt_serde_yaml::Error` into a `FsError`, attaching the error location
@@ -89,11 +76,11 @@ pub fn yaml_to_fs_error(err: dbt_serde_yaml::Error, filename: Option<&Path>) -> 
         location
     };
 
-    if let Some(err) = err.into_external() {
-        if let Ok(err) = err.downcast::<FsError>() {
-            // These are errors raised from our own callbacks:
-            return err;
-        }
+    if let Some(err) = err.into_external()
+        && let Ok(err) = err.downcast::<FsError>()
+    {
+        // These are errors raised from our own callbacks:
+        return err;
     }
     FsError::new(ErrorCode::SerializationError, format!("YAML error: {msg}"))
         .with_location(location)
@@ -172,6 +159,16 @@ where
     Ok(value
         .as_u64()
         .or_else(|| value.as_str().and_then(|s| s.parse::<u64>().ok())))
+}
+
+pub fn f64_or_string_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = dbt_serde_yaml::Value::deserialize(deserializer)?;
+    Ok(value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|s| s.parse::<f64>().ok())))
 }
 
 pub fn default_true() -> Option<bool> {

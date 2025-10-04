@@ -15,7 +15,9 @@ use crate::schemas::manifest::{BigqueryClusterConfig, PartitionConfig};
 use crate::schemas::project::configs::common::WarehouseSpecificNodeConfig;
 use crate::schemas::project::configs::common::{default_meta_and_tags, default_quoting};
 use crate::schemas::project::{DefaultTo, IterChildren};
-use crate::schemas::serde::{StringOrArrayOfStrings, bool_or_string_bool, u64_or_string_u64};
+use crate::schemas::serde::{
+    StringOrArrayOfStrings, bool_or_string_bool, f64_or_string_f64, u64_or_string_u64,
+};
 
 #[skip_serializing_none]
 #[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
@@ -129,9 +131,9 @@ pub struct ProjectSourceConfig {
     #[serde(
         default,
         rename = "+refresh_interval_minutes",
-        deserialize_with = "u64_or_string_u64"
+        deserialize_with = "f64_or_string_f64"
     )]
-    pub refresh_interval_minutes: Option<u64>,
+    pub refresh_interval_minutes: Option<f64>,
     #[serde(rename = "+description")]
     pub description: Option<String>,
     #[serde(rename = "+max_staleness")]
@@ -244,13 +246,13 @@ pub struct ProjectSourceConfig {
 }
 
 impl IterChildren<ProjectSourceConfig> for ProjectSourceConfig {
-    fn iter_children(&self) -> Iter<String, ShouldBe<Self>> {
+    fn iter_children(&self) -> Iter<'_, String, ShouldBe<Self>> {
         self.__additional_properties__.iter()
     }
 }
 
 #[skip_serializing_none]
-#[derive(Deserialize, Serialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[derive(Deserialize, Serialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 pub struct SourceConfig {
     #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub enabled: Option<bool>,

@@ -10,12 +10,12 @@ use crate::schemas::serde::StringOrArrayOfStrings;
 type YmlValue = dbt_serde_yaml::Value;
 
 #[skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WhereFilterIntersection {
     pub where_filters: Vec<WhereFilter>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WhereFilter {
     pub where_sql_template: String,
 }
@@ -29,19 +29,6 @@ impl From<Vec<String>> for WhereFilterIntersection {
                     where_sql_template: s.to_string(),
                 })
                 .collect(),
-        }
-    }
-}
-
-impl From<StringOrArrayOfStrings> for WhereFilterIntersection {
-    fn from(source: StringOrArrayOfStrings) -> Self {
-        match source {
-            StringOrArrayOfStrings::String(s) => Self {
-                where_filters: vec![WhereFilter {
-                    where_sql_template: s,
-                }],
-            },
-            StringOrArrayOfStrings::ArrayOfStrings(arr) => arr.into(),
         }
     }
 }

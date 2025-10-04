@@ -41,8 +41,10 @@ pub struct MinimalProperties {
     pub unit_tests: BTreeMap<String, MinimalPropertiesEntry>,
     pub tests: BTreeMap<String, MinimalPropertiesEntry>,
     pub exposures: BTreeMap<String, MinimalPropertiesEntry>,
+    pub metrics: BTreeMap<String, MinimalPropertiesEntry>,
     pub saved_queries: BTreeMap<String, MinimalPropertiesEntry>,
     pub groups: BTreeMap<String, MinimalPropertiesEntry>,
+    pub semantic_layer_spec_is_legacy: bool,
 }
 
 // impl try extend from MinimalResolvedProperties
@@ -68,6 +70,7 @@ impl MinimalProperties {
                     base_ctx,
                     &[],
                     dependency_package_name_from_ctx(jinja_env, base_ctx),
+                    true,
                 )?;
                 for (key, maybe_version_info) in collect_model_version_info(&model).into_iter() {
                     if let Some(existing_model) = self.models.get_mut(&key) {
@@ -101,6 +104,7 @@ impl MinimalProperties {
                     base_ctx,
                     &[],
                     dependency_package_name_from_ctx(jinja_env, base_ctx),
+                    true,
                 )?;
 
                 if let Some(tables) = &*source.tables {
@@ -126,6 +130,7 @@ impl MinimalProperties {
                             base_ctx,
                             &[],
                             dependency_package_name_from_ctx(jinja_env, base_ctx),
+                            true,
                         )?;
                         let key = (
                             source.name.clone(),
@@ -186,6 +191,7 @@ impl MinimalProperties {
                     base_ctx,
                     &[],
                     dependency_package_name_from_ctx(jinja_env, base_ctx),
+                    true,
                 )?;
                 if let Some(existing_seed) = self.seeds.get_mut(&seed.name) {
                     existing_seed
@@ -217,6 +223,7 @@ impl MinimalProperties {
                     base_ctx,
                     &[],
                     dependency_package_name_from_ctx(jinja_env, base_ctx),
+                    true,
                 )?;
                 if let Some(existing_snapshot) = self.snapshots.get_mut(&snapshot.name) {
                     existing_snapshot
@@ -248,6 +255,7 @@ impl MinimalProperties {
                     base_ctx,
                     &[],
                     dependency_package_name_from_ctx(jinja_env, base_ctx),
+                    true,
                 )?;
                 self.exposures.insert(
                     exposure.name.clone(),
@@ -263,6 +271,38 @@ impl MinimalProperties {
                 );
             }
         }
+        if let Some(metrics) = other.metrics {
+            for metric_value in metrics {
+                let metric = into_typed_with_jinja::<MinimalSchemaValue, _>(
+                    io_args,
+                    metric_value.clone(),
+                    false,
+                    jinja_env,
+                    base_ctx,
+                    &[],
+                    dependency_package_name_from_ctx(jinja_env, base_ctx),
+                    true,
+                )?;
+                if let Some(existing_metric) = self.metrics.get_mut(&metric.name) {
+                    existing_metric
+                        .duplicate_paths
+                        .push(properties_path.to_path_buf());
+                } else {
+                    self.metrics.insert(
+                        metric.name.clone(),
+                        MinimalPropertiesEntry {
+                            name: validate_resource_name(&metric.name)?,
+                            name_span: Span::default(),
+                            relative_path: properties_path.to_path_buf(),
+                            schema_value: metric_value,
+                            table_value: None,
+                            version_info: None,
+                            duplicate_paths: vec![],
+                        },
+                    );
+                }
+            }
+        }
         if let Some(saved_queries) = other.saved_queries {
             for saved_query_value in saved_queries {
                 let saved_query = into_typed_with_jinja::<MinimalSchemaValue, _>(
@@ -273,6 +313,7 @@ impl MinimalProperties {
                     base_ctx,
                     &[],
                     dependency_package_name_from_ctx(jinja_env, base_ctx),
+                    true,
                 )?;
                 if let Some(existing_saved_query) = self.saved_queries.get_mut(&saved_query.name) {
                     existing_saved_query
@@ -304,6 +345,7 @@ impl MinimalProperties {
                     base_ctx,
                     &[],
                     dependency_package_name_from_ctx(jinja_env, base_ctx),
+                    true,
                 )?;
                 if let Some(existing_unit_test) = self.unit_tests.get_mut(&unit_test.name) {
                     existing_unit_test
@@ -335,6 +377,7 @@ impl MinimalProperties {
                     base_ctx,
                     &[],
                     dependency_package_name_from_ctx(jinja_env, base_ctx),
+                    true,
                 )?;
                 if let Some(existing_test) = self.tests.get_mut(&test.name) {
                     existing_test
@@ -366,6 +409,7 @@ impl MinimalProperties {
                     base_ctx,
                     &[],
                     dependency_package_name_from_ctx(jinja_env, base_ctx),
+                    true,
                 )?;
                 if let Some(existing_test) = self.tests.get_mut(&test.name) {
                     existing_test
@@ -397,6 +441,7 @@ impl MinimalProperties {
                     base_ctx,
                     &[],
                     dependency_package_name_from_ctx(jinja_env, base_ctx),
+                    true,
                 )?;
                 if let Some(existing_group) = self.groups.get_mut(&group.name) {
                     existing_group
@@ -418,6 +463,7 @@ impl MinimalProperties {
                 }
             }
         }
+
         Ok(())
     }
 }
@@ -437,6 +483,7 @@ fn validate_resource_name(name: &str) -> FsResult<String> {
     }
 }
 
+#[allow(clippy::cognitive_complexity)]
 pub fn resolve_minimal_properties(
     arg: &ResolveArgs,
     package: &DbtPackage,
@@ -445,7 +492,11 @@ pub fn resolve_minimal_properties(
     base_ctx: &BTreeMap<String, MinijinjaValue>,
     token: &CancellationToken,
 ) -> FsResult<MinimalProperties> {
-    let mut minimal_resolved_properties = MinimalProperties::default();
+    let mut minimal_resolved_properties = MinimalProperties {
+        semantic_layer_spec_is_legacy: false,
+        ..Default::default()
+    };
+
     for dbt_asset in package.dbt_properties.iter().dedup() {
         token.check_cancellation()?;
         let absolute_path = dbt_asset.base_path.join(&dbt_asset.path);
@@ -476,13 +527,29 @@ pub fn resolve_minimal_properties(
             dependency_package_name,
         ) {
             Ok(properties_file_values) => {
+                let properties_path = &dbt_asset.path;
                 minimal_resolved_properties.extend_from_minimal_properties_file(
                     &arg.io,
-                    properties_file_values,
+                    properties_file_values.clone(),
                     jinja_env,
-                    &dbt_asset.path,
+                    properties_path,
                     base_ctx,
                 )?;
+
+                if !minimal_resolved_properties.semantic_layer_spec_is_legacy
+                    && let Some(_semantic_models) = properties_file_values.semantic_models
+                {
+                    // Top level semantic models are not allowed anymore
+                    // TODO: edit copy to encourage user to use auto-fix.
+                    show_warning!(
+                        arg.io,
+                        fs_err!(
+                            ErrorCode::SchemaError,
+                            "This project defines semantic models and metrics using the legacy YAML. Please migrate to the new YAML to use the semantic layer with dbt Fusion.",
+                        )
+                    );
+                    minimal_resolved_properties.semantic_layer_spec_is_legacy = true;
+                }
             }
             Err(e) => {
                 if let Some(package_name) = dependency_package_name

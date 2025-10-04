@@ -47,6 +47,8 @@ pub fn build_resolve_context(
     );
 
     ctx.insert("execute".to_string(), MinijinjaValue::from(false));
+    ctx.insert("node".to_string(), MinijinjaValue::NONE);
 
+    ctx.insert("connection_name".to_string(), MinijinjaValue::from(""));
     ctx
 }

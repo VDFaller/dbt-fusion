@@ -1,4 +1,4 @@
-use crate::base_adapter::{AdapterType, AdapterTyping, BaseAdapter};
+use crate::base_adapter::{AdapterType, AdapterTyping, BaseAdapter, backend_of};
 use crate::cast_util::downcast_value_to_dyn_base_relation;
 use crate::funcs::{
     dispatch_adapter_calls, empty_map_value, empty_mutable_vec_value, empty_string_value,
@@ -6,17 +6,20 @@ use crate::funcs::{
 };
 use crate::metadata::MetadataAdapter;
 use crate::parse::relation::EmptyRelation;
+use crate::query_comment::QueryCommentConfig;
 use crate::relation_object::{RelationObject, create_relation};
 use crate::response::AdapterResponse;
+use crate::sql_types::TypeFormatter;
+use crate::stmt_splitter::NaiveStmtSplitter;
 use crate::typed_adapter::TypedBaseAdapter;
 use crate::{AdapterResult, SqlEngine};
 
 use dashmap::{DashMap, DashSet};
 use dbt_agate::AgateTable;
+use dbt_auth::{AdapterConfig, Auth, auth_for_backend};
 use dbt_common::behavior_flags::Behavior;
 use dbt_common::cancellation::CancellationToken;
-use dbt_common::{FsError, FsResult, current_function_name};
-use dbt_schemas::schemas::columns::base::StdColumnType;
+use dbt_common::{FsError, current_function_name};
 use dbt_schemas::schemas::common::{DbtQuoting, ResolvedQuoting};
 use dbt_schemas::schemas::relations::base::{BaseRelation, RelationPattern};
 use dbt_xdbc::Connection;
@@ -36,10 +39,14 @@ use std::sync::Arc;
 /// Parse adapter for Jinja templates.
 ///
 /// Returns stub values to enable the parsing phase.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ParseAdapter {
-    /// Adapter type
     adapter_type: AdapterType,
+    /// The SQL engine for the ParseAdapter
+    ///
+    /// Not actually used to run SQL queries during parse, but needed since
+    /// this object carries useful dependencies.
+    engine: Arc<SqlEngine>,
     /// The call_get_relation method calls found during parse
     call_get_relation: DashMap<String, Vec<Value>>,
     /// The call_get_columns_in_relation method calls found during parse
@@ -50,10 +57,28 @@ pub struct ParseAdapter {
     unsafe_nodes: DashSet<String>,
     /// SQLs that are found passed in to adapter.execute in the hidden Parse phase
     execute_sqls: DashSet<String>,
-    /// The quoting policy for the adapter
-    quoting: ResolvedQuoting,
     /// The global CLI cancellation token
     cancellation_token: CancellationToken,
+}
+
+impl fmt::Debug for ParseAdapter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ParseAdapter")
+            .field("adapter_type", &self.adapter_type)
+            .field("call_get_relation", &self.call_get_relation)
+            .field(
+                "call_get_columns_in_relation",
+                &self.call_get_columns_in_relation,
+            )
+            .field(
+                "patterned_dangling_sources",
+                &self.patterned_dangling_sources,
+            )
+            .field("unsafe_nodes", &self.unsafe_nodes)
+            .field("execute_sqls", &self.execute_sqls)
+            .field("quoting", &self.engine.quoting())
+            .finish()
+    }
 }
 
 type RelationsToFetch = (
@@ -66,19 +91,40 @@ impl ParseAdapter {
     /// Make a new adapter
     pub fn new(
         adapter_type: AdapterType,
+        config: dbt_serde_yaml::Mapping,
         package_quoting: DbtQuoting,
+        type_formatter: Box<dyn TypeFormatter>,
         token: CancellationToken,
     ) -> Self {
+        let backend = backend_of(adapter_type);
+
+        let auth: Arc<dyn Auth> = auth_for_backend(backend).into();
+        let adapter_config = AdapterConfig::new(config);
+        let quoting = package_quoting
+            .try_into()
+            .expect("Failed to convert quoting to resolved quoting");
+        let stmt_splitter = Arc::new(NaiveStmtSplitter {});
+        let query_comment = QueryCommentConfig::from_query_comment(None, adapter_type, false);
+
+        let engine = SqlEngine::new(
+            adapter_type,
+            auth,
+            adapter_config,
+            quoting,
+            stmt_splitter,
+            query_comment,
+            type_formatter,
+            token.clone(),
+        );
+
         Self {
             adapter_type,
+            engine,
             call_get_relation: DashMap::new(),
             call_get_columns_in_relation: DashMap::new(),
             patterned_dangling_sources: DashMap::new(),
             unsafe_nodes: DashSet::new(),
             execute_sqls: DashSet::new(),
-            quoting: package_quoting
-                .try_into()
-                .expect("Failed to convert quoting to resolved quoting"),
             cancellation_token: token,
         }
     }
@@ -97,7 +143,7 @@ impl ParseAdapter {
             schema.to_string(),
             Some(identifier.to_string()),
             None,
-            self.quoting,
+            self.engine().quoting(),
         )?
         .as_value();
 
@@ -118,25 +164,18 @@ impl ParseAdapter {
     pub fn record_get_columns_in_relation_call(
         &self,
         state: &State,
-        args: &[Value],
+        relation: Arc<dyn BaseRelation>,
     ) -> Result<(), MinijinjaError> {
-        let parser = ArgParser::new(args, None);
-        check_num_args(current_function_name!(), &parser, 1, 1)?;
-
-        let relation = args
-            .first()
-            .expect("get_columns_in_relation requires one argument");
-
-        let base_relation = downcast_value_to_dyn_base_relation(relation)?;
-        if !base_relation.is_database_relation() {
+        if !relation.is_database_relation() {
             return Ok(());
         }
         if state.is_execute() {
             if let Some(unique_id) = state.lookup(TARGET_UNIQUE_ID) {
+                let relation_value = RelationObject::new(relation).into_value();
                 self.call_get_columns_in_relation
                     .entry(unique_id.to_string())
                     .or_default()
-                    .push(relation.to_owned());
+                    .push(relation_value);
             } else {
                 println!("'TARGET_UNIQUE_ID' while get_columns_in_relation is unset");
             }
@@ -210,17 +249,16 @@ impl AdapterTyping for ParseAdapter {
         unimplemented!("as_typed_base_adapter")
     }
 
-    fn column_type(&self) -> Option<Value> {
-        let value = Value::from_object(StdColumnType);
-        Some(value)
+    fn is_parse(&self) -> bool {
+        true
     }
 
-    fn engine(&self) -> Option<&Arc<SqlEngine>> {
-        None
+    fn engine(&self) -> &Arc<SqlEngine> {
+        &self.engine
     }
 
     fn quoting(&self) -> ResolvedQuoting {
-        self.quoting
+        self.engine.quoting()
     }
 
     fn cancellation_token(&self) -> CancellationToken {
@@ -231,6 +269,7 @@ impl AdapterTyping for ParseAdapter {
 impl BaseAdapter for ParseAdapter {
     fn new_connection(
         &self,
+        _state: Option<&State>,
         _node_id: Option<String>,
     ) -> Result<Box<dyn Connection>, MinijinjaError> {
         unimplemented!("new_connection is not implemented for ParseAdapter")
@@ -288,9 +327,9 @@ impl BaseAdapter for ParseAdapter {
     fn get_columns_in_relation(
         &self,
         state: &State,
-        args: &[Value],
+        relation: Arc<dyn BaseRelation>,
     ) -> Result<Value, MinijinjaError> {
-        self.record_get_columns_in_relation_call(state, args)?;
+        self.record_get_columns_in_relation_call(state, relation)?;
         Ok(empty_vec_value())
     }
 
@@ -334,7 +373,8 @@ impl BaseAdapter for ParseAdapter {
     fn expand_target_column_types(
         &self,
         _state: &State,
-        _args: &[Value],
+        _from_relation: Arc<dyn BaseRelation>,
+        _to_relation: Arc<dyn BaseRelation>,
     ) -> Result<Value, MinijinjaError> {
         Ok(none_value())
     }
@@ -385,15 +425,7 @@ impl BaseAdapter for ParseAdapter {
         Ok(empty_vec_value())
     }
 
-    fn quote(&self, _state: &State, args: &[Value]) -> Result<Value, MinijinjaError> {
-        let parser = ArgParser::new(args, None);
-        check_num_args(current_function_name!(), &parser, 1, 1)?;
-
-        let _ = args
-            .first()
-            .expect("quote requires exactly one argument")
-            .to_string();
-
+    fn quote(&self, _state: &State, _identifier: &str) -> Result<Value, MinijinjaError> {
         Ok(empty_vec_value())
     }
 
@@ -424,13 +456,13 @@ impl BaseAdapter for ParseAdapter {
         let default_database = target.as_str().unwrap_or_default();
         let database = parser
             .get_optional::<String>("database")
-            .unwrap_or(default_database.to_string());
+            .unwrap_or_else(|| default_database.to_string());
         let _ = parser
             .get_optional::<bool>("quote_table")
             .unwrap_or_default();
         let excluded_schemas = parser
             .get_optional::<Value>("excluded_schemas")
-            .unwrap_or(Value::from_iter::<Vec<String>>(vec![]));
+            .unwrap_or_else(|| Value::from_iter::<Vec<String>>(vec![]));
         let _: Vec<String> = Vec::<String>::deserialize(excluded_schemas).map_err(|e| {
             MinijinjaError::new(MinijinjaErrorKind::SerdeDeserializeError, e.to_string())
         })?;
@@ -540,7 +572,16 @@ impl BaseAdapter for ParseAdapter {
         Ok(none_value())
     }
 
-    fn load_dataframe(&self, _state: &State, _args: &[Value]) -> Result<Value, MinijinjaError> {
+    fn load_dataframe(
+        &self,
+        _state: &State,
+        _database: &str,
+        _schema: &str,
+        _table_name: &str,
+        _agate_table: Arc<AgateTable>,
+        _file_path: &str,
+        _field_delimiter: &str,
+    ) -> Result<Value, MinijinjaError> {
         Ok(none_value())
     }
 
@@ -564,7 +605,11 @@ impl BaseAdapter for ParseAdapter {
         Ok(none_value())
     }
 
-    fn describe_relation(&self, _state: &State, _args: &[Value]) -> Result<Value, MinijinjaError> {
+    fn describe_relation(
+        &self,
+        _state: &State,
+        _relation: Arc<dyn BaseRelation>,
+    ) -> Result<Value, MinijinjaError> {
         Ok(none_value())
     }
 
@@ -583,12 +628,18 @@ impl BaseAdapter for ParseAdapter {
     fn quote_as_configured(
         &self,
         _state: &State,
-        _args: &[Value],
+        _identifier: &str,
+        _quote_key: &str,
     ) -> Result<Value, MinijinjaError> {
         Ok(empty_string_value())
     }
 
-    fn quote_seed_column(&self, _state: &State, _args: &[Value]) -> Result<Value, MinijinjaError> {
+    fn quote_seed_column(
+        &self,
+        _state: &State,
+        _column: &str,
+        _quote_config: Option<bool>,
+    ) -> Result<Value, MinijinjaError> {
         Ok(empty_string_value())
     }
 
@@ -747,17 +798,4 @@ impl Object for ParseAdapter {
     ) -> Result<Value, MinijinjaError> {
         dispatch_adapter_calls(&**self, state, name, args, listeners)
     }
-}
-
-/// Make parse factory
-pub fn create_parse_adapter(
-    adapter_type: AdapterType,
-    package_quoting: DbtQuoting,
-    token: CancellationToken,
-) -> FsResult<Arc<dyn BaseAdapter>> {
-    Ok(Arc::new(ParseAdapter::new(
-        adapter_type,
-        package_quoting,
-        token,
-    )))
 }

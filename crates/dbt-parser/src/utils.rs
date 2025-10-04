@@ -11,6 +11,7 @@ use dbt_schemas::schemas::InternalDbtNodeAttributes;
 use dbt_schemas::schemas::common::{DbtMaterialization, ResolvedQuoting, normalize_quoting};
 use dbt_schemas::schemas::project::DefaultTo;
 use dbt_schemas::schemas::properties::ModelProperties;
+use dbt_schemas::schemas::telemetry::NodeType;
 use dbt_schemas::state::DbtPackage;
 use minijinja::ArgSpec;
 use minijinja::compiler::ast::{MacroKind, Stmt};
@@ -33,17 +34,17 @@ pub fn coalesce<T: Clone>(values: Vec<Option<T>>) -> Option<T> {
     None
 }
 
-/// generate the unique id for a model (can be made more extensible for each type of node)
+/// generate the unique id for a dbt resource (can be made more extensible for each type of node)
 pub fn get_unique_id(
-    model_name: &str,
+    resource_name: &str,
     package_name: &str,
     version: Option<String>,
     node_type: &str,
 ) -> String {
     if let Some(version) = version {
-        format!("{node_type}.{package_name}.{model_name}.v{version}")
+        format!("{node_type}.{package_name}.{resource_name}.v{version}")
     } else {
-        format!("{node_type}.{package_name}.{model_name}")
+        format!("{node_type}.{package_name}.{resource_name}")
     }
 }
 
@@ -113,6 +114,12 @@ pub fn get_original_file_path(base_path: &Path, in_dir: &Path, sub_path: &Path) 
     } else {
         sub_path.to_owned()
     }
+}
+
+/// Returns the contents of a file given an original_file_path and in_dir,
+pub fn get_original_file_contents(in_dir: &Path, original_file_path: &PathBuf) -> Option<String> {
+    let absolute_path = in_dir.join(original_file_path);
+    stdfs::read_to_string(&absolute_path).ok()
 }
 
 /// Prepares package dependencies for resolution and sets thread local dependencies.
@@ -327,7 +334,7 @@ pub fn update_node_relation_components(
     adapter_type: AdapterType,
 ) -> FsResult<()> {
     // Source and unit test nodes do not have relation components
-    if ["source", "unit_test"].contains(&node.resource_type()) {
+    if [NodeType::Source, NodeType::UnitTest].contains(&node.resource_type()) {
         return Ok(());
     }
     let (database, schema, alias, relation_name, quoting) = generate_relation_components(
@@ -351,12 +358,12 @@ pub fn update_node_relation_components(
     // Only set relation_name for:
     // - Test nodes with store_failures=true
     // - Nodes that are relational and not ephemeral models
-    if node.resource_type() == "test" {
-        if let Some(store_failures) = components.store_failures {
-            if store_failures {
-                let base_attr = node.base_mut();
-                base_attr.relation_name = Some(relation_name);
-            }
+    if node.resource_type() == NodeType::Test {
+        if let Some(store_failures) = components.store_failures
+            && store_failures
+        {
+            let base_attr = node.base_mut();
+            base_attr.relation_name = Some(relation_name);
         }
     } else {
         // Check if node is relational and not ephemeral
@@ -452,7 +459,9 @@ fn extract_sql_resources_from_ast<T: DefaultTo<T>>(
                     sql_resources.push(SqlResource::Test(macro_name.to_string(), span));
                 }
                 MacroKind::Doc => {
-                    sql_resources.push(SqlResource::Doc(macro_name.to_string(), span));
+                    if let Some(Stmt::EmitRaw(emit_raw)) = macro_node.body.first() {
+                        sql_resources.push(SqlResource::Doc(macro_name.to_string(), emit_raw.span));
+                    }
                 }
                 MacroKind::Snapshot => {
                     sql_resources.push(SqlResource::Snapshot(macro_name.to_string(), span));

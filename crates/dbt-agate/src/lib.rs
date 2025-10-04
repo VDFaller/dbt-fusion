@@ -1,3 +1,5 @@
+#![allow(clippy::let_and_return)]
+
 use core::fmt;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -353,7 +355,7 @@ pub trait MappedSequence {
         let value = self.get_value(key);
         match value {
             Some(value) => value,
-            None => default.cloned().unwrap_or(Value::from(())),
+            None => default.cloned().unwrap_or_else(|| Value::from(())),
         }
     }
 
@@ -409,7 +411,7 @@ pub trait MappedSequence {
                 let keys = self
                     .keys()
                     .map(Value::from_object)
-                    .unwrap_or(Value::from(()));
+                    .unwrap_or_else(|| Value::from(()));
                 Ok(keys)
             }
             "items" => {

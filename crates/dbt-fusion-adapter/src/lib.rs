@@ -7,20 +7,23 @@ mod macros;
 pub mod base_adapter;
 pub mod bridge_adapter;
 pub mod cache;
-pub mod convert_type;
+pub mod column;
+pub mod columns;
 pub mod errors;
 pub mod factory;
 pub mod formatter;
 pub mod funcs;
 pub mod information_schema;
+pub mod metadata;
 pub mod need_quotes;
+pub mod query_comment;
 pub mod query_ctx;
 pub mod record_and_replay;
 pub mod render_constraint;
-pub mod reserved_keywords;
 pub mod response;
 pub mod snapshots;
 pub mod sql_engine;
+pub mod sql_types;
 pub mod stmt_splitter;
 pub mod typed_adapter;
 
@@ -40,8 +43,6 @@ pub use statement::{StmtCancellationReport, TrackedStatement, cancel_all_tracked
 pub mod bigquery;
 /// Databricks adapter
 pub mod databricks;
-/// Metadata adapter
-pub mod metadata;
 /// Parse adapter
 pub mod parse;
 /// Postgres adapter

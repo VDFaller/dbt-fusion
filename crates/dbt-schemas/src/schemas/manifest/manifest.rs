@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use dbt_common::{Span, adapter::AdapterType, io_args::StaticAnalysisKind};
 use dbt_serde_yaml::UntaggedEnumDeserialize;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, str::FromStr as _, sync::Arc};
+use std::{collections::BTreeMap, path::PathBuf, str::FromStr as _, sync::Arc};
 
 // Type aliases for clarity
 type YmlValue = dbt_serde_yaml::Value;
@@ -11,13 +11,16 @@ use crate::{
     dbt_utils::get_dbt_schema_version,
     schemas::{
         CommonAttributes, DbtModel, DbtModelAttr, DbtSeed, DbtSnapshot, DbtSource, DbtTest,
-        DbtUnitTest, DbtUnitTestAttr, IntrospectionKind, NodeBaseAttributes, Nodes,
-        common::{DbtChecksum, DbtMaterialization, DbtQuoting, NodeDependsOn},
+        DbtUnitTest, DbtUnitTestAttr, IntrospectionKind, NodeBaseAttributes, Nodes, TimeSpine,
+        TimeSpinePrimaryColumn,
+        common::{Access, DbtChecksum, DbtMaterialization, DbtQuoting, NodeDependsOn},
         manifest::{
+            ManifestExposure, ManifestGroup, ManifestSavedQuery, ManifestUnitTest,
             manifest_nodes::{
                 ManifestDataTest, ManifestModel, ManifestOperation, ManifestSeed, ManifestSnapshot,
             },
             saved_query::DbtSavedQueryAttr,
+            semantic_model::NodeRelation,
         },
         nodes::{
             AdapterAttr, DbtGroup, DbtGroupAttr, DbtSeedAttr, DbtSnapshotAttr, DbtSourceAttr,
@@ -46,6 +49,7 @@ pub struct ManifestMetadata {
     pub __base__: BaseMetadata,
     #[serde(default)]
     pub project_name: String,
+    /// The MD5 hash of the project name.
     pub project_id: Option<String>,
     pub user_id: Option<String>,
     pub send_anonymous_usage_stats: Option<bool>,
@@ -101,6 +105,8 @@ pub fn serialize_with_resource_type(mut value: YmlValue, resource_type: &str) ->
 pub fn build_manifest(invocation_id: &str, resolver_state: &ResolverState) -> DbtManifest {
     let (parent_map, child_map) = build_parent_and_child_maps(&resolver_state.nodes);
     let group_map = build_group_map(&resolver_state.nodes);
+
+    let disabled = build_disabled_map(resolver_state);
     DbtManifest {
         metadata: ManifestMetadata {
             __base__: BaseMetadata {
@@ -116,13 +122,30 @@ pub fn build_manifest(invocation_id: &str, resolver_state: &ResolverState) -> Db
                 .db_config
                 .adapter_type()
                 .to_string(),
+            project_id: Some(format!(
+                "{:x}",
+                md5::compute(resolver_state.root_project_name.as_bytes())
+            )),
             ..Default::default()
         },
         nodes: resolver_state
             .nodes
             .models
             .iter()
-            .map(|(id, node)| (id.clone(), DbtNode::Model((**node).clone().into())))
+            .map(|(id, node)| {
+                (id.clone(), {
+                    let mut model_node: ManifestModel = (**node).clone().into();
+                    // External public models should not have a path or original_file_path
+                    if model_node.access == Some(Access::Public)
+                        && resolver_state.root_project_name
+                            != model_node.__common_attr__.package_name
+                    {
+                        model_node.__common_attr__.path = PathBuf::new();
+                        model_node.__common_attr__.original_file_path = PathBuf::new();
+                    }
+                    DbtNode::Model(model_node)
+                })
+            })
             .chain(
                 resolver_state
                     .nodes
@@ -176,8 +199,18 @@ pub fn build_manifest(invocation_id: &str, resolver_state: &ResolverState) -> Db
             .iter()
             .map(|(id, exposure)| (id.clone(), (**exposure).clone().into()))
             .collect(),
-        semantic_models: BTreeMap::new(), // TODO: map from resolver_state.nodes
-        metrics: BTreeMap::new(),         // TODO: map from resolver_state.nodes
+        semantic_models: resolver_state
+            .nodes
+            .semantic_models
+            .iter()
+            .map(|(id, semantic_model)| (id.clone(), (**semantic_model).clone().into()))
+            .collect(),
+        metrics: resolver_state
+            .nodes
+            .metrics
+            .iter()
+            .map(|(id, metric)| (id.clone(), (**metric).clone().into()))
+            .collect(),
         saved_queries: resolver_state
             .nodes
             .saved_queries
@@ -197,12 +230,155 @@ pub fn build_manifest(invocation_id: &str, resolver_state: &ResolverState) -> Db
             .iter()
             .map(|(id, group)| (id.clone(), (**group).clone().into()))
             .collect(),
+        selectors: resolver_state.manifest_selectors.clone(),
         docs: resolver_state.macros.docs_macros.clone(),
         parent_map,
         child_map,
         group_map,
-        ..Default::default()
+        disabled,
     }
+}
+
+fn build_disabled_map(resolver_state: &ResolverState) -> BTreeMap<String, Vec<YmlValue>> {
+    let disabled: BTreeMap<String, Vec<YmlValue>> = resolver_state
+        .disabled_nodes
+        .models
+        .iter()
+        .map(|(id, model)| {
+            (
+                id.clone(),
+                vec![
+                    dbt_serde_yaml::to_value(ManifestModel::from((**model).clone()))
+                        .unwrap_or_default(),
+                ],
+            )
+        })
+        .chain(
+            resolver_state
+                .disabled_nodes
+                .tests
+                .iter()
+                .map(|(id, test)| {
+                    (
+                        id.clone(),
+                        vec![
+                            dbt_serde_yaml::to_value(ManifestDataTest::from((**test).clone()))
+                                .unwrap_or_default(),
+                        ],
+                    )
+                }),
+        )
+        .chain(
+            resolver_state
+                .disabled_nodes
+                .snapshots
+                .iter()
+                .map(|(id, snapshot)| {
+                    (
+                        id.clone(),
+                        vec![
+                            dbt_serde_yaml::to_value(ManifestSnapshot::from((**snapshot).clone()))
+                                .unwrap_or_default(),
+                        ],
+                    )
+                }),
+        )
+        .chain(
+            resolver_state
+                .disabled_nodes
+                .seeds
+                .iter()
+                .map(|(id, seed)| {
+                    (
+                        id.clone(),
+                        vec![
+                            dbt_serde_yaml::to_value(ManifestSeed::from((**seed).clone()))
+                                .unwrap_or_default(),
+                        ],
+                    )
+                }),
+        )
+        .chain(
+            resolver_state
+                .disabled_nodes
+                .analyses
+                .iter()
+                .map(|(id, analysis)| {
+                    (
+                        id.clone(),
+                        vec![
+                            dbt_serde_yaml::to_value(ManifestModel::from((**analysis).clone()))
+                                .unwrap_or_default(),
+                        ],
+                    )
+                }),
+        )
+        .chain(
+            resolver_state
+                .disabled_nodes
+                .exposures
+                .iter()
+                .map(|(id, exposure)| {
+                    (
+                        id.clone(),
+                        vec![
+                            dbt_serde_yaml::to_value(ManifestExposure::from((**exposure).clone()))
+                                .unwrap_or_default(),
+                        ],
+                    )
+                }),
+        )
+        .chain(
+            resolver_state
+                .disabled_nodes
+                .saved_queries
+                .iter()
+                .map(|(id, saved_query)| {
+                    (
+                        id.clone(),
+                        vec![
+                            dbt_serde_yaml::to_value(ManifestSavedQuery::from(
+                                (**saved_query).clone(),
+                            ))
+                            .unwrap_or_default(),
+                        ],
+                    )
+                }),
+        )
+        .chain(
+            resolver_state
+                .disabled_nodes
+                .unit_tests
+                .iter()
+                .map(|(id, unit_test)| {
+                    (
+                        id.clone(),
+                        vec![
+                            dbt_serde_yaml::to_value(ManifestUnitTest::from((**unit_test).clone()))
+                                .unwrap_or_default(),
+                        ],
+                    )
+                }),
+        )
+        .chain(
+            resolver_state
+                .disabled_nodes
+                .groups
+                .iter()
+                .map(|(id, group)| {
+                    (
+                        id.clone(),
+                        vec![
+                            dbt_serde_yaml::to_value(ManifestGroup::from((**group).clone()))
+                                .unwrap_or_default(),
+                        ],
+                    )
+                }),
+        )
+        //.chain(resolver_state.disabled_nodes.metrics.iter().map(|(id, metric)| (id.clone(), vec![dbt_serde_yaml::to_value(ManifestMetric::from((**metric).clone())).unwrap_or_default()])))
+        //.chain(resolver_state.disabled_nodes.semantic_models.iter().map(|(id, semantic_model)| (id.clone(), vec![dbt_serde_yaml::to_value(ManifestSemanticModel::from((**semantic_model).clone())).unwrap_or_default()])))
+        .collect();
+    disabled
 }
 
 // Build map of group names to nodes in the group
@@ -272,6 +448,24 @@ fn build_parent_and_child_maps(
         all_nodes.push((id.clone(), unit_test.__base_attr__.depends_on.clone()));
     }
 
+    for (id, semantic_model) in &nodes.semantic_models {
+        all_nodes.push((
+            id.clone(),
+            semantic_model.__semantic_model_attr__.depends_on.clone(),
+        ));
+    }
+
+    for (id, metric) in &nodes.metrics {
+        all_nodes.push((id.clone(), metric.__metric_attr__.depends_on.clone()));
+    }
+
+    for (id, saved_query) in &nodes.saved_queries {
+        all_nodes.push((
+            id.clone(),
+            saved_query.__saved_query_attr__.depends_on.clone(),
+        ));
+    }
+
     // Process all collected nodes
     for (node_id, depends_on) in all_nodes {
         // Initialize parent list for this node
@@ -318,87 +512,12 @@ fn build_parent_and_child_maps(
 pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -> Nodes {
     let mut nodes = Nodes::default();
     // Do not put disabled nodes into the nodes, because all things in Nodes object should be enabled.
-    for (unique_id, node) in manifest.nodes {
+    for (unique_id, node) in manifest.nodes.clone() {
         match node {
             DbtNode::Model(model) => {
                 nodes.models.insert(
                     unique_id,
-                    Arc::new(DbtModel {
-                        __common_attr__: CommonAttributes {
-                            unique_id: model.__common_attr__.unique_id,
-                            name: model.__common_attr__.name,
-                            name_span: Span::default(),
-                            package_name: model.__common_attr__.package_name,
-                            path: model.__common_attr__.path,
-                            original_file_path: model.__common_attr__.original_file_path,
-                            patch_path: model.__common_attr__.patch_path,
-                            fqn: model.__common_attr__.fqn,
-                            description: model.__common_attr__.description,
-                            raw_code: model.__base_attr__.raw_code,
-                            checksum: model.__base_attr__.checksum,
-                            language: model.__base_attr__.language,
-                            tags: model
-                                .config
-                                .tags
-                                .clone()
-                                .map(|tags| tags.into())
-                                .unwrap_or_default(),
-                            meta: model.config.meta.clone().unwrap_or_default(),
-                        },
-                        __base_attr__: NodeBaseAttributes {
-                            database: model.__common_attr__.database,
-                            schema: model.__common_attr__.schema,
-                            alias: model.__base_attr__.alias,
-                            relation_name: model.__base_attr__.relation_name,
-                            materialized: model
-                                .config
-                                .materialized
-                                .clone()
-                                .unwrap_or(DbtMaterialization::View),
-                            static_analysis: StaticAnalysisKind::On,
-                            enabled: model.config.enabled.unwrap_or(true),
-                            extended_model: false,
-                            quoting: model
-                                .config
-                                .quoting
-                                .map(|mut quoting| {
-                                    quoting.default_to(&dbt_quoting);
-                                    quoting
-                                })
-                                .unwrap_or(dbt_quoting)
-                                .try_into()
-                                .expect("DbtQuoting should be set"),
-                            quoting_ignore_case: false,
-                            persist_docs: model.config.persist_docs.clone(),
-                            columns: model.__base_attr__.columns,
-                            depends_on: model.__base_attr__.depends_on,
-                            refs: model.__base_attr__.refs,
-                            sources: model.__base_attr__.sources,
-                            metrics: model.__base_attr__.metrics,
-                        },
-                        __model_attr__: DbtModelAttr {
-                            access: model.config.access.clone().unwrap_or_default(),
-                            group: model.config.group.clone(),
-                            contract: model.config.contract.clone(),
-                            incremental_strategy: model.config.incremental_strategy.clone(),
-                            freshness: model.config.freshness.clone(),
-                            introspection: IntrospectionKind::None,
-                            version: model.version,
-                            latest_version: model.latest_version,
-                            constraints: model.constraints.unwrap_or_default(),
-                            deprecation_date: model.deprecation_date,
-                            primary_key: model.primary_key.unwrap_or_default(),
-                            time_spine: model.time_spine,
-                            event_time: model.config.event_time.clone(),
-                        },
-                        __adapter_attr__: AdapterAttr::from_config_and_dialect(
-                            &model.config.__warehouse_specific_config__,
-                            AdapterType::from_str(&manifest.metadata.adapter_type)
-                                .expect("Unknown or unsupported adapter type"),
-                        ),
-                        deprecated_config: model.config,
-                        __other__: model.__other__,
-                    }),
+                    Arc::new(manifest_model_to_dbt_model(model, &manifest, dbt_quoting)),
                 );
             }
             DbtNode::Test(test) => {
@@ -434,6 +553,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                             relation_name: test.__base_attr__.relation_name,
                             materialized: DbtMaterialization::Test,
                             static_analysis: StaticAnalysisKind::On,
+                            static_analysis_off_reason: None,
                             enabled: test.config.enabled.unwrap_or(true),
                             extended_model: false,
                             quoting: test
@@ -503,6 +623,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                                 .clone()
                                 .unwrap_or(DbtMaterialization::Table),
                             static_analysis: StaticAnalysisKind::On,
+                            static_analysis_off_reason: None,
                             quoting: snapshot
                                 .config
                                 .quoting
@@ -528,6 +649,11 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                                 .clone()
                                 .unwrap_or_default(),
                         },
+                        __adapter_attr__: AdapterAttr::from_config_and_dialect(
+                            &snapshot.config.__warehouse_specific_config__,
+                            AdapterType::from_str(&manifest.metadata.adapter_type)
+                                .expect("Unknown or unsupported adapter type"),
+                        ),
                         deprecated_config: snapshot.config,
                         compiled: snapshot.__base_attr__.compiled,
                         compiled_code: snapshot.__base_attr__.compiled_code,
@@ -567,6 +693,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                             relation_name: seed.__base_attr__.relation_name,
                             materialized: DbtMaterialization::Table,
                             static_analysis: StaticAnalysisKind::On,
+                            static_analysis_off_reason: None,
                             enabled: seed.config.enabled.unwrap_or(true),
                             quoting: seed
                                 .config
@@ -602,82 +729,11 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
             DbtNode::Analysis(analysis) => {
                 nodes.analyses.insert(
                     unique_id,
-                    Arc::new(DbtModel {
-                        __common_attr__: CommonAttributes {
-                            unique_id: analysis.__common_attr__.unique_id,
-                            name: analysis.__common_attr__.name,
-                            package_name: analysis.__common_attr__.package_name,
-                            path: analysis.__common_attr__.path,
-                            name_span: Span::default(),
-                            original_file_path: analysis.__common_attr__.original_file_path,
-                            patch_path: analysis.__common_attr__.patch_path,
-                            fqn: analysis.__common_attr__.fqn,
-                            description: analysis.__common_attr__.description,
-                            raw_code: analysis.__base_attr__.raw_code,
-                            checksum: analysis.__base_attr__.checksum,
-                            language: analysis.__base_attr__.language,
-                            tags: analysis
-                                .config
-                                .tags
-                                .clone()
-                                .map(|tags| tags.into())
-                                .unwrap_or_default(),
-                            meta: analysis.config.meta.clone().unwrap_or_default(),
-                        },
-                        __base_attr__: NodeBaseAttributes {
-                            database: analysis.__common_attr__.database,
-                            schema: analysis.__common_attr__.schema,
-                            alias: analysis.__base_attr__.alias,
-                            relation_name: analysis.__base_attr__.relation_name,
-                            materialized: analysis
-                                .config
-                                .materialized
-                                .clone()
-                                .unwrap_or(DbtMaterialization::View),
-                            static_analysis: StaticAnalysisKind::On,
-                            enabled: analysis.config.enabled.unwrap_or(true),
-                            extended_model: false,
-                            quoting: analysis
-                                .config
-                                .quoting
-                                .map(|mut quoting| {
-                                    quoting.default_to(&dbt_quoting);
-                                    quoting
-                                })
-                                .unwrap_or(dbt_quoting)
-                                .try_into()
-                                .expect("DbtQuoting should be set"),
-                            quoting_ignore_case: false,
-                            persist_docs: analysis.config.persist_docs.clone(),
-                            columns: analysis.__base_attr__.columns,
-                            depends_on: analysis.__base_attr__.depends_on,
-                            refs: analysis.__base_attr__.refs,
-                            sources: analysis.__base_attr__.sources,
-                            metrics: analysis.__base_attr__.metrics,
-                        },
-                        __model_attr__: DbtModelAttr {
-                            access: analysis.config.access.clone().unwrap_or_default(),
-                            group: analysis.config.group.clone(),
-                            contract: analysis.config.contract.clone(),
-                            incremental_strategy: analysis.config.incremental_strategy.clone(),
-                            freshness: analysis.config.freshness.clone(),
-                            introspection: IntrospectionKind::None,
-                            version: analysis.version,
-                            latest_version: analysis.latest_version,
-                            constraints: analysis.constraints.unwrap_or_default(),
-                            deprecation_date: analysis.deprecation_date,
-                            primary_key: analysis.primary_key.unwrap_or_default(),
-                            time_spine: analysis.time_spine,
-                            event_time: analysis.config.event_time.clone(),
-                        },
-                        __adapter_attr__: AdapterAttr::from_config_and_dialect(
-                            &analysis.config.__warehouse_specific_config__,
-                            AdapterType::from_str(&manifest.metadata.adapter_type)
-                                .expect("Unknown or unsupported adapter type"),
-                        ),
-                        deprecated_config: analysis.config,
-                        __other__: analysis.__other__,
-                    }),
+                    Arc::new(manifest_model_to_dbt_model(
+                        analysis,
+                        &manifest,
+                        dbt_quoting,
+                    )),
                 );
             }
         }
@@ -714,6 +770,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                     relation_name: source.relation_name,
                     materialized: DbtMaterialization::Table,
                     static_analysis: StaticAnalysisKind::On,
+                    static_analysis_off_reason: None,
                     enabled: source.config.enabled.unwrap_or(true),
                     extended_model: false,
                     quoting: source
@@ -775,6 +832,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                     quoting: Default::default(),
                     materialized: Default::default(),
                     static_analysis: Default::default(),
+                    static_analysis_off_reason: None,
                     enabled: true,
                     extended_model: false,
                     persist_docs: None,
@@ -830,6 +888,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                     relation_name: unit_test.__base_attr__.relation_name,
                     materialized: DbtMaterialization::Table,
                     static_analysis: StaticAnalysisKind::On,
+                    static_analysis_off_reason: None,
                     quoting: dbt_quoting.try_into().expect("DbtQuoting should be set"),
                     quoting_ignore_case: false,
                     enabled: unit_test.config.enabled.unwrap_or(true),
@@ -849,6 +908,10 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                     version: unit_test.version,
                     overrides: unit_test.overrides,
                 },
+                field_event_status: unit_test.field_event_status,
+                field_pre_injected_sql: unit_test.field_pre_injected_sql,
+                tested_node_unique_id: unit_test.tested_node_unique_id,
+                this_input_node_unique_id: unit_test.this_input_node_unique_id,
                 deprecated_config: unit_test.config,
             }),
         );
@@ -928,6 +991,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                     quoting: Default::default(),
                     materialized: Default::default(),
                     static_analysis: Default::default(),
+                    static_analysis_off_reason: None,
                     enabled: true,
                     extended_model: false,
                     persist_docs: None,
@@ -943,6 +1007,113 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
         );
     }
     nodes
+}
+
+/// Convert a ManifestModel to a DbtModel.
+/// Inverse of From<DbtModel> for ManifestModel.
+pub fn manifest_model_to_dbt_model(
+    model: ManifestModel,
+    manifest: &DbtManifest,
+    dbt_quoting: DbtQuoting,
+) -> DbtModel {
+    let database = model.__common_attr__.database;
+    let schema = model.__common_attr__.schema;
+    let alias = model.__base_attr__.alias;
+    let relation_name = model.__base_attr__.relation_name;
+
+    let node_relation = NodeRelation {
+        database: Some(database.clone()),
+        schema_name: schema.clone(),
+        alias: alias.clone(),
+        relation_name: relation_name.clone(),
+    };
+
+    let time_spine = model.time_spine.map(|ts| TimeSpine {
+        node_relation,
+        primary_column: TimeSpinePrimaryColumn {
+            name: ts.standard_granularity_column,
+            time_granularity: Default::default(), // TODO: hydrate time_granularity by looking up the column's granularity, not sure if available in manifest.
+        },
+        custom_granularities: ts.custom_granularities.unwrap_or_default(),
+    });
+
+    DbtModel {
+        __common_attr__: CommonAttributes {
+            unique_id: model.__common_attr__.unique_id,
+            name: model.__common_attr__.name,
+            package_name: model.__common_attr__.package_name,
+            path: model.__common_attr__.path,
+            name_span: Span::default(),
+            original_file_path: model.__common_attr__.original_file_path,
+            patch_path: model.__common_attr__.patch_path,
+            fqn: model.__common_attr__.fqn,
+            description: model.__common_attr__.description,
+            raw_code: model.__base_attr__.raw_code,
+            checksum: model.__base_attr__.checksum,
+            language: model.__base_attr__.language,
+            tags: model
+                .config
+                .tags
+                .clone()
+                .map(|tags| tags.into())
+                .unwrap_or_default(),
+            meta: model.config.meta.clone().unwrap_or_default(),
+        },
+        __base_attr__: NodeBaseAttributes {
+            database,
+            schema,
+            alias,
+            relation_name,
+            materialized: model
+                .config
+                .materialized
+                .clone()
+                .unwrap_or(DbtMaterialization::View),
+            static_analysis: StaticAnalysisKind::On,
+            static_analysis_off_reason: None,
+            enabled: model.config.enabled.unwrap_or(true),
+            extended_model: false,
+            quoting: model
+                .config
+                .quoting
+                .map(|mut quoting| {
+                    quoting.default_to(&dbt_quoting);
+                    quoting
+                })
+                .unwrap_or(dbt_quoting)
+                .try_into()
+                .expect("DbtQuoting should be set"),
+            quoting_ignore_case: false,
+            persist_docs: model.config.persist_docs.clone(),
+            columns: model.__base_attr__.columns,
+            depends_on: model.__base_attr__.depends_on,
+            refs: model.__base_attr__.refs,
+            sources: model.__base_attr__.sources,
+            metrics: model.__base_attr__.metrics,
+        },
+        __model_attr__: DbtModelAttr {
+            access: model.config.access.clone().unwrap_or_default(),
+            group: model.config.group.clone(),
+            contract: model.config.contract.clone(),
+            incremental_strategy: model.config.incremental_strategy.clone(),
+            freshness: model.config.freshness.clone(),
+            introspection: IntrospectionKind::None,
+            version: model.version,
+            latest_version: model.latest_version,
+            constraints: model.constraints.unwrap_or_default(),
+            deprecation_date: model.deprecation_date,
+            primary_key: model.primary_key.unwrap_or_default(),
+            time_spine,
+            event_time: model.config.event_time.clone(),
+        },
+        __adapter_attr__: AdapterAttr::from_config_and_dialect(
+            &model.config.__warehouse_specific_config__,
+            AdapterType::from_str(&manifest.metadata.adapter_type)
+                .expect("Unknown or unsupported adapter type"),
+        ),
+        deprecated_config: model.config,
+        __other__: model.__other__,
+    }
 }
 
 #[cfg(test)]

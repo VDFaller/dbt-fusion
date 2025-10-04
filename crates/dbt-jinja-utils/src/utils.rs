@@ -170,7 +170,7 @@ pub async fn inject_and_persist_ephemeral_models(
         pos += start + DBT_CTE_PREFIX.len();
         let name_end = final_sql[pos..]
             .find(|c: char| !c.is_alphanumeric() && c != '_')
-            .unwrap_or(final_sql[pos..].len());
+            .unwrap_or_else(|| final_sql[pos..].len());
         let model_name = &final_sql[pos..pos + name_end];
         // Only add if not already seen
         if !ephemeral_model_names.contains(&model_name.to_string()) {
@@ -210,7 +210,9 @@ pub async fn inject_and_persist_ephemeral_models(
 
     // Wrap the current SQL in a subquery and prepend CTEs
     let ctes = all_ctes.join(", ");
-    final_sql = format!("with {ctes}\n\nselect * from (\n{final_sql}\n)");
+    final_sql = format!(
+        "with {ctes}\n--EPHEMERAL-SELECT-WRAPPER-START\nselect * from (\n{final_sql}\n--EPHEMERAL-SELECT-WRAPPER-END\n)"
+    );
     // Shift expanded macro spans down by number of added lines and added offet
     // for the "with ... select * from (" line, and the CTEs
     let added_lines = ctes.lines().count() + 2;
@@ -286,7 +288,7 @@ pub fn get_method(args: &[Value], map: &BTreeMap<String, Value>) -> Result<Value
     let name: String = args.get("name")?;
     let default = args
         .get_optional::<Value>("default")
-        .unwrap_or(Value::from(""));
+        .unwrap_or_else(|| Value::from(""));
 
     Ok(match map.get(&name) {
         Some(val) if !val.is_none() => val.clone(),
@@ -297,15 +299,18 @@ pub fn get_method(args: &[Value], map: &BTreeMap<String, Value>) -> Result<Value
 /// Get catalog by relations for project
 pub fn get_catalog_by_relations(
     env: &JinjaEnv,
+    catalog_macro_name: &str,
     root_project_name: &str,
     current_project_name: &str,
     base_ctx: &BTreeMap<String, Value>,
     args: &[Value],
 ) -> FsResult<Value> {
-    // let macro_name = format!("get_catalog_relations");
-    let macro_name = "get_catalog_relations";
-    let template_name =
-        find_macro_template(env, macro_name, root_project_name, current_project_name)?;
+    let template_name = find_macro_template(
+        env,
+        catalog_macro_name,
+        root_project_name,
+        current_project_name,
+    )?;
 
     // Create a state object for rendering
     let template = env.get_template(&template_name)?;
@@ -315,7 +320,7 @@ pub fn get_catalog_by_relations(
 
     // Call the macro
     let result = new_state
-        .call_macro_raw(macro_name, args, &[])
+        .call_macro_raw(catalog_macro_name, args, &[])
         .map_err(|err| {
             Box::new(FsError::from_jinja_err(
                 err,
@@ -336,10 +341,10 @@ pub fn find_macro_template(
     let cache_key = (current_project_name.to_string(), macro_name.to_string());
 
     // Check cache first - return early if found
-    if let Ok(cache) = TEMPLATE_CACHE.lock() {
-        if let Some(template) = cache.get(&cache_key) {
-            return Ok(template.clone());
-        }
+    if let Ok(cache) = TEMPLATE_CACHE.lock()
+        && let Some(template) = cache.get(&cache_key)
+    {
+        return Ok(template.clone());
     }
     // First try - check the current project
     let template_name = format!("{current_project_name}.{macro_name}");
@@ -406,7 +411,7 @@ pub fn generate_component_name(
     // Build the args
     let mut args = custom_name
         .map(|name| vec![Value::from(name)])
-        .unwrap_or(vec![Value::from(())]); // If no custom name, pass in none so the macro reads from the target context
+        .unwrap_or_else(|| vec![Value::from(())]); // If no custom name, pass in none so the macro reads from the target context
     if let Some(node) = node {
         args.push(Value::from_serialize(node.serialize()));
     }

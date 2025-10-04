@@ -20,6 +20,7 @@ use dbt_common::cancellation::CancellationToken;
 use dbt_common::error::AbstractLocation;
 use dbt_common::fs_err;
 use dbt_common::io_args::StaticAnalysisKind;
+use dbt_common::io_args::StaticAnalysisOffReason;
 use dbt_common::show_error;
 use dbt_common::show_warning;
 use dbt_jinja_utils::jinja_environment::JinjaEnv;
@@ -28,8 +29,11 @@ use dbt_jinja_utils::utils::dependency_package_name_from_ctx;
 use dbt_schemas::schemas::CommonAttributes;
 use dbt_schemas::schemas::DbtModel;
 use dbt_schemas::schemas::DbtModelAttr;
+use dbt_schemas::schemas::InternalDbtNodeAttributes;
 use dbt_schemas::schemas::IntrospectionKind;
 use dbt_schemas::schemas::NodeBaseAttributes;
+use dbt_schemas::schemas::TimeSpine;
+use dbt_schemas::schemas::TimeSpinePrimaryColumn;
 use dbt_schemas::schemas::common::DbtMaterialization;
 use dbt_schemas::schemas::common::DbtQuoting;
 use dbt_schemas::schemas::common::ModelFreshnessRules;
@@ -39,6 +43,7 @@ use dbt_schemas::schemas::dbt_column::ColumnInheritanceRules;
 use dbt_schemas::schemas::dbt_column::ColumnProperties;
 use dbt_schemas::schemas::dbt_column::DbtColumnRef;
 use dbt_schemas::schemas::dbt_column::process_columns;
+use dbt_schemas::schemas::manifest::semantic_model::NodeRelation;
 use dbt_schemas::schemas::nodes::AdapterAttr;
 use dbt_schemas::schemas::project::DbtProject;
 use dbt_schemas::schemas::project::ModelConfig;
@@ -57,16 +62,20 @@ use std::sync::Arc;
 
 use super::resolve_properties::MinimalPropertiesEntry;
 use super::resolve_tests::persist_generic_data_tests::TestableNodeTrait;
+use super::validate_models::validate_model;
 
-#[allow(clippy::cognitive_complexity)]
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::cognitive_complexity,
+    clippy::expect_fun_call,
+    clippy::too_many_arguments
+)]
 pub async fn resolve_models(
     arg: &ResolveArgs,
     package: &DbtPackage,
     package_quoting: DbtQuoting,
     root_project: &DbtProject,
     root_project_configs: &RootProjectConfigs,
-    model_properties: &mut BTreeMap<String, MinimalPropertiesEntry>,
+    models_properties: &mut BTreeMap<String, MinimalPropertiesEntry>,
     database: &str,
     schema: &str,
     adapter_type: AdapterType,
@@ -126,13 +135,34 @@ pub async fn resolve_models(
         runtime_config: runtime_config.clone(),
     };
 
+    // HACK: strip semantic resources out of all model properties
+    // this is because semantic resources have fields that have jinja expressions
+    // but should not be rendered (they are hydrated verbatim in manifest.json)
+    //
+    // This is a hack because we treat models and models.metrics differently in an attempt
+    // for only-once parsing of model yaml properties in resolver.rs, which duplicates the knowledge
+    // that you must treat them separately, such as the removal of semantic properties here.
+    let mut models_properties_sans_semantics: BTreeMap<String, MinimalPropertiesEntry> =
+        BTreeMap::new();
+    models_properties.iter().for_each(|(model_key, v)| {
+        let mut v = v.clone();
+        if let Some(m) = v.schema_value.as_mapping_mut() {
+            // NOTE: do not remove derived_semantics not because it has jinja
+            // but because we want to report any yaml errors that we didn't
+            // show in resolve_inner's parsing of model yaml properties
+            m.remove("metrics");
+        }
+
+        models_properties_sans_semantics.insert(model_key.clone(), v);
+    });
+
     let mut model_sql_resources_map: Vec<SqlFileRenderResult<ModelConfig, ModelProperties>> =
         // FIXME -- this attempts to deserialize the model properties
         // and renders jinja but we shouldn't be doing so with metrics.filter
         render_unresolved_sql_files::<ModelConfig, ModelProperties>(
             &render_ctx,
             &package.model_sql_files,
-            model_properties,
+            &mut models_properties_sans_semantics,
             token,
         )
         .await?;
@@ -161,20 +191,35 @@ pub async fn resolve_models(
         let ref_name = dbt_asset.path.file_stem().unwrap().to_str().unwrap();
         // Is there a better way to handle this if the model doesn't have a config?
         let mut model_config = *sql_file_info.config;
+        // Default to View if no materialized is set
         if model_config.materialized.is_none() {
             model_config.materialized = Some(DbtMaterialization::View);
         }
+        // Set to Inline if this is the inline file
+        let is_inline_file = package
+            .inline_file
+            .as_ref()
+            .map(|inline_file| inline_file == &dbt_asset)
+            .unwrap_or(false);
+        if is_inline_file {
+            model_config.materialized = Some(DbtMaterialization::Inline);
+        }
 
-        let model_name = model_properties
+        let mut model_name = models_properties_sans_semantics
             .get(ref_name)
             .map(|mpe| mpe.name.clone())
             .unwrap_or_else(|| ref_name.to_owned());
 
-        let maybe_version = model_properties
+        if is_inline_file {
+            // Inline nodes should present a stable name for logging and manifest output
+            model_name = "inline".to_owned();
+        }
+
+        let maybe_version = models_properties_sans_semantics
             .get(ref_name)
             .and_then(|mpe| mpe.version_info.as_ref().map(|v| v.version.clone()));
 
-        let maybe_latest_version = model_properties
+        let maybe_latest_version = models_properties_sans_semantics
             .get(ref_name)
             .and_then(|mpe| mpe.version_info.as_ref().map(|v| v.latest_version.clone()));
 
@@ -227,6 +272,24 @@ pub async fn resolve_models(
         } else {
             ModelProperties::empty(model_name.to_owned())
         };
+
+        // Validate model properties (versions, time spine, etc.)
+        match validate_model(&properties) {
+            Ok(errors) => {
+                if !errors.is_empty() {
+                    // Show each error individually
+                    for error in errors {
+                        show_error!(&arg.io, Box::new(error));
+                    }
+                    continue;
+                }
+            }
+            Err(e) => {
+                show_error!(&arg.io, e);
+                continue;
+            }
+        }
+
         let model_constraints = properties.constraints.clone().unwrap_or_default();
 
         // Iterate over metrics and construct the dependencies
@@ -260,6 +323,41 @@ pub async fn resolve_models(
             ModelFreshnessRules::validate(freshness.build_after.as_ref())?;
         }
 
+        let static_analysis = model_config
+            .static_analysis
+            .unwrap_or(StaticAnalysisKind::On);
+
+        // Hydrate time_spine from model properties
+        let mut time_spine: Option<TimeSpine> = None;
+        if let Some(props_time_spine) = properties.time_spine.clone() {
+            let standard_granularity_column_dimension = properties.columns.clone().unwrap_or_default()
+                .into_iter()
+                .find(|d| {
+                    d.name == props_time_spine.standard_granularity_column.clone()
+                }).expect(&format!("Cannot find standard granularity column '{}'. There should have been a validation error.", props_time_spine.standard_granularity_column));
+
+            let primary_column = TimeSpinePrimaryColumn {
+                name: props_time_spine.standard_granularity_column.clone(),
+                time_granularity: standard_granularity_column_dimension
+                    .granularity
+                    .unwrap_or_default(),
+            };
+
+            // Create a temporary node_relation for the time_spine
+            let node_relation = NodeRelation {
+                database: Some(database.to_string()),
+                schema_name: schema.to_string(),
+                alias: model_name.to_string(), // will be updated after relation components are resolved
+                relation_name: None,
+            };
+
+            time_spine = Some(TimeSpine {
+                node_relation,
+                primary_column,
+                custom_granularities: props_time_spine.custom_granularities.unwrap_or_default(),
+            });
+        }
+
         // Create the DbtModel with all properties already set
         let mut dbt_model = DbtModel {
             __common_attr__: CommonAttributes {
@@ -276,8 +374,10 @@ pub async fn resolve_models(
                     .clone()
                     .or_else(|| properties.description.clone()),
                 checksum: sql_file_info.checksum.clone(),
+                // NOTE: raw_code has to be this value for dbt-evaluator to return truthy
+                // hydrating it with get_original_file_contents would actually break dbt-evaluator
                 raw_code: Some("--placeholder--".to_string()),
-                language: Some("sql".to_string()),
+                language: Some("sql".to_string()), // TODO: are python models supported?
                 tags: model_config
                     .tags
                     .clone()
@@ -332,9 +432,9 @@ pub async fn resolve_models(
                     .unwrap_or_default()
                     .snowflake_ignore_case
                     .unwrap_or(false),
-                static_analysis: model_config
-                    .static_analysis
-                    .unwrap_or(StaticAnalysisKind::On),
+                static_analysis_off_reason: matches!(static_analysis, StaticAnalysisKind::Off)
+                    .then(|| StaticAnalysisOffReason::ConfiguredOff),
+                static_analysis,
             },
             __model_attr__: DbtModelAttr {
                 introspection: IntrospectionKind::None,
@@ -343,7 +443,7 @@ pub async fn resolve_models(
                 constraints: model_constraints,
                 deprecation_date: None,
                 primary_key: vec![],
-                time_spine: None,
+                time_spine,
                 access: model_config.access.clone().unwrap_or_default(),
                 group: model_config.group.clone(),
                 contract: model_config.contract.clone(),
@@ -377,6 +477,23 @@ pub async fn resolve_models(
             &components,
             adapter_type,
         )?;
+
+        // Update time_spine node_relation with the resolved relation components
+        if dbt_model.__model_attr__.time_spine.is_some() {
+            let database = dbt_model.database();
+            let schema = dbt_model.schema();
+            let alias = dbt_model.alias();
+            let relation_name = dbt_model.__base_attr__.relation_name.clone();
+
+            if let Some(ref mut ts) = dbt_model.__model_attr__.time_spine {
+                ts.node_relation = NodeRelation {
+                    database: Some(database),
+                    schema_name: schema,
+                    alias,
+                    relation_name,
+                };
+            }
+        }
         match refs_and_sources.insert_ref(&dbt_model, adapter_type, status, false) {
             Ok(_) => (),
             Err(e) => {
@@ -412,7 +529,7 @@ pub async fn resolve_models(
         }
     }
 
-    for (model_name, mpe) in model_properties.iter() {
+    for (model_name, mpe) in models_properties_sans_semantics.iter() {
         // Skip until we support better error messages for versioned models
         if mpe.version_info.is_some() {
             continue;
@@ -481,40 +598,37 @@ fn process_versioned_columns(
     columns: BTreeMap<String, DbtColumnRef>,
 ) -> Result<BTreeMap<String, DbtColumnRef>, Box<dbt_common::FsError>> {
     for version in versions.iter() {
-        if maybe_version.is_some_and(|v| Some(v) == version.get_version().as_ref()) {
-            if let Some(column_props) = version.__additional_properties__.get("columns") {
-                let column_map: Vec<ColumnProperties> = column_props
-                    .as_sequence()
-                    .map(|cols| {
-                        cols.iter()
-                            .filter_map(|col| col.as_mapping())
-                            .filter(|map| {
-                                !(map.contains_key("include") || map.contains_key("exclude"))
-                            })
-                            .filter_map(|map| {
-                                dbt_serde_yaml::from_value::<ColumnProperties>(map.clone().into())
-                                    .ok()
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
+        if maybe_version.is_some_and(|v| Some(v) == version.get_version().as_ref())
+            && let Some(column_props) = version.__additional_properties__.get("columns")
+        {
+            let column_map: Vec<ColumnProperties> = column_props
+                .as_sequence()
+                .map(|cols| {
+                    cols.iter()
+                        .filter_map(|col| col.as_mapping())
+                        .filter(|map| !(map.contains_key("include") || map.contains_key("exclude")))
+                        .filter_map(|map| {
+                            dbt_serde_yaml::from_value::<ColumnProperties>(map.clone().into()).ok()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
 
-                let mut versioned_columns = process_columns(
-                    Some(&column_map),
-                    model_config.meta.clone(),
-                    model_config.tags.clone().map(|tags| tags.into()),
-                )?;
+            let mut versioned_columns = process_columns(
+                Some(&column_map),
+                model_config.meta.clone(),
+                model_config.tags.clone().map(|tags| tags.into()),
+            )?;
 
-                if let Some(rules) = ColumnInheritanceRules::from_version_columns(column_props) {
-                    columns
-                        .iter()
-                        .filter(|(name, _)| rules.should_include_column(name))
-                        .for_each(|(name, col)| {
-                            versioned_columns.insert(name.clone(), col.clone());
-                        });
-                }
-                return Ok(versioned_columns);
+            if let Some(rules) = ColumnInheritanceRules::from_version_columns(column_props) {
+                columns
+                    .iter()
+                    .filter(|(name, _)| rules.should_include_column(name))
+                    .for_each(|(name, col)| {
+                        versioned_columns.insert(name.clone(), col.clone());
+                    });
             }
+            return Ok(versioned_columns);
         }
     }
 

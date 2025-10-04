@@ -154,7 +154,9 @@ pub fn build_cfg(code: &[Instruction]) -> CFG {
 
     // 1. Identify block leaders (start of each basic block)
     let mut leaders: BTreeSet<usize> = BTreeSet::new();
-    leaders.insert(0);
+    if !code.is_empty() {
+        leaders.insert(0);
+    }
     for (index, instruction) in code.iter().enumerate() {
         for (target, kind) in branch_targets(index, instruction) {
             if !matches!(kind, FallThrough) && target < code.len() {
@@ -178,7 +180,7 @@ pub fn build_cfg(code: &[Instruction]) -> CFG {
         };
         // Find macro name for this block, if any (only at block start)
         let cur_macro_and_span = match code.get(start) {
-            Some(Instruction::MacroName(name, span)) => Some((name.to_string(), span)),
+            Some(Instruction::MacroName(name, span)) => Some(((*name).to_string(), span)),
             _ => None,
         };
         blocks.push(BasicBlock {
@@ -200,7 +202,7 @@ pub fn build_cfg(code: &[Instruction]) -> CFG {
     let mut macro_entries = Vec::new();
     for (i, block) in blocks.iter().enumerate() {
         if let Some(Instruction::MacroName(name, _)) = code.get(block.start) {
-            macro_entries.push((i, name.to_string()));
+            macro_entries.push((i, (*name).to_string()));
         }
     }
 

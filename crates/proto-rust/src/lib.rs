@@ -1,3 +1,10 @@
+// Various manual trait impls and utilities for working with the generated proto code.
+pub mod impls;
+pub mod macros;
+mod static_full_name;
+
+pub use static_full_name::StaticName;
+
 #[allow(
     clippy::cognitive_complexity,
     clippy::large_enum_variant,
@@ -13,6 +20,39 @@ pub mod v1 {
     pub mod public {
         pub mod events {
             pub mod fusion {
+                pub mod compat {
+                    include!("gen/v1.public.events.fusion.compat.rs");
+                }
+                pub mod dev {
+                    include!("gen/v1.public.events.fusion.dev.rs");
+                }
+                pub mod onboarding {
+                    include!("gen/v1.public.events.fusion.onboarding.rs");
+                }
+                pub mod phase {
+                    include!("gen/v1.public.events.fusion.phase.rs");
+                }
+                pub mod invocation {
+                    include!("gen/v1.public.events.fusion.invocation.rs");
+                }
+                pub mod log {
+                    include!("gen/v1.public.events.fusion.log.rs");
+                }
+                pub mod artifact {
+                    include!("gen/v1.public.events.fusion.artifact.rs");
+                }
+                pub mod node {
+                    include!("gen/v1.public.events.fusion.node.rs");
+                }
+                pub mod process {
+                    include!("gen/v1.public.events.fusion.process.rs");
+                }
+                pub mod query {
+                    include!("gen/v1.public.events.fusion.query.rs");
+                }
+                pub mod update {
+                    include!("gen/v1.public.events.fusion.update.rs");
+                }
                 include!("gen/v1.public.events.fusion.rs");
             }
         }
@@ -20,36 +60,14 @@ pub mod v1 {
             pub mod adapter_types {
                 include!("gen/v1.public.fields.adapter_types.rs");
             }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use prost::Name;
-
-    // We only enable reflection for the public protobuf events.
-    static PUBLIC_DESCRIPTOR_POOL: &[u8] = include_bytes!("gen/dbtlabs_proto.bin");
-
-    #[test]
-    /// Test for presence of adapter events
-    fn test_adapter_events() {
-        let pool = prost_reflect::DescriptorPool::decode(PUBLIC_DESCRIPTOR_POOL).unwrap();
-
-        let file_descriptor = pool.get_message_by_name(
-            crate::v1::public::fields::adapter_types::SqlQueryStatus::type_url()
-                .split("/")
-                .last()
-                .unwrap(),
-        );
-
-        println!("file_descriptor = {file_descriptor:?}");
-
-        if let Some(file_descriptor) = file_descriptor {
-            let extensions = file_descriptor.extensions();
-            for extension in extensions {
-                println!("extension = {extension:?}");
+            pub mod core_types {
+                include!("gen/v1.public.fields.core_types.rs");
             }
         }
     }
 }
+
+// Test-only utilities for enumerating proto message types.
+// Available in this crate's tests or when dependents opt-in via feature.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_utils;

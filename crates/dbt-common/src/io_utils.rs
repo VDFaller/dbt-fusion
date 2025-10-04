@@ -1,5 +1,6 @@
 use crate::stdfs::File;
 use crate::{ErrorCode, FsError, FsResult, err, fs_err, stdfs::canonicalize};
+use dbt_telemetry::{ExecutionPhase, NodeOutcome, NodeSkipReason};
 use pathdiff::diff_paths;
 use std::{
     any::Any,
@@ -9,36 +10,22 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Represents the different phases of node processing
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ProcessingPhase {
-    Render,
-    Analyze,
-}
-
-/// Represents the status of a completed phase
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PhaseStatus {
-    Succeeded,
-    Failed,
-}
-
 /// A trait for reporting status messages and errors that occur during execution.
 /// This is primarily used in LSP mode to report errors and progress to the client.
 pub trait StatusReporter: Any + Send + Sync {
     /// Called when an error occurs to collect it for later processing
     fn collect_error(&self, error: &FsError);
     fn collect_warning(&self, warning: &FsError);
+    fn collect_node_evaluation(
+        &self,
+        file_path: PathBuf,
+        execution_phase: ExecutionPhase,
+        node_outcome: NodeOutcome,
+        node_skip_reason: Option<NodeSkipReason>,
+        node_skip_reason_upstream: Option<(String, String, bool)>,
+    );
     /// Called to show progress in the UI
     fn show_progress(&self, action: &str, target: &str, description: Option<&str>);
-    /// Combined async operation to clear diagnostics and optionally mark phase completion.
-    fn record_node(
-        &self,
-        file_path: &Path,
-        unique_id: Option<&str>,
-        phase: Option<ProcessingPhase>,
-        status: Option<PhaseStatus>,
-    );
     fn bulk_publish_empty(&self, file_paths: Vec<PathBuf>);
 }
 
@@ -96,7 +83,7 @@ pub fn determine_project_dir(inputs: &[String], project_file: &str) -> FsResult<
                 Err(_) => {
                     return err!(
                         ErrorCode::IoError,
-                        "Input directory '{input}' not found; make sure that it exists under the provided path"
+                        "Input dir '{input}' not found; make sure that it exists under the provided path"
                     );
                 }
             }
@@ -111,13 +98,13 @@ pub fn determine_project_dir(inputs: &[String], project_file: &str) -> FsResult<
                 if !inputs.is_empty() {
                     err!(
                         ErrorCode::IoError,
-                        "Invalid value '{}' for <TARGETS>: Please pass a path that points to or into a dbt project directory",
+                        "Invalid value '{}' for <TARGETS>: Please pass a path that points to or into a dbt project dir\nHint: pass a dbt project dir via `--project-dir <path>` or run `db init` to scaffold a project",
                         inputs[0]
                     )
                 } else {
                     err!(
                         ErrorCode::IoError,
-                        "The current directory is not a dbt project directory; cd into it or pass a <path> to it via --project-dir <path>"
+                        "The current dir is not a dbt project dir\nHint: `cd` into it; pass a <path> to it via `--project-dir <path>`; or run `db init` to scaffold a project"
                     )
                 }
             } else {
@@ -125,7 +112,7 @@ pub fn determine_project_dir(inputs: &[String], project_file: &str) -> FsResult<
                     diff_paths(search_start, env::current_dir()?).unwrap_or(env::current_dir()?);
                 err!(
                     ErrorCode::IoError,
-                    "Invalid value '{}' for <TARGETS>: Please pass a path that points to or into a dbt project directory",
+                    "Invalid value '{}' for <TARGETS>: Please pass a path that points to or into a dbt project dir\nHint: pass a dbt project dir via `--project-dir <path>` or run `db init` to scaffold a project",
                     relative_path.display()
                 )
             }

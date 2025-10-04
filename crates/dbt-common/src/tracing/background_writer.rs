@@ -3,9 +3,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
-use crate::{ErrorCode, FsResult};
+use dbt_error::{ErrorCode, FsResult};
 
-use super::{TelemetryShutdown, shared_writer::SharedWriter};
+use super::{shared_writer::SharedWriter, shutdown::TelemetryShutdown};
 
 /// Channel-based non-blocking writer that performs writes on a separate thread.
 ///
@@ -104,7 +104,7 @@ impl BackgroundWriter {
     }
 
     /// Send data to be written
-    pub fn write_bytes(&self, data: &[u8]) -> FsResult<()> {
+    pub fn write_bytes(&self, data: &[u8], append_newline: bool) -> FsResult<()> {
         if self.shutdown_flag.load(Ordering::Acquire) {
             // Writer thread has shut down
             return err!(
@@ -113,8 +113,13 @@ impl BackgroundWriter {
             );
         }
 
+        let mut data = data.to_vec();
+        if append_newline {
+            data.push(b'\n');
+        }
+
         self.sender
-            .send(TelemetryMessage::Write(data.to_vec()))
+            .send(TelemetryMessage::Write(data))
             .map_err(|_| {
                 // Channel is disconnected, mark as shut down
                 self.shutdown_flag.store(true, Ordering::Release);
@@ -128,7 +133,12 @@ impl BackgroundWriter {
 
 impl SharedWriter for BackgroundWriter {
     fn write(&self, data: &str) -> io::Result<()> {
-        self.write_bytes(data.as_bytes())
+        self.write_bytes(data.as_bytes(), false)
+            .map_err(|e| io::Error::other(e.to_string()))
+    }
+
+    fn writeln(&self, data: &str) -> io::Result<()> {
+        self.write_bytes(data.as_bytes(), true)
             .map_err(|e| io::Error::other(e.to_string()))
     }
 }
@@ -176,8 +186,10 @@ impl Drop for BackgroundWriterShutdownHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dbt_test_primitives::assert_contains;
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     /// Mock writer that captures output
     struct MockWriter {
@@ -221,14 +233,14 @@ mod tests {
                 };
 
                 // Fail after writing N messages
-                if let Some(fail_after) = self.fail_after_message_count {
-                    if count > fail_after {
-                        // Don't write to buffer on failure
-                        return Err(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "Mock write error",
-                        ));
-                    }
+                if let Some(fail_after) = self.fail_after_message_count
+                    && count > fail_after
+                {
+                    // Don't write to buffer on failure
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "Mock write error",
+                    ));
                 }
 
                 let mut full_msg = self.msg_buffer.lock().unwrap();
@@ -269,8 +281,8 @@ mod tests {
         let (writer, mut handle) = BackgroundWriter::new(Box::new(mock));
 
         // Write two messages
-        assert!(writer.write_bytes(b"message1\n").is_ok());
-        assert!(writer.write_bytes(b"message2\n").is_ok());
+        assert!(writer.write_bytes(b"message1", true).is_ok());
+        assert!(writer.write_bytes(b"message2\n", false).is_ok());
 
         // Shutdown and verify exact buffer contents
         handle.shutdown().unwrap();
@@ -289,25 +301,33 @@ mod tests {
         let (writer, mut handle) = BackgroundWriter::new(Box::new(mock));
 
         // First message should succeed
-        assert!(writer.write_bytes(b"message1\n").is_ok());
+        assert!(writer.write_bytes(b"message1\n", false).is_ok());
         // Second a second message. Write will succeed, but writer thread should fail
-        assert!(writer.write_bytes(b"message2\n").is_ok());
+        assert!(writer.write_bytes(b"message2\n", false).is_ok());
 
         // Lock until we reach count of 1
         {
-            let count = counter.lock().unwrap();
-            if *count < 2 {
-                drop(count);
-                // Wait a bit for the writer thread to process
-                thread::sleep(std::time::Duration::from_millis(10));
-            }
+            let timeout = Duration::from_secs(5);
+            let start = Instant::now();
 
-            let count = counter.lock().unwrap();
-            assert!(*count > 1);
+            // Wait until the writer thread has processed at least 2 messages
+            loop {
+                if let Ok(c) = counter.try_lock()
+                    && *c > 1
+                {
+                    break;
+                }
+
+                if start.elapsed() > timeout {
+                    panic!("Timed out waiting for writer thread to process second message");
+                }
+
+                thread::sleep(Duration::from_millis(10));
+            }
         };
 
         // The next write should fail
-        assert!(writer.write_bytes(b"message3\n").is_err());
+        assert!(writer.write_bytes(b"message3\n", false).is_err());
 
         // Shutdown - should return error due to write failure
         let Err(error) = handle.shutdown() else {
@@ -315,7 +335,7 @@ mod tests {
         };
 
         assert_eq!(error.code, ErrorCode::IoError);
-        assert!(error.to_string().contains("Mock write error"));
+        assert_contains!(error.to_string(), "Mock write error");
 
         // Verify only first message was written (writer failed after 1)
         let buffer_contents = buffer.lock().unwrap();
@@ -330,7 +350,7 @@ mod tests {
         let (writer, mut handle) = BackgroundWriter::new(Box::new(mock));
 
         // Write will succeed but flush will fail
-        assert!(writer.write_bytes(b"message1\n").is_ok());
+        assert!(writer.write_bytes(b"message1\n", false).is_ok());
 
         // Shutdown - should return error due to write failure
         let Err(error) = handle.shutdown() else {
@@ -338,10 +358,10 @@ mod tests {
         };
 
         assert_eq!(error.code, ErrorCode::IoError);
-        assert!(error.to_string().contains("Mock flush error"));
+        assert_contains!(error.to_string(), "Mock flush error");
 
         // After shutdown, writes should fail
-        assert!(writer.write_bytes(b"message2\n").is_err());
+        assert!(writer.write_bytes(b"message2\n", false).is_err());
 
         // First message was written to buffer (before flush failed)
         let buffer_contents = buffer.lock().unwrap();
@@ -354,7 +374,7 @@ mod tests {
         let mock = MockWriter::new();
         let (writer, mut handle) = BackgroundWriter::new(Box::new(mock));
 
-        assert!(writer.write_bytes(b"message1\n").is_ok());
+        assert!(writer.write_bytes(b"message1\n", false).is_ok());
 
         // Multiple shutdowns should be safe
         assert!(handle.shutdown().is_ok());
@@ -368,12 +388,12 @@ mod tests {
         let buffer = mock.buffer.clone();
         let (writer, mut handle) = BackgroundWriter::new(Box::new(mock));
 
-        assert!(writer.write_bytes(b"message1\n").is_ok());
+        assert!(writer.write_bytes(b"message1\n", false).is_ok());
 
         handle.shutdown().unwrap();
 
         // Writes after shutdown should return error
-        assert!(writer.write_bytes(b"after_shutdown\n").is_err());
+        assert!(writer.write_bytes(b"after_shutdown\n", false).is_err());
 
         let buffer_contents = buffer.lock().unwrap();
         let output = String::from_utf8_lossy(&buffer_contents);

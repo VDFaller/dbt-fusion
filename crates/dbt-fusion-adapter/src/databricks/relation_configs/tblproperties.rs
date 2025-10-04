@@ -35,6 +35,9 @@ pub const IGNORE_LIST: &[&str] = &[
     "delta.rowTracking.materializedRowIdColumnName",
     "spark.internal.pipelines.top_level_entry.user_specified_name",
     "delta.columnMapping.maxColumnId",
+    "spark.sql.internal.pipelines.parentTableId",
+    "delta.enableDeletionVectors",
+    "delta.feature.deletionVectors",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,14 +94,12 @@ impl DatabricksComponentProcessor for TblPropertiesProcessor {
             for row in table.rows() {
                 if let (Ok(key_val), Ok(value_val)) =
                     (row.get_item(&Value::from(0)), row.get_item(&Value::from(1)))
+                    && let (Some(key_str), Some(value_str)) = (key_val.as_str(), value_val.as_str())
                 {
-                    if let (Some(key_str), Some(value_str)) = (key_val.as_str(), value_val.as_str())
-                    {
-                        if key_str == "pipelines.pipelineId" {
-                            pipeline_id = Some(value_str.to_string());
-                        } else if !IGNORE_LIST.contains(&key_str) {
-                            tblproperties.insert(key_str.to_string(), value_str.to_string());
-                        }
+                    if key_str == "pipelines.pipelineId" {
+                        pipeline_id = Some(value_str.to_string());
+                    } else if !IGNORE_LIST.contains(&key_str) {
+                        tblproperties.insert(key_str.to_string(), value_str.to_string());
                     }
                 }
             }
@@ -119,12 +120,12 @@ impl DatabricksComponentProcessor for TblPropertiesProcessor {
 
         if let Some(model) = relation_config.as_any().downcast_ref::<DbtModel>() {
             // Extract tblproperties from databricks_attr
-            if let Some(databricks_attr) = &model.__adapter_attr__.databricks_attr {
-                if let Some(props_map) = &databricks_attr.tblproperties {
-                    for (key, value) in props_map {
-                        if let YmlValue::String(value_str, _) = value {
-                            tblproperties.insert(key.clone(), value_str.clone());
-                        }
+            if let Some(databricks_attr) = &model.__adapter_attr__.databricks_attr
+                && let Some(props_map) = &databricks_attr.tblproperties
+            {
+                for (key, value) in props_map {
+                    if let YmlValue::String(value_str, _) = value {
+                        tblproperties.insert(key.clone(), value_str.clone());
                     }
                 }
             }
@@ -237,6 +238,7 @@ mod tests {
                 quoting_ignore_case: false,
                 materialized: DbtMaterialization::StreamingTable,
                 static_analysis: dbt_common::io_args::StaticAnalysisKind::On,
+                static_analysis_off_reason: None,
                 enabled: true,
                 extended_model: false,
                 persist_docs: None,

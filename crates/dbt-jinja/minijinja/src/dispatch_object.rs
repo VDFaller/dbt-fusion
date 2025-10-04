@@ -113,7 +113,6 @@ impl Object for DispatchObject {
         let non_internal_namespace = state.env().get_non_internal_packages();
         // get dbt and adapters namespace
         let dbt_and_adapters_namespace = state.env().get_dbt_and_adapters_namespace();
-
         // First try with specific packages if specified
         // The logic below comes from https://github.com/dbt-labs/dbt-core/blob/4aa5169212d8256002095d44dc5f2505dca1b07c/core/dbt/context/providers.py#L158
         for package_name_opt in &search_packages {
@@ -134,7 +133,7 @@ impl Object for DispatchObject {
                         // For non-internal packages
                         let template_name = format!("{package_name}.{search_name}");
                         attempts.push(template_name.clone());
-                        if template_exists(state, &template_name, listeners) {
+                        if template_exists(state, &template_name) {
                             let rv =
                                 self.execute_template(state, &template_name, args, listeners)?;
                             return Ok(rv);
@@ -146,23 +145,17 @@ impl Object for DispatchObject {
                 for prefix in &adapter_prefixes {
                     let search_name = format!("{}__{}", prefix, self.macro_name);
 
-                    if let Some(template_name) = macro_namespace_template_resolver(
-                        state,
-                        &search_name,
-                        &mut attempts,
-                        listeners,
-                    ) {
+                    if let Some(template_name) =
+                        macro_namespace_template_resolver(state, &search_name, &mut attempts)
+                    {
                         let rv = self.execute_template(state, &template_name, args, listeners)?;
                         return Ok(rv);
                     }
                 }
                 // find the macro without prefix
-                if let Some(template_name) = macro_namespace_template_resolver(
-                    state,
-                    &self.macro_name,
-                    &mut attempts,
-                    listeners,
-                ) {
+                if let Some(template_name) =
+                    macro_namespace_template_resolver(state, &self.macro_name, &mut attempts)
+                {
                     let rv = self.execute_template(state, &template_name, args, listeners)?;
                     return Ok(rv);
                 }
@@ -206,12 +199,21 @@ impl DispatchObject {
                 // TODO @venkaa28: I (@akbog) moved the lookup here from the environment
                 // since there was only a single call site for it. However, I don't like that
                 // this would default to empty in the previous implementation.
-                let macro_dispatch_order = state
-                    .lookup(MACRO_DISPATCH_ORDER)
-                    .unwrap_or_default()
-                    .downcast_object::<ValueMap>()
-                    .unwrap_or(Arc::new(ValueMap::new()));
+                let macro_dispatch_order = {
+                    let value = state.lookup(MACRO_DISPATCH_ORDER).unwrap_or_default();
+                    let mut value_map = ValueMap::new();
 
+                    if let Ok(keys) = value.try_iter() {
+                        for key in keys {
+                            if let Ok(val) = value.get_item(&key) {
+                                // Convert key to string if needed
+                                value_map.insert(key, val);
+                            }
+                        }
+                    }
+
+                    Arc::new(value_map)
+                };
                 if let Some(order) = macro_dispatch_order.get(&Value::from(namespace.as_str())) {
                     // Use configured order
                     order
@@ -251,7 +253,7 @@ impl DispatchObject {
         args: &[Value],
         listeners: &[Rc<dyn RenderingEventListener>],
     ) -> Result<Value, Error> {
-        let template = match state.env().get_template(template_name, listeners) {
+        let template = match state.env().get_template(template_name) {
             Ok(template) => template,
             Err(err) => {
                 // If the template name was found in a namespace but the template itself doesn't exist,
@@ -333,12 +335,8 @@ pub fn get_internal_packages(dialect: &str) -> Vec<String> {
 }
 
 /// Helper function to check if a template exists in the environment
-fn template_exists(
-    state: &State<'_, '_>,
-    template_name: &str,
-    listeners: &[Rc<dyn RenderingEventListener>],
-) -> bool {
-    state.env().get_template(template_name, listeners).is_ok()
+fn template_exists(state: &State<'_, '_>, template_name: &str) -> bool {
+    state.env().get_template(template_name).is_ok()
 }
 
 /// Finds a template in the namespace according to dbt's resolution rules
@@ -370,27 +368,26 @@ pub fn macro_namespace_template_resolver(
     state: &State<'_, '_>,
     search_name: &str,
     attempts: &mut Vec<String>,
-    listeners: &[Rc<dyn RenderingEventListener>],
 ) -> Option<String> {
     // Get necessary values from state
     let current_package_name = state
         .lookup(TARGET_PACKAGE_NAME)
         .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or("dbt".to_string());
+        .unwrap_or_else(|| "dbt".to_string());
     let root_package = state.env().get_root_package_name();
     let dbt_and_adapters = state.env().get_dbt_and_adapters_namespace();
 
     // 1. Local namespace (current package)
     let template_name = format!("{current_package_name}.{search_name}");
     attempts.push(template_name.clone());
-    if template_exists(state, &template_name, listeners) {
+    if template_exists(state, &template_name) {
         return Some(template_name);
     }
 
     // 2. Root package namespace
     let template_name = format!("{root_package}.{search_name}");
     attempts.push(template_name.clone());
-    if template_exists(state, &template_name, listeners) {
+    if template_exists(state, &template_name) {
         return Some(template_name);
     }
 
@@ -399,7 +396,7 @@ pub fn macro_namespace_template_resolver(
     if let Some(pkg) = dbt_and_adapters.get(&search_name_value) {
         let template_name = format!("{pkg}.{search_name}");
         attempts.push(template_name.clone());
-        if template_exists(state, &template_name, listeners) {
+        if template_exists(state, &template_name) {
             return Some(template_name);
         }
     }

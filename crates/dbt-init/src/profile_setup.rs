@@ -92,8 +92,16 @@ impl ProjectStore {
         let env = initialize_load_profile_jinja_environment();
         let empty_context = HashMap::<String, String>::new();
 
-        let config: DbtCloudYml =
-            into_typed_with_jinja(&io_args, yaml_value, false, &env, &empty_context, &[], None)?;
+        let config: DbtCloudYml = into_typed_with_jinja(
+            &io_args,
+            yaml_value,
+            false,
+            &env,
+            &empty_context,
+            &[],
+            None,
+            true,
+        )?;
 
         Ok(Some(Self { config }))
     }
@@ -115,15 +123,14 @@ impl ProjectStore {
     }
 
     pub fn get_base_url(&self, project_id: Option<&str>) -> String {
-        if let Some(project_id) = project_id {
-            if let Some(project) = self
+        if let Some(project_id) = project_id
+            && let Some(project) = self
                 .config
                 .projects
                 .iter()
                 .find(|p| p.project_id == project_id)
-            {
-                return format!("https://{}", project.account_host);
-            }
+        {
+            return format!("https://{}", project.account_host);
         }
 
         format!("https://{}", self.config.context.active_host)

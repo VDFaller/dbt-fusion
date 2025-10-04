@@ -1,6 +1,9 @@
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use dbt_common::cancellation::CancellationToken;
+use dbt_common::constants::{
+    DBT_CATALOGS_YML, DBT_DEPENDENCIES_YML, DBT_PACKAGES_LOCK_FILE, DBT_PACKAGES_YML,
+};
 use dbt_common::once_cell_vars::DISPATCH_CONFIG;
 use dbt_common::show_warning;
 use dbt_jinja_utils::invocation_args::InvocationArgs;
@@ -9,18 +12,18 @@ use dbt_jinja_utils::phases::load::init::initialize_load_jinja_environment;
 use dbt_jinja_utils::phases::load::init::initialize_load_profile_jinja_environment;
 use dbt_jinja_utils::serde::yaml_to_fs_error;
 use dbt_schemas::schemas::serde::StringOrInteger;
-use dbt_schemas::schemas::telemetry::BuildPhaseInfo;
-use dbt_schemas::schemas::telemetry::TelemetryAttributes;
+use dbt_schemas::schemas::telemetry::{ExecutionPhase, PhaseExecuted};
+use dbt_schemas::state::DbtProfile;
 use fs_deps::get_or_install_packages;
 use pathdiff::diff_paths;
 use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::time::SystemTime;
+use std::{fs, io};
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
@@ -39,6 +42,7 @@ use dbt_schemas::state::{DbtAsset, DbtPackage, DbtState, DbtVars, ResourcePathKi
 use crate::args::LoadArgs;
 use crate::dbt_project_yml_loader::load_project_yml;
 use crate::download_publication::download_publication_artifacts;
+use crate::load_catalogs;
 use crate::utils::{collect_file_info, identify_package_dependencies};
 use crate::{
     load_internal_packages, load_packages, load_profiles, load_vars, persist_internal_packages,
@@ -48,12 +52,12 @@ use dbt_jinja_utils::phases::load::secret_renderer::secret_context_env_var;
 use dbt_jinja_utils::serde::{into_typed_with_jinja, value_from_file};
 use dbt_jinja_utils::var_fn;
 
-use dbt_common::tracing::ToTracingValue;
+use dbt_common::tracing::event_info::store_event_attributes;
 
 #[tracing::instrument(
     skip_all,
     fields(
-        __event = TelemetryAttributes::Phase(BuildPhaseInfo::Loading { }).to_tracing_value(),
+        _e = ?store_event_attributes(PhaseExecuted::start_general(ExecutionPhase::LoadProject).into()),
     )
 )]
 pub async fn load(
@@ -63,57 +67,9 @@ pub async fn load(
 ) -> FsResult<(DbtState, Option<usize>, Option<ProjectDbtCloudConfig>)> {
     let _pb = with_progress!(arg.io, spinner => LOADING);
 
-    // Read the input file
-    let dbt_project_path = arg.io.in_dir.join(DBT_PROJECT_YML);
+    let (simplified_dbt_project, mut dbt_profile) =
+        load_simplified_project_and_profiles(arg).await?;
 
-    let raw_dbt_project_in_val = value_from_file(&arg.io, &dbt_project_path, false, None)?;
-    let env = initialize_load_profile_jinja_environment();
-    let ctx: BTreeMap<String, minijinja::Value> = BTreeMap::from([
-        (
-            "env_var".to_owned(),
-            minijinja::Value::from_func_func("env_var", secret_context_env_var),
-        ),
-        (
-            "var".to_owned(),
-            minijinja::Value::from_function(var_fn(arg.vars.clone())),
-        ),
-    ]);
-
-    let simplified_dbt_project: DbtProjectSimplified =
-        into_typed_with_jinja(&arg.io, raw_dbt_project_in_val, true, &env, &ctx, &[], None)?;
-
-    if simplified_dbt_project.data_paths.is_some() {
-        return err!(
-            ErrorCode::InvalidConfig,
-            "'data-paths' cannot be specified in dbt_project.yml",
-        );
-    }
-    if simplified_dbt_project.source_paths.is_some() {
-        return err!(
-            ErrorCode::InvalidConfig,
-            "'source-paths' cannot be specified in dbt_project.yml",
-        );
-    }
-    if (*simplified_dbt_project.log_path)
-        .as_ref()
-        .is_some_and(|path| path != "logs")
-    {
-        return err!(
-            ErrorCode::InvalidConfig,
-            "'log-path' cannot be specified in dbt_project.yml",
-        );
-    }
-    if (*simplified_dbt_project.target_path)
-        .as_ref()
-        .is_some_and(|path| path != "target")
-    {
-        return err!(
-            ErrorCode::InvalidConfig,
-            "'target-path' cannot be specified in dbt_project.yml",
-        );
-    }
-
-    let mut dbt_profile = load_profiles(arg, &simplified_dbt_project, &env, &ctx)?;
     // Check if .gitignore exists and add dbt_internal_packages/ if not present
     let gitignore_path = arg.io.in_dir.join(".gitignore");
     if gitignore_path.exists() {
@@ -127,6 +83,18 @@ pub async fn load(
             fs::write(&gitignore_path, updated_content)?;
         }
     }
+
+    // initialize loader into a crate accessible static location
+    let catalogs_yml_path = arg.io.in_dir.join(DBT_CATALOGS_YML);
+    match fs::read_to_string(&catalogs_yml_path) {
+        Ok(text) => load_catalogs(&text, &catalogs_yml_path),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(fs_err!(
+            code => ErrorCode::InvalidConfig,
+            loc  => PathBuf::from(&catalogs_yml_path),
+            "Failed to read '{}': {}", DBT_CATALOGS_YML, e
+        )),
+    }?;
 
     let final_threads = if iarg.num_threads.is_none() {
         if let Some(threads) = dbt_profile.db_config.get_threads() {
@@ -203,7 +171,7 @@ pub async fn load(
 
     let arg_ref = &arg;
     if let Some(prev_dbt_state) = arg.prev_dbt_state.clone() {
-        let root_package = prev_dbt_state.root_package();
+        let prev_root_package = prev_dbt_state.root_package();
 
         let package_map_lookup = BTreeMap::new();
         let mut dummy_collected_vars = Vec::new();
@@ -211,13 +179,14 @@ pub async fn load(
             arg_ref,
             &env,
             &arg.io.in_dir,
+            &dbt_state.dbt_profile,
             false,
             &package_map_lookup,
             true,
             &mut dummy_collected_vars,
         )
         .await?;
-        new_root_package.dependencies = root_package.dependencies.clone();
+        new_root_package.dependencies = prev_root_package.dependencies.clone();
         dbt_state.vars = prev_dbt_state.vars.clone();
 
         let packages = prev_dbt_state
@@ -247,6 +216,8 @@ pub async fn load(
         &packages_install_path,
         arg.install_deps,
         arg.add_package.clone(),
+        arg.upgrade,
+        arg.lock,
         arg.vars.clone(),
         token,
     )
@@ -271,6 +242,7 @@ pub async fn load(
         let packages = load_packages(
             &arg,
             &env,
+            &dbt_state.dbt_profile,
             &mut collected_vars,
             &lookup_map,
             &packages_install_path,
@@ -285,6 +257,7 @@ pub async fn load(
         let packages = load_internal_packages(
             &arg,
             &env,
+            &dbt_state.dbt_profile,
             &mut collected_vars,
             &internal_packages_install_path,
             token,
@@ -296,10 +269,78 @@ pub async fn load(
     Ok((dbt_state, final_threads, simplified_dbt_project.dbt_cloud))
 }
 
+pub async fn load_simplified_project_and_profiles(
+    arg: &LoadArgs,
+) -> FsResult<(DbtProjectSimplified, DbtProfile)> {
+    // Read the input file
+    let dbt_project_path = arg.io.in_dir.join(DBT_PROJECT_YML);
+
+    let raw_dbt_project_in_val = value_from_file(&arg.io, &dbt_project_path, false, None)?;
+    let env = initialize_load_profile_jinja_environment();
+    let ctx: BTreeMap<String, minijinja::Value> = BTreeMap::from([
+        (
+            "env_var".to_owned(),
+            minijinja::Value::from_func_func("env_var", secret_context_env_var),
+        ),
+        (
+            "var".to_owned(),
+            minijinja::Value::from_function(var_fn(arg.vars.clone())),
+        ),
+    ]);
+
+    let simplified_dbt_project: DbtProjectSimplified = into_typed_with_jinja(
+        &arg.io,
+        raw_dbt_project_in_val,
+        true,
+        &env,
+        &ctx,
+        &[],
+        None,
+        true,
+    )?;
+
+    if simplified_dbt_project.data_paths.is_some() {
+        return err!(
+            ErrorCode::InvalidConfig,
+            "'data-paths' cannot be specified in dbt_project.yml",
+        );
+    }
+    if simplified_dbt_project.source_paths.is_some() {
+        return err!(
+            ErrorCode::InvalidConfig,
+            "'source-paths' cannot be specified in dbt_project.yml",
+        );
+    }
+    if (*simplified_dbt_project.log_path)
+        .as_ref()
+        .is_some_and(|path| path != "logs")
+    {
+        return err!(
+            ErrorCode::InvalidConfig,
+            "'log-path' cannot be specified in dbt_project.yml",
+        );
+    }
+    if (*simplified_dbt_project.target_path)
+        .as_ref()
+        .is_some_and(|path| path != "target")
+    {
+        return err!(
+            ErrorCode::InvalidConfig,
+            "'target-path' cannot be specified in dbt_project.yml",
+        );
+    }
+
+    let dbt_profile = load_profiles(arg, &simplified_dbt_project, &env, &ctx)?;
+
+    Ok((simplified_dbt_project, dbt_profile))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn load_inner(
     arg: &LoadArgs,
     env: &JinjaEnv,
     package_path: &Path,
+    dbt_profile: &DbtProfile,
     // Indicates if we are loading a dependency or a root project
     is_dependency: bool,
     package_lookup_map: &BTreeMap<String, String>,
@@ -317,11 +358,13 @@ pub async fn load_inner(
                 .parent()
                 .and_then(|p| p.file_name())
                 .map(|os_str| os_str.to_string_lossy().to_string())
-                .ok_or(fs_err!(
-                    ErrorCode::InvalidConfig,
-                    "Failed to get package name from path: {}",
-                    &dbt_project_path.display()
-                ))?,
+                .ok_or_else(|| {
+                    fs_err!(
+                        ErrorCode::InvalidConfig,
+                        "Failed to get package name from path: {}",
+                        &dbt_project_path.display()
+                    )
+                })?,
         )
     } else {
         None
@@ -366,11 +409,8 @@ pub async fn load_inner(
         }
     }
 
-    let dbt_project_modified = last_modified(&dbt_project_path)?;
-    all_files.insert(
-        ResourcePathKind::ProjectPaths,
-        vec![(dbt_project_path, dbt_project_modified)],
-    );
+    let session_files = find_session_files(package_path)?;
+    all_files.insert(ResourcePathKind::SessionPaths, session_files);
 
     // Collect file paths and their timestamps for fields with a suffix `_paths`
     let all_dirs = collect_paths(&dbt_project);
@@ -492,7 +532,7 @@ pub async fn load_inner(
         package_path,
         &dbt_project.name,
         &ResourcePathKind::FixturePaths,
-        &["csv"],
+        &["csv", "sql"],
         &all_files,
     );
     let seed_files = find_files_by_kind_and_extension(
@@ -526,6 +566,10 @@ pub async fn load_inner(
             dependency_package_name.as_deref(),
         )?
     };
+    // Only do this for the root package.
+    if !is_dependency {
+        collect_profiles_yml_if_exists(dbt_profile, &mut all_files);
+    }
     Ok(DbtPackage {
         dbt_project,
         package_root_path: package_path.to_path_buf(),
@@ -540,14 +584,22 @@ pub async fn load_inner(
         snapshot_files,
         dependencies,
         all_paths: all_files,
+        inline_file: None,
     })
 }
 
 /// outputs the timestamp that this run started
 fn run_started_at() -> DateTime<Tz> {
-    let utc_now = Utc::now();
-    let tz_now: DateTime<Tz> = utc_now.with_timezone(&Tz::UTC);
-    tz_now
+    // check if we have env var DBT_RUN_STARTED_AT
+    if let Ok(run_started_at) = std::env::var("DBT_RUN_STARTED_AT") {
+        DateTime::parse_from_rfc3339(&run_started_at)
+            .unwrap()
+            .with_timezone(&Tz::UTC)
+    } else {
+        let utc_now = Utc::now();
+        let tz_now: DateTime<Tz> = utc_now.with_timezone(&Tz::UTC);
+        tz_now
+    }
 }
 
 fn should_exclude_path(kind: &ResourcePathKind, path: &Path) -> bool {
@@ -636,7 +688,18 @@ fn collect_all_files(
     let mut all_paths: HashMap<ResourcePathKind, Vec<(PathBuf, SystemTime)>> = HashMap::new();
     for (kind, paths) in &all_dirs {
         let mut info_paths = Vec::new();
-        collect_file_info(base_path, paths, &mut info_paths, dbtignore.as_ref()).lift(ectx!(
+
+        collect_file_info(
+            base_path,
+            paths,
+            &mut info_paths,
+            dbtignore.as_ref(),
+            |path: &Path| {
+                path.components().next()
+                    != Some(std::path::Component::Normal(OsStr::new("fixtures")))
+            },
+        )
+        .lift(ectx!(
             "Failed to collect file info: {}, {}",
             base_path.display(),
             paths.join(",")
@@ -745,6 +808,48 @@ fn get_packages_install_path(
     };
 
     (packages_install_path, internal_packages_install_path)
+}
+
+fn collect_profiles_yml_if_exists(
+    dbt_profile: &DbtProfile,
+    all_paths: &mut HashMap<ResourcePathKind, Vec<(PathBuf, SystemTime)>>,
+) {
+    if let Ok(timestamp) = last_modified(&dbt_profile.relative_profile_path) {
+        let entry = all_paths.entry(ResourcePathKind::ProfilePaths).or_default();
+        entry.push((dbt_profile.relative_profile_path.clone(), timestamp));
+    }
+}
+
+/// These are the built-in session file paths relative to a project.
+pub fn get_session_relative_file_paths() -> Vec<String> {
+    vec![
+        DBT_PROJECT_YML.into(),
+        DBT_DEPENDENCIES_YML.into(),
+        DBT_PACKAGES_YML.into(),
+        DBT_PACKAGES_LOCK_FILE.into(),
+        DBT_CATALOGS_YML.into(),
+    ]
+}
+
+fn find_session_files(package_path: &Path) -> FsResult<Vec<(PathBuf, SystemTime)>> {
+    let mut result = Vec::new();
+
+    for relative_path in get_session_relative_file_paths() {
+        // Heuristic for DBT_PROJECT_YML.
+        // We actually want to raise an error if it was not able to be read.
+        if relative_path == DBT_PROJECT_YML {
+            let dbt_project_path = package_path.join(relative_path);
+            let dbt_project_timestamp = last_modified(&dbt_project_path)?;
+            result.push((dbt_project_path, dbt_project_timestamp));
+        } else {
+            let path = package_path.join(relative_path);
+            if let Ok(timestamp) = last_modified(&path) {
+                result.push((path, timestamp));
+            }
+        }
+    }
+
+    Ok(result)
 }
 
 #[cfg(test)]

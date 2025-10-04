@@ -154,8 +154,8 @@ pub fn pretty_data_table(
             let ndjson_str =
                 batches_to_json!(arrow::json::writer::LineDelimited, converted_batches);
             // todo: inline the whole effect of the serde_yml
-            let line_count = ndjson_str.lines().count();
-            for (i, line) in ndjson_str.lines().enumerate() {
+            // let line_count = ndjson_str.lines().count();
+            for line in ndjson_str.lines() {
                 // Parse JSON object from each line of NDJSON
                 let json_obj: serde_json::Value =
                     serde_json::from_str(line).expect("Failed to parse JSON");
@@ -163,13 +163,11 @@ pub fn pretty_data_table(
                 let yaml_obj: dbt_serde_yaml::Value =
                     dbt_serde_yaml::to_value(&json_obj).expect("Failed to convert to YAML");
                 // Print YAML formatted object
+                out.push_str("---\n");
                 out.push_str(
                     &dbt_serde_yaml::to_string(&yaml_obj).expect("Failed to serialize to YAML"),
                 );
                 // Print YAML formatted object
-                if i < line_count - 1 {
-                    out.push_str("---");
-                }
             }
         }
 
@@ -349,6 +347,8 @@ fn stringify_types_for_show(new_batches_slice: &[RecordBatch]) -> Vec<RecordBatc
             let unvarianted = None;
             // we're not supposed to throw here 🤷‍♂️
             #[allow(clippy::unnecessary_literal_unwrap)]
+            #[expect(clippy::or_fun_call)]
+            // it's easy to address by inlining the `unvarianted`, but would make above TODO less clear
             let maybe_converted = unvarianted.unwrap_or(Arc::clone(array));
             if Arc::ptr_eq(array, &maybe_converted) {
                 new_schema_fields.push(field.clone());

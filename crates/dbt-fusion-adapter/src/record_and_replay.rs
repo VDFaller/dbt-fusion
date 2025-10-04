@@ -1,16 +1,21 @@
+use crate::base_adapter::backend_of;
 use crate::config::AdapterConfig;
 use crate::errors::AdapterResult;
+use crate::query_comment::QueryCommentConfig;
 use crate::sql_engine::SqlEngine;
+use crate::sql_types::TypeFormatter;
 use crate::stmt_splitter::StmtSplitter;
 
 use adbc_core::error::{Error as AdbcError, Result as AdbcResult, Status as AdbcStatus};
 use adbc_core::options::{OptionStatement, OptionValue};
 use arrow::array::{RecordBatch, RecordBatchIterator, RecordBatchReader};
-use arrow_json::writer::LineDelimitedWriter;
-use arrow_schema::{ArrowError, Field, Schema, SchemaBuilder};
+use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaBuilder};
 use dashmap::DashMap;
+use dbt_common::adapter::AdapterType;
 use dbt_common::cancellation::CancellationToken;
+use dbt_schemas::schemas::common::ResolvedQuoting;
 use dbt_xdbc::{Backend, Connection, QueryCtx, Statement};
+use minijinja::State;
 use once_cell::sync::Lazy;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -23,9 +28,9 @@ use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::fs::{self, File, create_dir_all, metadata};
 use std::hash::{Hash, Hasher};
-use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tracing::warn;
 
 // The reason this is global is that we might have multiple adapters
 // (we do not limit the number of adapters people can instantiate) and
@@ -38,14 +43,17 @@ static DBT_TMP_UUID_PATTERN: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"dbt_tmp_[0-9a-f]{8}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{12}").unwrap()
 });
 
-fn checksum8(input: &str) -> String {
-    // NOTE: This is cleaning we need to do for our auto generated
-    // schemas in tests. Note ideal it is not localized but if things
-    // change in the ways we generate scheams things will start
-    // failing.
+// This is cleaning we need to do for our auto generated
+// schemas in tests. Note ideal it is not localized but if things
+// change in the ways we generate scheams things will start
+// failing.
+fn cleanup_schema_name(input: &str) -> String {
     let re = Regex::new(r"___.*?___").unwrap();
-    let input = re.replace_all(input, "").to_string();
+    re.replace_all(input, "").to_string()
+}
 
+fn checksum8(input: &str) -> String {
+    let input = cleanup_schema_name(input);
     let mut hasher = DefaultHasher::new();
     input.hash(&mut hasher);
     let hash = hasher.finish();
@@ -78,12 +86,67 @@ fn compute_file_name(query_ctx: &QueryCtx) -> AdbcResult<String> {
     Ok(file_name)
 }
 
-fn compute_file_name_from_node_id(id: &str) -> AdbcResult<String> {
+fn compute_file_name_for_node_id(node_id: Option<&str>) -> String {
+    let id = node_id.unwrap_or("unknown");
     let mut entry = COUNTERS.entry(id.to_string()).or_insert(0);
     let file_name = format!("{}-{}", id, *entry);
     *entry += 1;
+    file_name
+}
 
-    Ok(file_name)
+/// Fixes decimal types with invalid precision (0) by setting appropriate defaults
+/// This handles the case where BigQuery returns precision=0 for NUMERIC/BIGNUMERIC
+/// types without explicit precision, which is invalid for Parquet
+fn fix_decimal_precision_in_schema(schema: &Schema) -> Schema {
+    let fixed_fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|field| fix_decimal_precision_in_field(field))
+        .collect();
+
+    Schema::new(fixed_fields).with_metadata(schema.metadata().clone())
+}
+
+// FIXME(jason): This looks to be more of a driver problem, let's prevent 0 precision
+// from coming back. Guard against it for now.
+fn fix_decimal_precision_in_field(field: &Field) -> Field {
+    let fixed_data_type = match field.data_type() {
+        DataType::Decimal128(precision, scale) if *precision == 0 => {
+            // BigQuery NUMERIC defaults: precision=38, scale=9
+            warn!(
+                "Found DECIMAL128 with invalid precision=0, using defaults (38, 9) for field '{}'",
+                field.name()
+            );
+            DataType::Decimal128(38, *scale)
+        }
+        DataType::Decimal256(precision, scale) if *precision == 0 => {
+            // BigQuery BIGNUMERIC defaults: precision=76, scale=38
+            warn!(
+                "Found DECIMAL256 with invalid precision=0, using defaults (76, 38) for field '{}'",
+                field.name()
+            );
+            DataType::Decimal256(76, *scale)
+        }
+        DataType::List(list_field) => {
+            let fixed_list_field = Arc::new(fix_decimal_precision_in_field(list_field));
+            DataType::List(fixed_list_field)
+        }
+        DataType::LargeList(list_field) => {
+            let fixed_list_field = Arc::new(fix_decimal_precision_in_field(list_field));
+            DataType::LargeList(fixed_list_field)
+        }
+        DataType::Struct(fields) => {
+            let fixed_fields: Vec<Arc<Field>> = fields
+                .iter()
+                .map(|f| Arc::new(fix_decimal_precision_in_field(f)))
+                .collect();
+            DataType::Struct(fixed_fields.into())
+        }
+        other => other.clone(),
+    };
+
+    Field::new(field.name(), fixed_data_type, field.is_nullable())
+        .with_metadata(field.metadata().clone())
 }
 
 pub struct RecordEngineInner {
@@ -108,8 +171,12 @@ impl RecordEngine {
         self.0.engine.backend()
     }
 
-    pub fn new_connection(&self, node_id: Option<String>) -> AdapterResult<Box<dyn Connection>> {
-        let actual_conn = self.0.engine.new_connection(None)?;
+    pub fn new_connection(
+        &self,
+        state: Option<&State>,
+        node_id: Option<String>,
+    ) -> AdapterResult<Box<dyn Connection>> {
+        let actual_conn = self.0.engine.new_connection(state, node_id.clone())?;
         let conn = RecordEngineConnection(self.0.clone(), actual_conn, node_id);
         Ok(Box::new(conn))
     }
@@ -122,12 +189,32 @@ impl RecordEngine {
         self.0.engine.config(key)
     }
 
-    pub fn cancellation_token(&self) -> CancellationToken {
-        self.0.engine.cancellation_token()
+    pub fn get_config(&self) -> &AdapterConfig {
+        self.0.engine.get_config()
     }
 
-    pub fn splitter(&self) -> Arc<dyn StmtSplitter> {
+    pub fn adapter_type(&self) -> AdapterType {
+        self.0.engine.adapter_type()
+    }
+
+    pub fn quoting(&self) -> ResolvedQuoting {
+        self.0.engine.quoting()
+    }
+
+    pub fn splitter(&self) -> &dyn StmtSplitter {
         self.0.engine.splitter()
+    }
+
+    pub fn query_comment(&self) -> &QueryCommentConfig {
+        self.0.engine.query_comment()
+    }
+
+    pub(crate) fn type_formatter(&self) -> &dyn TypeFormatter {
+        self.0.engine.type_formatter()
+    }
+
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.0.engine.cancellation_token()
     }
 }
 
@@ -169,55 +256,46 @@ impl Connection for RecordEngineConnection {
         let path = self.0.path.clone();
         create_dir_all(&path).map_err(|e| from_io_error(e, Some(&path)))?;
 
-        if let Some(node_id) = &self.2 {
-            let file_name = compute_file_name_from_node_id(node_id)?;
+        let file_name = compute_file_name_for_node_id(self.2.as_deref());
+        let err_path = path.join(format!("{file_name}.get_table_schema.err"));
+        let parquet_path = path.join(format!("{file_name}.get_table_schema.parquet"));
+        let metadata_path = path.join(format!("{file_name}.get_table_schema.metadata.json"));
 
-            let connection_path = path.join(format!("{file_name}.connection"));
-            let err_path = path.join(format!("{file_name}.connection.err"));
-            let parquet_path = path.join(format!("{file_name}.connection.parquet"));
-            let metadata_path = path.join(format!("{file_name}.connection.metadata.json"));
+        match result {
+            Ok(schema) => {
+                // Fix decimal types with invalid precision=0 before writing to parquet
+                let fixed_schema = fix_decimal_precision_in_schema(&schema);
 
-            fs::write(&connection_path, "get_table_schema")
-                .map_err(|e| from_io_error(e, Some(&connection_path)))?;
+                // create empty record batch with fixed schema
+                let schema_ref = Arc::new(fixed_schema.clone());
+                let batch = RecordBatch::new_empty(schema_ref.clone());
 
-            match result {
-                Ok(schema) => {
-                    // create empty record batch with schema
-                    let schema_ref = Arc::new(schema.clone());
-                    let batch = RecordBatch::new_empty(schema_ref.clone());
+                let file = File::create(&parquet_path)
+                    .map_err(|e| from_io_error(e, Some(&parquet_path)))?;
+                let props = WriterProperties::builder().build();
+                let mut writer = ArrowWriter::try_new(file, schema_ref, Some(props))
+                    .map_err(from_parquet_error)?;
+                writer.write(&batch).map_err(from_parquet_error)?;
+                writer.close().map_err(from_parquet_error)?;
 
-                    let file = File::create(&parquet_path)
-                        .map_err(|e| from_io_error(e, Some(&parquet_path)))?;
-                    let props = WriterProperties::builder().build();
-                    let mut writer = ArrowWriter::try_new(file, schema_ref, Some(props))
-                        .map_err(from_parquet_error)?;
-                    writer.write(&batch).map_err(from_parquet_error)?;
-                    writer.close().map_err(from_parquet_error)?;
+                let metadata = fixed_schema.metadata();
+                let metadata_json = serde_json::to_string(&metadata)
+                    .map_err(|e| from_serde_error(e, Some(&metadata_path)))?;
+                fs::write(&metadata_path, metadata_json)
+                    .map_err(|e| from_io_error(e, Some(&metadata_path)))?;
 
-                    let metadata = schema.metadata();
-                    let metadata_json = serde_json::to_string(&metadata)
-                        .map_err(|e| from_serde_error(e, Some(&metadata_path)))?;
-                    fs::write(&metadata_path, metadata_json)
-                        .map_err(|e| from_io_error(e, Some(&metadata_path)))?;
-
-                    Ok(schema)
-                }
-                Err(err) => {
-                    let err_msg = format!("{err}");
-                    fs::write(&err_path, err_msg.clone())
-                        .map_err(|e| from_io_error(e, Some(&err_path)))?;
-                    // do not create json or parquet, relay original error
-                    Err(AdbcError::with_message_and_status(
-                        err_msg,
-                        AdbcStatus::Internal,
-                    ))
-                }
+                Ok(schema)
             }
-        } else {
-            Err(AdbcError::with_message_and_status(
-                "Node id is required to record table schema",
-                AdbcStatus::Internal,
-            ))
+            Err(err) => {
+                let err_msg = format!("{err}");
+                fs::write(&err_path, err_msg.clone())
+                    .map_err(|e| from_io_error(e, Some(&err_path)))?;
+                // do not create json or parquet, relay original error
+                Err(AdbcError::with_message_and_status(
+                    err_msg,
+                    AdbcStatus::Internal,
+                ))
+            }
         }
     }
 }
@@ -268,7 +346,6 @@ impl Statement for RecordEngineStatement {
         create_dir_all(&path).map_err(|e| from_io_error(e, Some(&path)))?;
 
         let file_name = compute_file_name(&query_ctx)?;
-        let json_path = path.join(format!("{file_name}.json"));
         let sql_path = path.join(format!("{file_name}.sql"));
         let err_path = path.join(format!("{file_name}.err"));
         let parquet_path = path.join(format!("{file_name}.parquet"));
@@ -280,15 +357,6 @@ impl Statement for RecordEngineStatement {
             Ok(mut reader) => {
                 let schema = reader.schema();
                 let batches: Vec<RecordBatch> = reader.by_ref().collect::<Result<_, _>>()?;
-                let file =
-                    File::create(&json_path).map_err(|e| from_io_error(e, Some(&json_path)))?;
-                let writer = BufWriter::new(file);
-                let mut json_writer = LineDelimitedWriter::new(writer);
-
-                for batch in &batches {
-                    json_writer.write(batch)?;
-                }
-                json_writer.finish()?;
 
                 let file = File::create(&parquet_path)
                     .map_err(|e| from_io_error(e, Some(&parquet_path)))?;
@@ -361,16 +429,18 @@ impl Statement for RecordEngineStatement {
 }
 
 struct ReplayEngineInner {
-    /// The XDBC backend responsible for the recordings we are replaying
+    adapter_type: AdapterType,
     backend: Backend,
     /// Path to recordings
     path: PathBuf,
     /// Adapter config
     config: AdapterConfig,
+    quoting: ResolvedQuoting,
+    stmt_splitter: Arc<dyn StmtSplitter>,
+    query_comment: QueryCommentConfig,
+    type_formatter: Box<dyn TypeFormatter>,
     /// Global CLI cancellation token
     cancellation_token: CancellationToken,
-    /// Statement splitter
-    splitter: Arc<dyn StmtSplitter>,
 }
 
 impl ReplayEngineInner {
@@ -383,26 +453,42 @@ impl ReplayEngineInner {
 pub struct ReplayEngine(Arc<ReplayEngineInner>);
 
 impl ReplayEngine {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        backend: Backend,
+        adapter_type: AdapterType,
         path: PathBuf,
         config: AdapterConfig,
+        quoting: ResolvedQuoting,
+        stmt_splitter: Arc<dyn StmtSplitter>,
+        query_comment: QueryCommentConfig,
+        type_formatter: Box<dyn TypeFormatter>,
         token: CancellationToken,
-        splitter: Arc<dyn StmtSplitter>,
     ) -> Self {
         let inner = ReplayEngineInner {
-            backend,
+            adapter_type,
+            backend: backend_of(adapter_type),
             path,
             config,
+            quoting,
+            stmt_splitter,
+            query_comment,
+            type_formatter,
             cancellation_token: token,
-            splitter,
         };
         ReplayEngine(Arc::new(inner))
     }
 
-    pub fn new_connection(&self, node_id: Option<String>) -> AdapterResult<Box<dyn Connection>> {
+    pub fn new_connection(
+        &self,
+        _state: Option<&State>,
+        node_id: Option<String>,
+    ) -> AdapterResult<Box<dyn Connection>> {
         let conn = ReplayEngineConnection(self.0.clone(), node_id);
         Ok(Box::new(conn))
+    }
+
+    pub fn adapter_type(&self) -> AdapterType {
+        self.0.adapter_type
     }
 
     pub fn backend(&self) -> Backend {
@@ -413,12 +499,28 @@ impl ReplayEngine {
         self.0.config.get_string(key)
     }
 
-    pub fn cancellation_token(&self) -> CancellationToken {
-        self.0.cancellation_token.clone()
+    pub fn get_config(&self) -> &AdapterConfig {
+        &self.0.config
     }
 
-    pub fn splitter(&self) -> Arc<dyn StmtSplitter> {
-        self.0.splitter.clone()
+    pub fn quoting(&self) -> ResolvedQuoting {
+        self.0.quoting
+    }
+
+    pub fn splitter(&self) -> &dyn StmtSplitter {
+        self.0.stmt_splitter.as_ref()
+    }
+
+    pub fn query_comment(&self) -> &QueryCommentConfig {
+        &self.0.query_comment
+    }
+
+    pub(crate) fn type_formatter(&self) -> &dyn TypeFormatter {
+        self.0.type_formatter.as_ref()
+    }
+
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.0.cancellation_token.clone()
     }
 }
 
@@ -455,61 +557,42 @@ impl Connection for ReplayEngineConnection {
         _db_schema: Option<&str>,
         _table_name: &str,
     ) -> AdbcResult<Schema> {
-        if let Some(node_id) = &self.1 {
-            let file_name = compute_file_name_from_node_id(node_id)?;
-            let path = self.0.path.clone();
-            let connection_path = path.join(format!("{file_name}.connection"));
-            let err_path = path.join(format!("{file_name}.connection.err"));
-            let parquet_path = path.join(format!("{file_name}.connection.parquet"));
-            let metadata_path = path.join(format!("{file_name}.connection.metadata.json"));
+        let path = self.0.path.clone();
 
-            // content from connection_path is "get_table_schema"
-            let content = fs::read_to_string(&connection_path)
-                .map_err(|e| from_io_error(e, Some(&connection_path)))?;
-            if content != "get_table_schema" {
-                return Err(AdbcError::with_message_and_status(
-                    "Connection path content is not get_table_schema",
-                    AdbcStatus::Internal,
-                ));
-            }
+        let file_name = compute_file_name_for_node_id(self.1.as_deref());
+        let err_path = path.join(format!("{file_name}.get_table_schema.err"));
+        let parquet_path = path.join(format!("{file_name}.get_table_schema.parquet"));
+        let metadata_path = path.join(format!("{file_name}.get_table_schema.metadata.json"));
 
-            // replay the error
-            if err_path.exists() {
-                let msg =
-                    fs::read_to_string(&err_path).map_err(|e| from_io_error(e, Some(&err_path)))?;
-                return Err(AdbcError::with_message_and_status(
-                    msg,
-                    AdbcStatus::Internal,
-                ));
-            }
-
-            // read the schema
-            let file =
-                File::open(&parquet_path).map_err(|e| from_io_error(e, Some(&parquet_path)))?;
-            let builder =
-                ParquetRecordBatchReaderBuilder::try_new(file).map_err(from_parquet_error)?;
-            let reader = builder.build().map_err(from_parquet_error)?;
-            let schema = reader.schema();
-
-            // read the metadata
-            let metadata_json = fs::read_to_string(&metadata_path)
-                .map_err(|e| from_io_error(e, Some(&metadata_path)))?;
-            let metadata: HashMap<String, String> = serde_json::from_str(&metadata_json)
-                .map_err(|e| from_serde_error(e, Some(&metadata_path)))?;
-
-            let mut schema_builder = SchemaBuilder::from(schema.fields());
-            for (key, value) in metadata {
-                schema_builder.metadata_mut().insert(key, value);
-            }
-
-            let schema = schema_builder.finish();
-            Ok(schema)
-        } else {
-            Err(AdbcError::with_message_and_status(
-                "Node id is required to record table schema",
+        // replay the error
+        if err_path.exists() {
+            let msg =
+                fs::read_to_string(&err_path).map_err(|e| from_io_error(e, Some(&err_path)))?;
+            return Err(AdbcError::with_message_and_status(
+                msg,
                 AdbcStatus::Internal,
-            ))
+            ));
         }
+
+        // read the schema
+        let file = File::open(&parquet_path).map_err(|e| from_io_error(e, Some(&parquet_path)))?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(from_parquet_error)?;
+        let reader = builder.build().map_err(from_parquet_error)?;
+        let schema = reader.schema();
+
+        // read the metadata
+        let metadata_json = fs::read_to_string(&metadata_path)
+            .map_err(|e| from_io_error(e, Some(&metadata_path)))?;
+        let metadata: HashMap<String, String> = serde_json::from_str(&metadata_json)
+            .map_err(|e| from_serde_error(e, Some(&metadata_path)))?;
+
+        let mut schema_builder = SchemaBuilder::from(schema.fields());
+        for (key, value) in metadata {
+            schema_builder.metadata_mut().insert(key, value);
+        }
+
+        let schema = schema_builder.finish();
+        Ok(schema)
     }
 }
 
@@ -574,7 +657,6 @@ impl Statement for ReplayEngineStatement {
 
         let path = self.replay_engine.full_path();
         let file_name = compute_file_name(&query_ctx)?;
-        let json_path = path.join(format!("{file_name}.json"));
         let parquet_path = path.join(format!("{file_name}.parquet"));
         let sql_path = path.join(format!("{file_name}.sql"));
         let err_path = path.join(format!("{file_name}.err"));
@@ -582,7 +664,11 @@ impl Statement for ReplayEngineStatement {
         // Query has to match to the recorded one, otherwise we
         // have issues with ordering or recording
         if !fs::exists(&sql_path).map_err(|e| from_io_error(e, Some(&sql_path)))? {
-            panic!("Missing query file ({:?}) during replay", &sql_path);
+            panic!(
+                "Missing query file ({:?}) during replay. Query: {}",
+                &sql_path,
+                replay_sql.as_str()
+            );
         }
         // dbt_tmp_800c2fb4_a0ba_4708_a0b1_813316032bfb
         let record_sql =
@@ -605,13 +691,10 @@ impl Statement for ReplayEngineStatement {
             ));
         }
 
-        if !json_path.exists() {
-            panic!("{json_path:?} does not exist during replay");
-        }
-
         // If parquet file is empty, then there was no schema during
         // recording
-        let metadata = metadata(&parquet_path).map_err(|e| from_io_error(e, Some(&json_path)))?;
+        let metadata =
+            metadata(&parquet_path).map_err(|e| from_io_error(e, Some(&parquet_path)))?;
         let reader: Box<dyn RecordBatchReader + Send + 'a> = if metadata.len() == 0 {
             let schema = Arc::new(Schema::new(Vec::<Field>::new()));
             let batch = RecordBatch::new_empty(schema.clone());

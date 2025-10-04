@@ -545,12 +545,14 @@ impl FlatRecordBatch {
         self.original.as_ref()
     }
 
-    pub fn with_single_column(&self, idx: usize) -> Self {
+    pub fn with_single_column(&self, idx: usize) -> Arc<FlatRecordBatch> {
         let column_batch = single_column_batch(&self.flat, idx);
-        Self::_from_flattened_record_batch(Arc::new(column_batch), None).unwrap()
+        // one column pulled from an already flat batch is still flat, so .unwrap() is safe
+        let flat = Self::_from_flattened_record_batch(Arc::new(column_batch), None).unwrap();
+        Arc::new(flat)
     }
 
-    pub(crate) fn with_renamed_columns(&self, renamed_columns: &[String]) -> FlatRecordBatch {
+    pub(crate) fn with_renamed_columns(&self, renamed_columns: &[String]) -> Arc<FlatRecordBatch> {
         debug_assert!(renamed_columns.len() == self.flat.num_columns());
         let new_schema = {
             let mut renamed_columns = renamed_columns.iter();
@@ -563,8 +565,45 @@ impl FlatRecordBatch {
             Arc::new(Schema::new(new_fields))
         };
         // only column names changed, so .unwrap() is safe
-        let new_flat = RecordBatch::try_new(new_schema, self.flat.columns().to_vec()).unwrap();
-        Self::_from_flattened_record_batch(Arc::new(new_flat), None).unwrap()
+        let new_flat = {
+            let new_columns = self.flat.columns().to_vec();
+            let options = RecordBatchOptions::default().with_row_count(Some(self.flat.num_rows()));
+            RecordBatch::try_new_with_options(new_schema, new_columns, &options)
+        }
+        .unwrap();
+        Arc::new(Self::_from_flattened_record_batch(Arc::new(new_flat), None).unwrap())
+    }
+
+    /// Create a new [FlatRecordBatch] by selecting a subset of columns from the current one.
+    ///
+    /// PRE-CONDITION: the indices are valid for the current batch.
+    pub(crate) fn select<'a>(
+        &'a self,
+        indices: impl Iterator<Item = usize> + 'a,
+    ) -> Arc<FlatRecordBatch> {
+        let (new_schema, new_columns) = {
+            let mut columns = Vec::new();
+            let mut fields = Vec::new();
+
+            let schema = self.flat.schema_ref();
+            for idx in indices {
+                fields.push(schema.field(idx).clone());
+                columns.push(Arc::clone(self.flat.column(idx)));
+            }
+
+            let schema_metadata = schema.metadata().clone();
+            (
+                Arc::new(Schema::new_with_metadata(fields, schema_metadata)),
+                columns,
+            )
+        };
+        // only column selection, so .unwrap() is safe
+        let new_flat = {
+            let options = RecordBatchOptions::default().with_row_count(Some(self.flat.num_rows()));
+            RecordBatch::try_new_with_options(new_schema, new_columns, &options)
+        }
+        .unwrap();
+        Arc::new(Self::_from_flattened_record_batch(Arc::new(new_flat), None).unwrap())
     }
 
     pub(crate) fn converters(&self) -> &[Box<dyn ArrayConverter>] {
@@ -595,5 +634,6 @@ pub(crate) fn single_column_batch(batch: &RecordBatch, idx: usize) -> RecordBatc
     let field = schema_ref.field(idx).clone();
     let schema = Schema::new_with_metadata(vec![field], schema_ref.metadata().clone());
     let columns = vec![batch.column(idx).clone()];
+    // only one column selected, row-count can be derived, so .unwrap() is safe
     RecordBatch::try_new(Arc::new(schema), columns).unwrap()
 }

@@ -55,7 +55,7 @@ fn bad_input<T>() -> Result<T> {
 /// implementation does not support negative values i.e. it ignores sign
 /// symbols, because [`Duration`] does not support negative values, and the Go
 /// Snowflake driver uses absolute values for these durations.
-pub(crate) fn parse_duration(input: &str) -> Result<Duration> {
+pub fn parse_duration(input: &str) -> Result<Duration> {
     // Drop sign symbols.
     let input = input.replace(['+', '-'], "");
 
@@ -94,11 +94,11 @@ pub(crate) fn parse_duration(input: &str) -> Result<Duration> {
             // Add this part to the duration.
             duration += match unit {
                 "h" => {
-                    Duration::from_secs(3600u64.checked_mul(int).ok_or(overflow())?)
+                    Duration::from_secs(3600u64.checked_mul(int).ok_or_else(overflow)?)
                         + Duration::try_from_secs_f64(3600f64 * frac).map_err(arg_err)?
                 }
                 "m" => {
-                    Duration::from_secs(60u64.checked_mul(int).ok_or(overflow())?)
+                    Duration::from_secs(60u64.checked_mul(int).ok_or_else(overflow)?)
                         + Duration::try_from_secs_f64(60f64 * frac).map_err(arg_err)?
                 }
                 "s" => {

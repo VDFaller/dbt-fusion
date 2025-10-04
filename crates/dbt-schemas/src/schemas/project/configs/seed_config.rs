@@ -29,7 +29,7 @@ use crate::schemas::project::configs::common::default_quoting;
 use crate::schemas::project::configs::common::default_to_grants;
 use crate::schemas::serde::StringOrArrayOfStrings;
 use crate::schemas::serde::bool_or_string_bool;
-use crate::schemas::serde::u64_or_string_u64;
+use crate::schemas::serde::{f64_or_string_f64, u64_or_string_u64};
 
 #[skip_serializing_none]
 #[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
@@ -38,7 +38,7 @@ pub struct ProjectSeedConfig {
     pub column_types: Option<BTreeMap<String, String>>,
     #[serde(rename = "+copy_grants")]
     pub copy_grants: Option<bool>,
-    #[serde(rename = "+database", alias = "+project")]
+    #[serde(rename = "+database", alias = "+project", alias = "+data_space")]
     pub database: Option<String>,
     #[serde(rename = "+alias")]
     pub alias: Option<String>,
@@ -153,9 +153,9 @@ pub struct ProjectSeedConfig {
     #[serde(
         default,
         rename = "+refresh_interval_minutes",
-        deserialize_with = "u64_or_string_u64"
+        deserialize_with = "f64_or_string_f64"
     )]
-    pub refresh_interval_minutes: Option<u64>,
+    pub refresh_interval_minutes: Option<f64>,
     #[serde(rename = "+description")]
     pub description: Option<String>,
     #[serde(rename = "+max_staleness")]
@@ -261,16 +261,18 @@ pub struct ProjectSeedConfig {
 }
 
 impl IterChildren<ProjectSeedConfig> for ProjectSeedConfig {
-    fn iter_children(&self) -> Iter<String, ShouldBe<Self>> {
+    fn iter_children(&self) -> Iter<'_, String, ShouldBe<Self>> {
         self.__additional_properties__.iter()
     }
 }
 
 #[skip_serializing_none]
-#[derive(Deserialize, Serialize, Debug, Default, PartialEq, Eq, Clone, JsonSchema)]
+#[derive(Deserialize, Serialize, Debug, Default, PartialEq, Clone, JsonSchema)]
 pub struct SeedConfig {
     pub column_types: Option<BTreeMap<String, String>>,
+    #[serde(alias = "project", alias = "data_space")]
     pub database: Option<String>,
+    #[serde(alias = "dataset")]
     pub schema: Option<String>,
     pub alias: Option<String>,
     pub docs: Option<DocsConfig>,

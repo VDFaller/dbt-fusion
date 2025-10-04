@@ -22,6 +22,7 @@ use dbt_fusion_adapter::load_store::ResultStore;
 use dbt_fusion_adapter::relation_object::create_relation;
 use dbt_schemas::schemas::CommonAttributes;
 use dbt_schemas::schemas::NodeBaseAttributes;
+use dbt_schemas::schemas::telemetry::NodeType;
 use minijinja::State;
 use minijinja::constants::CURRENT_PATH;
 use minijinja::constants::CURRENT_SPAN;
@@ -46,7 +47,7 @@ async fn extend_with_model_context<S: Serialize>(
     deprecated_config: &S,
     adapter_type: AdapterType,
     io_args: &IoArgs,
-    resource_type: &str,
+    resource_type: NodeType,
     sql_header: Option<MinijinjaValue>,
 ) {
     // Create a relation for 'this' using config values
@@ -136,8 +137,8 @@ async fn extend_with_model_context<S: Serialize>(
 
     // We are reading the raw_sql here for snapshots and models
     let raw_sql_path = match resource_type {
-        "snapshot" => Some(io_args.out_dir.join(common_attr.original_file_path.clone())),
-        "model" => Some(io_args.in_dir.join(common_attr.original_file_path.clone())),
+        NodeType::Snapshot => Some(io_args.out_dir.join(common_attr.original_file_path.clone())),
+        NodeType::Model => Some(io_args.in_dir.join(common_attr.original_file_path.clone())),
         _ => None,
     };
     if let Some(raw_sql_path) = raw_sql_path {
@@ -165,7 +166,12 @@ async fn extend_with_model_context<S: Serialize>(
         MinijinjaValue::from_object(node_config),
     );
 
-    base_context.insert("model".to_owned(), MinijinjaValue::from_object(model_map));
+    base_context.insert(
+        "model".to_owned(),
+        MinijinjaValue::from_object(model_map.clone()),
+    );
+    base_context.insert("node".to_owned(), MinijinjaValue::from_object(model_map));
+    base_context.insert("connection_name".to_owned(), MinijinjaValue::from(""));
 }
 
 /// Extend the base context with stateful functions
@@ -212,7 +218,7 @@ pub async fn build_run_node_context<S: Serialize>(
     agate_table: Option<AgateTable>,
     base_context: &BTreeMap<String, MinijinjaValue>,
     io_args: &IoArgs,
-    resource_type: &str,
+    resource_type: NodeType,
     sql_header: Option<MinijinjaValue>,
     packages: BTreeSet<String>,
 ) -> BTreeMap<String, MinijinjaValue> {
@@ -239,7 +245,7 @@ pub async fn build_run_node_context<S: Serialize>(
         "write".to_owned(),
         MinijinjaValue::from_object(WriteConfig {
             model_name,
-            resource_type: resource_type.to_string(),
+            resource_type: resource_type.as_ref().to_string(),
             project_root: io_args.in_dir.clone(),
             target_path: io_args.out_dir.clone(),
         }),
@@ -426,15 +432,14 @@ fn write_file(
     };
 
     // Create parent directories if needed
-    if let Some(parent) = full_path.parent() {
-        if !parent.exists() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                return Err(Error::new(
-                    ErrorKind::InvalidOperation,
-                    format!("Failed to create directory {}: {}", parent.display(), e),
-                ));
-            }
-        }
+    if let Some(parent) = full_path.parent()
+        && !parent.exists()
+        && let Err(e) = fs::create_dir_all(parent)
+    {
+        return Err(Error::new(
+            ErrorKind::InvalidOperation,
+            format!("Failed to create directory {}: {}", parent.display(), e),
+        ));
     }
 
     match fs::write(&full_path, payload) {
